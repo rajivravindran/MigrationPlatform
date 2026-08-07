@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  height: 100%;
+}
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+
+/* Soft pulse for eligible mapping targets during click-to-connect */
+@keyframes pulse-soft {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgb(52 211 153 / 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgb(52 211 153 / 0);
+  }
+}
+
+.animate-pulse-soft {
+  animation: pulse-soft 1.6s ease-in-out infinite;
+}
+
+/* React Flow field nodes — kill default node chrome so our custom card owns the look */
+.react-flow__node-field {
+  padding: 0 !important;
+  border: none !important;
+  background: transparent !important;
+  border-radius: 0 !important;
+  width: auto !important;
+  font-size: inherit !important;
+  box-shadow: none !important;
+}
+
+.react-flow__node-field.selected {
+  box-shadow: none !important;
+}
+
+.react-flow__handle {
+  z-index: 2;
+}
+
+.react-flow__edge-path {
+  stroke-linecap: round;
+}
+
+.react-flow__attribution {
+  display: none !important;
+}

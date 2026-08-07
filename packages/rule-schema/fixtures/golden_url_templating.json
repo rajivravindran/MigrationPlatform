@@ -1,0 +1,39 @@
+{
+  "id": "rt_url_templating",
+  "version": 1,
+  "name": "URL templating fixture",
+  "source": {
+    "type": "csv",
+    "schema": [
+      {"name": "id", "type": "string"},
+      {"name": "country", "type": "string"},
+      {"name": "tenant", "type": "string"},
+      {"name": "tag1", "type": "string"},
+      {"name": "tag2", "type": "string"}
+    ],
+    "options": {"header": true, "delimiter": ","}
+  },
+  "preprocess": [],
+  "mapping": {
+    "payload": {
+      "echo": {"$from": "id"}
+    }
+  },
+  "destination": {
+    "type": "http",
+    "method": "GET",
+    "url": "https://api.example.com/v1/users/{userId}/orders",
+    "pathParams": {
+      "userId": {"$from": "id"}
+    },
+    "queryParams": {
+      "region": {"$from": "country"},
+      "since":  {"$literal": "2024-01-01"},
+      "tags":   [{"$from": "tag1"}, {"$from": "tag2"}, "static"]
+    },
+    "headers": {
+      "X-Tenant-Id": {"$from": "tenant"},
+      "X-Trace":     "static-value"
+    }
+  }
+}

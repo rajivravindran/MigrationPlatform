@@ -1,0 +1,71 @@
+use std::net::SocketAddr;
+
+use anyhow::Context;
+use tokio::net::TcpListener;
+use tracing::info;
+
+use migration_api::config::Config;
+use migration_api::{build_router, security, state, telemetry, temporal};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+    let cfg = Config::from_env().context("loading API config")?;
+
+    telemetry::init_tracing("migration-api", cfg.otlp_endpoint.as_deref())
+        .context("initialising tracing")?;
+
+    security::license::enforce_at_startup()
+        .await
+        .context("license check")?;
+
+    let metrics_handle = telemetry::init_metrics().context("initialising prometheus metrics")?;
+
+    let db_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(cfg.db_max_connections)
+        .connect(&cfg.database_url)
+        .await
+        .context("connecting to postgres")?;
+
+    sqlx::migrate!("./migrations")
+        .run(&db_pool)
+        .await
+        .context("running migrations")?;
+
+    let redis = redis::Client::open(cfg.redis_url.clone()).context("parsing redis url")?;
+    let temporal_client = temporal::TemporalClient::new(
+        cfg.orchestrator_bridge_url.as_deref(),
+        cfg.bridge_token.as_deref().unwrap_or(""),
+        &cfg.temporal_namespace,
+    );
+    if temporal_client.is_stub() {
+        tracing::warn!(
+            "ORCHESTRATOR_BRIDGE_URL is not set: Temporal operations run in stub mode and no workflows will be dispatched"
+        );
+    }
+    let minio = state::build_s3_client(&cfg).await?;
+    let jwt_keys = security::JwtKeys::load(&cfg)?;
+    let master_key = security::MasterKey::from_env_value(&cfg.master_key)?;
+
+    let state = state::AppState::new(state::AppStateInner {
+        cfg: cfg.clone(),
+        db: db_pool,
+        redis,
+        temporal: temporal_client,
+        s3: minio,
+        jwt: jwt_keys,
+        master_key,
+        metrics_handle,
+    });
+
+    let app = build_router(state);
+
+    let addr: SocketAddr = cfg.api_bind.parse().context("parsing API_BIND")?;
+    let listener = TcpListener::bind(addr).await.context("binding api port")?;
+    info!(%addr, "migration-api listening");
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .context("axum serve")?;
+
+    Ok(())
+}

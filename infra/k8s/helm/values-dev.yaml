@@ -1,0 +1,40 @@
+global:
+  environment: dev
+
+api:
+  replicas: 1
+  hpa: { enabled: false }
+  podDisruptionBudget:
+    minAvailable: 0
+
+orchestrator:
+  replicas: 1
+  hpa: { enabled: false }
+  podDisruptionBudget:
+    minAvailable: 0
+
+transformWorker:
+  replicas: 1
+  hpa: { enabled: false }
+
+web:
+  replicas: 1
+  hpa: { enabled: false }
+
+ingress:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+backup:
+  enabled: false
+
+postgresql:
+  primary:
+    persistence:
+      size: 10Gi
+
+minio:
+  persistence:
+    size: 10Gi

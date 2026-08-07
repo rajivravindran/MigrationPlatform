@@ -1,0 +1,61 @@
+{
+  "uid": "mp-schedules",
+  "title": "Migration Platform — Schedules",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "tags": ["migration-platform"],
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Schedule fires / sec",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum by (schedule_id) (rate(migration_schedule_fires_total[5m]))", "legendFormat": "{{schedule_id}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Next-fire lag (scheduled - actual)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(migration_schedule_fire_lag_seconds_bucket[5m])))", "legendFormat": "p95", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(migration_schedule_fire_lag_seconds_bucket[5m])))", "legendFormat": "p99", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Overlap drops (by policy)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "sum by (overlap_policy) (rate(migration_schedule_overlap_drops_total[5m]))", "legendFormat": "{{overlap_policy}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Catchup executions",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "rate(migration_schedule_catchup_executions_total[5m])", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Missed runs (15m)",
+      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "increase(migration_schedule_missed_runs_total[15m])", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Failed schedule runs (24h)",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "increase(migration_schedule_run_failed_total[24h])", "refId": "A" }
+      ]
+    }
+  ]
+}

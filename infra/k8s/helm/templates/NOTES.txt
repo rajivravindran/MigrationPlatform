@@ -1,0 +1,19 @@
+Migration Platform has been installed.
+
+1. Check rollout status:
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "mp.fullname" . }}-api
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "mp.fullname" . }}-orchestrator
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "mp.fullname" . }}-transform-worker
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "mp.fullname" . }}-web
+
+2. Seed an org + admin user:
+   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "mp.fullname" . }}-api -- \
+     /app/migration-admin create-org --name Acme
+   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "mp.fullname" . }}-api -- \
+     /app/migration-admin create-user --org 1 --email admin@example.com --role admin --password 'change-me'
+
+3. Port-forward locally:
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "mp.fullname" . }}-api 8080:8080
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "mp.fullname" . }}-web 3000:3000
+
+See docs/operations.md for day-2 procedures.

@@ -1,0 +1,9 @@
+title,body,author_name,author_email,comment_text,notify_status
+Getting started with Rust,A beginners guide to ownership and borrowing,Jane Doe,jane.doe@example.com,Great intro for newcomers!,200
+Temporal workflows explained,Why durable execution changes backend design,Bob Smith,bob.smith@example.com,This saved my on-call weekend.,200
+PostgreSQL partitioning tips,Hash vs range partitioning for large tables,Alice Kumar,alice.k@example.com,We use hash partitions in prod.,404
+Docker networking demystified,Bridge networks and service discovery,Raj Patel,raj.patel@example.com,Finally understand compose DNS.,200
+Next.js app router patterns,Server components vs client components,Maria Garcia,maria.g@example.com,Clear and practical examples.,500
+Kafka vs Redis streams,Choosing the right event backbone,Chen Wei,chen.wei@example.com,Would love a follow-up on exactly-once.,200
+Observability on a budget,Prometheus Grafana Loki starter stack,Sara Ali,sara.ali@example.com,Deployed this in an afternoon.,200
+API versioning strategies,Path headers or content negotiation,Tom Brown,tom.brown@example.com,Team finally agreed on a standard.,200

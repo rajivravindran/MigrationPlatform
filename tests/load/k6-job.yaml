@@ -1,0 +1,68 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-load
+  namespace: migration
+  labels:
+    app: k6-load
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: k6-load
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:0.49.0
+          args: ["run", "/scripts/load_10m.js"]
+          env:
+            - name: API
+              value: "http://migration-api.migration.svc:8080"
+            - name: TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k6-load-token
+                  key: token
+            - name: RULE_TEMPLATE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: k6-load-config
+                  key: rule_template_id
+            - name: WATCHED_PREFIX_CONNECTOR_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: k6-load-config
+                  key: connector_id
+            - name: EXPECTED_TOTAL_ROWS
+              value: "10000000"
+            - name: K6_OUT
+              value: "experimental-prometheus-rw=http://prometheus-pushgateway.monitoring.svc:9091/api/v1/write"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-load-scripts
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-load-scripts
+  namespace: migration
+data:
+  load_10m.js: |
+    // Kept in sync with tests/load/load_10m.js — populate via:
+    //   kubectl -n migration create configmap k6-load-scripts \
+    //     --from-file=tests/load/load_10m.js -o yaml --dry-run=client \
+    //     | kubectl apply -f -
+    throw new Error("Populate via kubectl create configmap from tests/load/load_10m.js");

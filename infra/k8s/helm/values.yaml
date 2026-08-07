@@ -1,0 +1,200 @@
+global:
+  namespace: migration
+  imagePullPolicy: IfNotPresent
+  storageClassName: ""
+  logLevel: info
+  environment: prod
+
+image:
+  registry: ghcr.io
+  repository: your-org/migration-platform
+  tag: "0.1.0"
+
+# ---- Internal services -----------------------------------------------------
+api:
+  image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}/api:{{ .Values.image.tag }}"
+  replicas: 3
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+    limits:   { cpu: "2",  memory: 1Gi }
+  service:
+    type: ClusterIP
+    httpPort: 8080
+    metricsPort: 9464
+  podDisruptionBudget:
+    minAvailable: 1
+  hpa:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+  env:
+    API_BIND: "0.0.0.0:8080"
+    METRICS_BIND: "0.0.0.0:9464"
+  readinessProbe:
+    httpGet: { path: /healthz, port: 8080 }
+    periodSeconds: 5
+  livenessProbe:
+    httpGet: { path: /healthz, port: 8080 }
+    periodSeconds: 15
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities: { drop: ["ALL"] }
+
+orchestrator:
+  image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}/orchestrator-go:{{ .Values.image.tag }}"
+  replicas: 4
+  resources:
+    requests: { cpu: 500m, memory: 512Mi }
+    limits:   { cpu: "4",  memory: 2Gi }
+  service:
+    metricsPort: 9464
+  podDisruptionBudget:
+    minAvailable: 2
+  hpa:
+    enabled: true
+    minReplicas: 4
+    maxReplicas: 40
+    targetCPUUtilizationPercentage: 70
+  env:
+    ACTIVITY_CONCURRENCY: "128"
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities: { drop: ["ALL"] }
+
+transformWorker:
+  image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}/transform-worker:{{ .Values.image.tag }}"
+  replicas: 2
+  resources:
+    requests: { cpu: 500m, memory: 512Mi }
+    limits:   { cpu: "2",  memory: 1Gi }
+  service:
+    metricsPort: 9464
+  podDisruptionBudget:
+    minAvailable: 1
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+  seccompProfile: RuntimeDefault
+  env:
+    SANDBOX_TIMEOUT_SECONDS: "5"
+    SANDBOX_MEMORY_MB: "256"
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities: { drop: ["ALL"] }
+
+web:
+  image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}/web:{{ .Values.image.tag }}"
+  replicas: 2
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  service:
+    type: ClusterIP
+    httpPort: 3000
+  podDisruptionBudget:
+    minAvailable: 1
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+  env:
+    NEXT_PUBLIC_API_URL: "https://api.example.com"
+    API_INTERNAL_URL: "http://migration-api:8080"
+
+# ---- Shared ----------------------------------------------------------------
+secrets:
+  create: true
+  masterKey: "change-me-32-byte-key-change-me-32byte"
+  jwtPrivateKey: ""
+  jwtPublicKey: ""
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  hosts:
+    api: api.example.com
+    web: app.example.com
+  tls:
+    enabled: true
+    secretName: migration-platform-tls
+
+networkPolicy:
+  enabled: true
+  ingressFromNamespaces:
+    - ingress-nginx
+
+# ---- Database migrations ---------------------------------------------------
+migrations:
+  image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}/api:{{ .Values.image.tag }}"
+  activeDeadlineSeconds: 300
+  backoffLimit: 3
+
+# ---- Postgres backups ------------------------------------------------------
+backup:
+  enabled: true
+  schedule: "0 2 * * *"
+  retentionDays: 14
+  image: "postgres:16"
+  bucket: "migration-backups"
+  endpoint: ""                   # e.g. https://s3.amazonaws.com or http://minio:9000
+  accessKeySecretRef: { name: migration-backup-s3, key: accessKey }
+  secretKeySecretRef: { name: migration-backup-s3, key: secretKey }
+
+# ---- Dependency subcharts --------------------------------------------------
+postgresql:
+  enabled: true
+  auth:
+    username: migration
+    password: migration
+    database: migration
+    postgresPassword: migration
+  primary:
+    persistence:
+      size: 100Gi
+    resources:
+      requests: { cpu: "500m", memory: "1Gi" }
+      limits:   { cpu: "4",    memory: "4Gi" }
+
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: false
+  master:
+    persistence:
+      enabled: false
+
+minio:
+  enabled: true
+  mode: standalone
+  auth:
+    rootUser: minio
+    rootPassword: minio123456
+  defaultBuckets: "migration,migration-results,migration-backups"
+  persistence:
+    size: 50Gi
+
+temporal:
+  enabled: true
+  server:
+    config:
+      persistence:
+        default:
+          driver: "sql"
+          sql: { driver: postgres12, database: temporal }

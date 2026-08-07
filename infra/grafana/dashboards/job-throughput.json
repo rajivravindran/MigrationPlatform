@@ -1,0 +1,83 @@
+{
+  "uid": "mp-jobs",
+  "title": "Migration Platform — Job Throughput",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["migration-platform"],
+  "templating": {
+    "list": [
+      {
+        "name": "job_id",
+        "type": "query",
+        "datasource": { "uid": "prometheus", "type": "prometheus" },
+        "query": "label_values(migration_job_rows_processed_total, job_id)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Rows processed / sec",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum by (job_id) (rate(migration_job_rows_processed_total{job_id=~\"$job_id\"}[1m]))", "legendFormat": "{{job_id}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Rows failed / sec",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sum by (job_id) (rate(migration_job_rows_failed_total{job_id=~\"$job_id\"}[1m]))", "legendFormat": "{{job_id}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Activity duration p50/p95/p99",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le, activity) (rate(temporal_activity_execution_latency_bucket[5m])))", "legendFormat": "p50 {{activity}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le, activity) (rate(temporal_activity_execution_latency_bucket[5m])))", "legendFormat": "p95 {{activity}}", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le, activity) (rate(temporal_activity_execution_latency_bucket[5m])))", "legendFormat": "p99 {{activity}}", "refId": "C" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Activity retries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "sum by (activity) (rate(temporal_activity_execution_failed_total[5m]))", "legendFormat": "{{activity}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "SSE subscribers",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "migration_sse_subscribers", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Cumulative processed",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "sum(migration_job_rows_processed_total{job_id=~\"$job_id\"})", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Cumulative failed",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 16 },
+      "targets": [
+        { "expr": "sum(migration_job_rows_failed_total{job_id=~\"$job_id\"})", "refId": "A" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "id": "rt_golden",
+  "version": 1,
+  "name": "Golden fixture",
+  "source": {
+    "type": "csv",
+    "schema": [
+      {"name": "email", "type": "string"},
+      {"name": "country", "type": "string"},
+      {"name": "external_id", "type": "string"}
+    ],
+    "options": {"delimiter": ",", "header": true}
+  },
+  "preprocess": [
+    {"id": "p1", "field": "email", "fn": "builtin.lowercase"},
+    {"id": "p2", "field": "country", "fn": "python", "code": "return value.upper()"}
+  ],
+  "mapping": {
+    "payload": {
+      "firstName": {"$from": "first_name"},
+      "email": {"$from": "email"},
+      "address": {
+        "country": {"$py": "row['country'][:2]"}
+      }
+    }
+  },
+  "destination": {
+    "type": "http",
+    "method": "POST",
+    "url": "https://api.example.com/v1/customers",
+    "auth": {"type": "bearer", "secretRef": "customer_api_token"},
+    "idempotencyKey": {"$py": "row['external_id']"},
+    "idempotencyHeader": "Idempotency-Key"
+  },
+  "retry": {"maxAttempts": 5, "backoff": "exponential", "initialIntervalMs": 100},
+  "concurrency": 16
+}

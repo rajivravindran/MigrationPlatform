@@ -1,0 +1,59 @@
+{
+  "id": "rt_golden_steps",
+  "version": 1,
+  "name": "Golden multi-step fixture",
+  "source": {
+    "type": "csv",
+    "schema": [
+      {"name": "email", "type": "string"},
+      {"name": "first_name", "type": "string"},
+      {"name": "street", "type": "string"},
+      {"name": "city", "type": "string"}
+    ],
+    "options": {"delimiter": ",", "header": true}
+  },
+  "preprocess": [
+    {"id": "p1", "field": "email", "fn": "builtin.lowercase"}
+  ],
+  "steps": [
+    {
+      "name": "createContact",
+      "description": "Create the contact and capture its id",
+      "mapping": {
+        "payload": {
+          "email": {"$from": "email"},
+          "firstName": {"$from": "first_name"}
+        }
+      },
+      "destination": {
+        "type": "http",
+        "method": "POST",
+        "url": "https://api.example.com/v1/contacts",
+        "auth": {"type": "bearer", "secretRef": "crm_token"},
+        "idempotencyHeader": "Idempotency-Key"
+      }
+    },
+    {
+      "name": "attachAddress",
+      "description": "Attach the address to the contact created in step 1",
+      "mapping": {
+        "payload": {
+          "street": {"$from": "street"},
+          "city": {"$from": "city"},
+          "contactRef": {"$fromResponse": "createContact", "path": "$.data.id"}
+        }
+      },
+      "destination": {
+        "type": "http",
+        "method": "POST",
+        "url": "https://api.example.com/v1/contacts/{contactId}/addresses",
+        "pathParams": {
+          "contactId": {"$fromResponse": "createContact", "path": "$.data.id"}
+        },
+        "auth": {"type": "bearer", "secretRef": "crm_token"}
+      }
+    }
+  ],
+  "retry": {"maxAttempts": 5, "backoff": "exponential", "initialIntervalMs": 100},
+  "concurrency": 16
+}

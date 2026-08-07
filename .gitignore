@@ -1,0 +1,104 @@
+node_modules/
+.next/
+dist/
+build/
+target/
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+coverage/
+tmp/
+*.log
+apps/web/.next/
+apps/web/node_modules/
+apps/transform-worker/.venv/
+infra/data/
+
+# License signing keys must never be committed (dev key regenerable via openssl or admin license-keygen)
+infra/license/*signing_key*.pem
+
+# Environment files and credentials (keep sanitized templates)
+.env.*
+!.env.example
+!.env.*.example
+credentials/
+credentials*.json
+credentials*.yaml
+credentials*.yml
+secrets/
+*.secret
+
+# Private keys, certificates with embedded keys, and signing material
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+*license*signing*key*
+*signing*private*key*
+
+# Go build and test outputs
+bin/
+*.test
+*.out
+vendor/
+
+# Python caches, environments, test and type-check outputs
+*.pyo
+*.pyd
+.python-version
+venv/
+env/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# JavaScript package-manager and framework caches
+.turbo/
+.cache/
+.npm/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+*.tsbuildinfo
+
+# Local databases, persistent volumes, and application state
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+volumes/
+.local/
+.state/
+
+# Terraform local state (may contain secrets)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Cursor/editor temporary artifacts
+.cursor/tmp/
+.cursor/cache/
+.cursor/worktrees/
+*.cursor-tmp
+*.swp
+*.swo
+*~
+
+# OS and generic temporary files
+Thumbs.db
+*.tmp

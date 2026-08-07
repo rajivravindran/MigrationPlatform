@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mp.fullname" . }}-transform-worker
+  labels: {{- include "mp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: transform-worker
+spec:
+  replicas: {{ .Values.transformWorker.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: transform-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Chart.Name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: transform-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: transform-worker
+          image: {{ include "mp.image" .Values.transformWorker.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.transformWorker.service.metricsPort }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "mp.fullname" . }}-env
+            - secretRef:
+                name: {{ include "mp.fullname" . }}-secrets
+          env:
+            {{- range $k, $v := .Values.transformWorker.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources: {{- toYaml .Values.transformWorker.resources | nindent 12 }}
+          livenessProbe:
+            tcpSocket: { port: 9464 }
+            periodSeconds: 30
+          readinessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            periodSeconds: 10
+          securityContext: {{- toYaml .Values.transformWorker.securityContext | nindent 12 }}
+      securityContext:
+        seccompProfile:
+          type: {{ .Values.transformWorker.seccompProfile }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- if .Values.transformWorker.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "mp.fullname" . }}-transform-worker
+  labels: {{- include "mp.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "mp.fullname" . }}-transform-worker
+  minReplicas: {{ .Values.transformWorker.hpa.minReplicas }}
+  maxReplicas: {{ .Values.transformWorker.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.transformWorker.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "mp.fullname" . }}-transform-worker
+  labels: {{- include "mp.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.transformWorker.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: transform-worker

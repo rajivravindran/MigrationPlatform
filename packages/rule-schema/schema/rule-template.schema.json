@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://migration-platform.local/rule-template.schema.json",
+  "title": "RuleTemplate",
+  "type": "object",
+  "required": ["id", "version", "name", "source", "preprocess"],
+  "additionalProperties": false,
+  "oneOf": [
+    { "required": ["mapping", "destination"], "not": { "required": ["steps"] } },
+    { "required": ["steps"], "not": { "anyOf": [ { "required": ["mapping"] }, { "required": ["destination"] } ] } }
+  ],
+  "properties": {
+    "id":      { "type": "string", "minLength": 1 },
+    "version": { "type": "integer", "minimum": 1 },
+    "name":    { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type":    { "enum": ["csv", "json", "xml", "salesforce", "watched_prefix"] },
+        "schema":  {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "enum": ["string","integer","number","boolean","datetime","object"] }
+            }
+          }
+        },
+        "options": { "type": "object" },
+        "connectorId": { "type": "integer" }
+      }
+    },
+    "preprocess": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "field", "fn"],
+        "additionalProperties": false,
+        "properties": {
+          "id":    { "type": "string" },
+          "field": { "type": "string" },
+          "fn":    { "type": "string" },
+          "args":  { "type": "object" },
+          "code":  { "type": "string" }
+        }
+      }
+    },
+    "mapping":     { "$ref": "#/$defs/mapping" },
+    "destination": { "$ref": "#/$defs/destination" },
+    "steps": {
+      "description": "Multi-step chain: each step is one HTTP call per row, executed in order. Later steps may reference earlier responses via {\"$fromResponse\":\"stepName\",\"path\":\"$.jsonpath\"}.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["name", "destination"],
+        "additionalProperties": false,
+        "properties": {
+          "name":        { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "description": { "type": "string" },
+          "mapping":     { "$ref": "#/$defs/mapping" },
+          "destination": { "$ref": "#/$defs/destination" },
+          "onFailure": {
+            "description": "After this step definitively fails (4xx or retries exhausted): stop the chain (default) or continue to later steps.",
+            "enum": ["stop", "continue"]
+          }
+        }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "backoff":     { "enum": ["exponential", "fixed"] },
+        "initialIntervalMs": { "type": "integer", "minimum": 10 }
+      }
+    },
+    "concurrency": { "type": "integer", "minimum": 1, "maximum": 512 }
+  },
+  "$defs": {
+    "mapping": {
+      "type": "object",
+      "required": ["payload"],
+      "additionalProperties": false,
+      "properties": {
+        "payload": { "type": "object" }
+      }
+    },
+    "destination": {
+      "type": "object",
+      "required": ["type", "method", "url"],
+      "additionalProperties": false,
+      "properties": {
+        "type":   { "const": "http" },
+        "method": { "enum": ["GET","POST","PUT","PATCH","DELETE"] },
+        "url":    { "type": "string", "format": "uri-reference" },
+        "pathParams": {
+          "description": "Substituted into {name} placeholders in url. Path-escaped.",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/valueExpr" }
+        },
+        "queryParams": {
+          "description": "Appended as ?k=v. Arrays expand to repeated keys (?k=a&k=b).",
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              { "$ref": "#/$defs/valueExpr" },
+              { "type": "array", "items": { "$ref": "#/$defs/valueExpr" } }
+            ]
+          }
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/valueExpr" }
+        },
+        "auth": {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "enum": ["bearer", "basic", "api_key", "oauth2_client"] },
+            "secretRef": { "type": "string" },
+            "headerName": { "type": "string" }
+          }
+        },
+        "idempotencyKey":     {},
+        "idempotencyHeader":  { "type": "string" }
+      }
+    },
+    "valueExpr": {
+      "description": "A literal string, a row-field reference {\"$from\":\"name\"}, a literal wrapper {\"$literal\":\"...\"}, or a prior-step response reference {\"$fromResponse\":\"stepName\",\"path\":\"$.data.id\"} (JSONPath).",
+      "anyOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "required": ["$from"],
+          "additionalProperties": false,
+          "properties": { "$from": { "type": "string", "minLength": 1 } }
+        },
+        {
+          "type": "object",
+          "required": ["$literal"],
+          "additionalProperties": false,
+          "properties": { "$literal": { "type": "string" } }
+        },
+        {
+          "type": "object",
+          "required": ["$fromResponse", "path"],
+          "additionalProperties": false,
+          "properties": {
+            "$fromResponse": { "type": "string", "minLength": 1 },
+            "path":          { "type": "string", "minLength": 1, "pattern": "^\\$" }
+          }
+        }
+      ]
+    }
+  }
+}

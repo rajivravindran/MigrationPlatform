@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "batchId": "demo-batch-1",
+  "onStageFailure": "stop",
+  "stages": [
+    { "id": "contacts", "file": "contacts.csv", "templateKey": "contacts-upsert" },
+    { "id": "pets", "file": "pets.csv", "templateKey": "pets-upsert" }
+  ]
+}

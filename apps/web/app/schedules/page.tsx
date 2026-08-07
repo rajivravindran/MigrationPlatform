@@ -1,0 +1,104 @@
+"use client";
+
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import Link from "next/link";
+import { toast } from "sonner";
+
+import { Badge, Button, Card, EmptyState } from "@/components/ui";
+import { apiFetch } from "@/lib/api";
+
+type Schedule = {
+  id: number;
+  name: string;
+  rule_template_id: number;
+  connector_id: number;
+  spec_json: { cron: string };
+  timezone: string;
+  overlap_policy: string;
+  enabled: boolean;
+  next_run_at?: string;
+  last_run_at?: string;
+};
+
+export default function SchedulesPage() {
+  const client = useQueryClient();
+  const { data, isLoading } = useQuery({
+    queryKey: ["schedules"],
+    queryFn: () => apiFetch<{ items: Schedule[] }>("/schedules"),
+    refetchInterval: 10000
+  });
+
+  const pause = useMutation({
+    mutationFn: (id: number) => apiFetch(`/schedules/${id}/pause`, { method: "POST" }),
+    onSuccess: () => { toast.success("Schedule paused"); client.invalidateQueries({ queryKey: ["schedules"] }); }
+  });
+  const resume = useMutation({
+    mutationFn: (id: number) => apiFetch(`/schedules/${id}/resume`, { method: "POST" }),
+    onSuccess: () => { toast.success("Schedule resumed"); client.invalidateQueries({ queryKey: ["schedules"] }); }
+  });
+  const triggerNow = useMutation({
+    mutationFn: (id: number) => apiFetch(`/schedules/${id}/trigger`, { method: "POST" }),
+    onSuccess: () => toast.success("Triggered immediate run")
+  });
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold">Schedules</h1>
+          <p className="text-sm text-slate-500">Temporal-backed recurring migrations with catch-up and overlap policies.</p>
+        </div>
+        <Link href="/schedules/new"><Button>New schedule</Button></Link>
+      </div>
+      {isLoading ? <Card>Loading&hellip;</Card> : null}
+      {data && data.items?.length === 0 ? (
+        <EmptyState
+          title="No schedules yet"
+          hint="Create a schedule to run a template on a cron expression."
+          action={<Link href="/schedules/new"><Button>New schedule</Button></Link>}
+        />
+      ) : null}
+      <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600">
+            <tr>
+              <th className="px-3 py-2 text-left">Name</th>
+              <th className="px-3 py-2 text-left">Cron</th>
+              <th className="px-3 py-2 text-left">Timezone</th>
+              <th className="px-3 py-2 text-left">Overlap</th>
+              <th className="px-3 py-2 text-left">Enabled</th>
+              <th className="px-3 py-2 text-left">Next run</th>
+              <th className="px-3 py-2 text-left">Last run</th>
+              <th className="px-3 py-2 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data?.items?.map((s) => (
+              <tr key={s.id} className="border-t border-slate-100 hover:bg-slate-50">
+                <td className="px-3 py-2">
+                  <Link className="text-brand-700 hover:underline" href={`/schedules/${s.id}`}>{s.name}</Link>
+                </td>
+                <td className="px-3 py-2 font-mono text-xs">{s.spec_json?.cron}</td>
+                <td className="px-3 py-2">{s.timezone}</td>
+                <td className="px-3 py-2">{s.overlap_policy}</td>
+                <td className="px-3 py-2"><Badge tone={s.enabled ? "ok" : "neutral"}>{s.enabled ? "enabled" : "paused"}</Badge></td>
+                <td className="px-3 py-2 text-slate-500">{s.next_run_at ?? "—"}</td>
+                <td className="px-3 py-2 text-slate-500">{s.last_run_at ?? "—"}</td>
+                <td className="px-3 py-2 text-right">
+                  <div className="inline-flex gap-2">
+                    {s.enabled ? (
+                      <Button variant="ghost" onClick={() => pause.mutate(s.id)}>Pause</Button>
+                    ) : (
+                      <Button variant="ghost" onClick={() => resume.mutate(s.id)}>Resume</Button>
+                    )}
+                    <Button onClick={() => triggerNow.mutate(s.id)}>Trigger now</Button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,94 @@
+groups:
+  - name: migration-platform-api
+    interval: 30s
+    rules:
+      - alert: ApiHighErrorRate
+        expr: |
+          sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          sum by (service) (rate(http_requests_total[5m])) > 0.01
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "API 5xx rate > 1% for 10m on {{ $labels.service }}"
+          description: "Sustained server errors; check deploy, DB, Temporal connectivity."
+
+      - alert: ApiLatencyP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, route, service) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "p95 latency > 1s on {{ $labels.route }}"
+
+  - name: migration-platform-jobs
+    interval: 30s
+    rules:
+      - alert: JobFailedRowsRatio
+        expr: |
+          sum by (job_id) (rate(migration_job_rows_failed_total[10m]))
+            /
+          clamp_min(sum by (job_id) (rate(migration_job_rows_processed_total[10m])), 1) > 0.05
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "Job {{ $labels.job_id }} failing > 5% of rows"
+          description: "Investigate destination endpoint health, connector credentials, or template regressions."
+
+      - alert: TemporalTaskQueueBacklog
+        expr: temporal_task_queue_backlog_count > 5000
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "Temporal task queue backlog > 5000"
+
+      - alert: ScheduleMissedRuns
+        expr: increase(migration_schedule_missed_runs_total[15m]) > 0
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "Schedule missed runs detected"
+
+  - name: migration-platform-sandbox
+    interval: 30s
+    rules:
+      - alert: PythonSandboxTimeouts
+        expr: rate(python_sandbox_timeouts_total[5m]) > 0.016
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "Python sandbox timeout rate > 1/min"
+          description: "User transform runtimes exceeding wall-clock limit; consider raising timeout or fixing regressions."
+
+      - alert: PythonSandboxOOM
+        expr: increase(python_sandbox_oom_kills_total[15m]) > 0
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "Python sandbox OOM kills detected"
+
+  - name: migration-platform-infra
+    interval: 30s
+    rules:
+      - alert: PostgresConnectionsHigh
+        expr: pg_stat_activity_count > 0.8 * pg_settings_max_connections
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "Postgres connection utilization > 80%"
+
+      - alert: RedisDown
+        expr: up{service="redis"} == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Redis scrape target is down"
+
+      - alert: TemporalDown
+        expr: up{service="temporal"} == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Temporal frontend scrape target is down"

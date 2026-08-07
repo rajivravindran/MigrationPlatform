@@ -1,0 +1,39 @@
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: migration-platform-ui-alerts
+    folder: Migration Platform
+    interval: 1m
+    rules:
+      - uid: mp-alert-job-failed-rows
+        title: Job failed-row ratio
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 600
+              to: 0
+            model:
+              expr: |
+                sum by (job_id) (rate(migration_job_rows_failed_total[10m]))
+                  /
+                clamp_min(sum by (job_id) (rate(migration_job_rows_processed_total[10m])), 1)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              type: threshold
+              conditions:
+                - evaluator: { params: [0.05], type: gt }
+              refId: C
+              expression: A
+        for: 10m
+        annotations:
+          summary: "Job {{ $labels.job_id }} failing > 5% of rows"
+        labels: { severity: warn }

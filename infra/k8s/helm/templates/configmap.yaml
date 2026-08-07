@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mp.fullname" . }}-env
+  labels: {{- include "mp.labels" . | nindent 4 }}
+data:
+  DATABASE_URL: {{ include "mp.postgresDSN" . | quote }}
+  REDIS_URL: {{ include "mp.redisURL" . | quote }}
+  TEMPORAL_ADDRESS: {{ include "mp.temporalAddress" . | quote }}
+  TEMPORAL_NAMESPACE: "default"
+  MINIO_ENDPOINT: {{ include "mp.minioEndpoint" . | quote }}
+  MINIO_BUCKET: "migration"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.{{ .Release.Namespace }}.svc.cluster.local:4317"
+  LOG_LEVEL: {{ .Values.global.logLevel | quote }}
+  DEPLOY_ENV: {{ .Values.global.environment | quote }}

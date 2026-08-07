@@ -1,0 +1,6 @@
+pet_name,category,pet_status,photo_url,order_quantity,ship_date,order_status
+Buddy,Dogs,available,https://images.example.com/buddy.jpg,1,2026-07-15T10:00:00Z,placed
+Mittens,Cats,pending,https://images.example.com/mittens.jpg,2,2026-07-16T14:30:00Z,approved
+Goldie,Fish,available,https://images.example.com/goldie.jpg,1,2026-07-17T09:00:00Z,placed
+Rex,Dogs,available,https://images.example.com/rex.jpg,1,2026-07-18T11:00:00Z,delivered
+Whiskers,Cats,pending,https://images.example.com/whiskers.jpg,3,2026-07-19T16:00:00Z,approved

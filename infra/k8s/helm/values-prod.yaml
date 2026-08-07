@@ -1,0 +1,46 @@
+global:
+  environment: prod
+
+api:
+  replicas: 6
+  hpa:
+    enabled: true
+    minReplicas: 6
+    maxReplicas: 40
+
+orchestrator:
+  replicas: 8
+  hpa:
+    enabled: true
+    minReplicas: 8
+    maxReplicas: 80
+  resources:
+    requests: { cpu: "1", memory: "1Gi" }
+    limits:   { cpu: "8", memory: "4Gi" }
+
+transformWorker:
+  replicas: 6
+  hpa:
+    enabled: true
+    minReplicas: 6
+    maxReplicas: 40
+
+web:
+  replicas: 4
+
+ingress:
+  enabled: true
+  hosts:
+    api: api.migration.example.com
+    web: app.migration.example.com
+
+postgresql:
+  primary:
+    persistence:
+      size: 500Gi
+    resources:
+      requests: { cpu: "2", memory: "4Gi" }
+      limits:   { cpu: "8", memory: "16Gi" }
+
+minio:
+  enabled: false # use external S3 in prod

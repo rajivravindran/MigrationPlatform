@@ -1,0 +1,74 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "mp.fullname" . }}-pg-backup
+  labels: {{- include "mp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: pgdump
+              image: {{ .Values.backup.image }}
+              env:
+                - name: PGHOST
+                  value: "{{ .Release.Name }}-postgresql"
+                - name: PGUSER
+                  value: {{ .Values.postgresql.auth.username }}
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Release.Name }}-postgresql
+                      key: password
+                - name: PGDATABASE
+                  value: {{ .Values.postgresql.auth.database }}
+                - name: S3_ENDPOINT
+                  value: {{ .Values.backup.endpoint | quote }}
+                - name: S3_BUCKET
+                  value: {{ .Values.backup.bucket | quote }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.accessKeySecretRef.name }}
+                      key: {{ .Values.backup.accessKeySecretRef.key }}
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backup.secretKeySecretRef.name }}
+                      key: {{ .Values.backup.secretKeySecretRef.key }}
+                - name: RETENTION_DAYS
+                  value: "{{ .Values.backup.retentionDays }}"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -euo pipefail
+                  apt-get update -qq && apt-get install -qq -y curl ca-certificates python3-pip >/dev/null
+                  pip3 install --quiet awscli-local awscli
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)
+                  DUMP=/tmp/migration-$TS.dump
+                  pg_dump --format=custom --no-owner --file "$DUMP" "$PGDATABASE"
+                  aws --endpoint-url "$S3_ENDPOINT" s3 cp "$DUMP" "s3://$S3_BUCKET/pg/$(basename $DUMP)"
+                  CUTOFF=$(date -u -d "@$(( $(date +%s) - RETENTION_DAYS*86400 ))" +%Y%m%dT%H%M%SZ)
+                  aws --endpoint-url "$S3_ENDPOINT" s3 ls "s3://$S3_BUCKET/pg/" \
+                    | awk '{print $4}' \
+                    | while read -r name; do
+                        case "$name" in
+                          migration-*.dump)
+                            ts=$(echo "$name" | sed -E 's/migration-(.*)\.dump/\1/')
+                            if [ "$ts" \< "$CUTOFF" ]; then
+                              aws --endpoint-url "$S3_ENDPOINT" s3 rm "s3://$S3_BUCKET/pg/$name"
+                            fi
+                            ;;
+                        esac
+                      done
+{{- end }}
