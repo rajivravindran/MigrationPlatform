@@ -13,3 +13,6 @@ data:
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.{{ .Release.Namespace }}.svc.cluster.local:4317"
   LOG_LEVEL: {{ .Values.global.logLevel | quote }}
   DEPLOY_ENV: {{ .Values.global.environment | quote }}
+  LICENSE_SERVER_URL: {{ .Values.license.serverURL | quote }}
+  ORCHESTRATOR_BRIDGE_URL: "http://{{ include "mp.fullname" . }}-orchestrator:7070"
+  API_INTERNAL_URL: "http://{{ include "mp.fullname" . }}-api:8080"

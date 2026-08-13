@@ -63,9 +63,12 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = cfg.api_bind.parse().context("parsing API_BIND")?;
     let listener = TcpListener::bind(addr).await.context("binding api port")?;
     info!(%addr, "migration-api listening");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .context("axum serve")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("axum serve")?;
 
     Ok(())
 }

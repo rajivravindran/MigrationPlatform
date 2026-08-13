@@ -1,0 +1,95 @@
+/* Shared lesson stylesheet — Tufte-ish, print-friendly */
+:root {
+  --fg: #1a1a1a;
+  --muted: #555;
+  --bg: #faf9f7;
+  --card: #fff;
+  --accent: #0b3d5c;
+  --line: #ddd;
+  --ok: #1b5e20;
+  --bad: #8b1e1e;
+  --focus: #0b57d0;
+}
+* { box-sizing: border-box; }
+html { font-size: 18px; }
+body {
+  margin: 0;
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 1.55;
+}
+main {
+  max-width: 42rem;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 4rem;
+}
+h1, h2, h3 {
+  font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+  font-weight: 650;
+  line-height: 1.25;
+  color: var(--accent);
+}
+h1 { font-size: 1.75rem; margin: 0 0 0.5rem; }
+h2 { font-size: 1.2rem; margin: 2rem 0 0.75rem; }
+h3 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; }
+p, li { color: var(--fg); }
+.muted, .meta { color: var(--muted); font-size: 0.92rem; }
+a { color: var(--focus); }
+pre, code, .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86rem;
+}
+pre {
+  background: var(--card);
+  border: 1px solid var(--line);
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+.diagram {
+  background: var(--card);
+  border: 1px solid var(--line);
+  padding: 1rem;
+  margin: 1rem 0;
+}
+.quiz {
+  border: 1px solid var(--line);
+  background: var(--card);
+  padding: 1rem 1.1rem;
+  margin: 1.25rem 0;
+}
+.quiz button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin: 0.4rem 0;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--line);
+  background: #f6f6f4;
+  font: inherit;
+  cursor: pointer;
+}
+.quiz button:hover, .quiz button:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.quiz .feedback { margin-top: 0.75rem; font-weight: 600; }
+.quiz .feedback.ok { color: var(--ok); }
+.quiz .feedback.bad { color: var(--bad); }
+.box {
+  border-left: 3px solid var(--accent);
+  padding: 0.25rem 0 0.25rem 0.9rem;
+  margin: 1rem 0;
+}
+footer {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+@media print {
+  body { background: #fff; }
+  .quiz button { border-color: #999; }
+}

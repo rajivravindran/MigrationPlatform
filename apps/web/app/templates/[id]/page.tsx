@@ -4,6 +4,8 @@ import MonacoEditor from "@monaco-editor/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FileUp,
+  AlertTriangle,
+  ChevronDown,
   Pencil,
   Plus,
   Sparkles,
@@ -31,7 +33,7 @@ import {
   type StepUI,
   type TargetKind
 } from "@/components/mapper/types";
-import { Badge, Button, Card, Input, Textarea } from "@/components/ui";
+import { Badge, Breadcrumbs, Button, Card, ErrorState, Input, LoadingState, PageHeader, Textarea } from "@/components/ui";
 import { apiFetch, getToken } from "@/lib/api";
 
 type ValueExpr =
@@ -323,12 +325,14 @@ function Designer({ template }: { template: Template }) {
   const [respPath, setRespPath] = useState("$.id");
   const [importUrl, setImportUrl] = useState("");
   const [importName, setImportName] = useState("");
+  const [dirty, setDirty] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const step = steps[active];
 
   const updateStep = useCallback(
     (idx: number, patch: Partial<StepUI> | ((s: StepUI) => StepUI)) => {
+      setDirty(true);
       setSteps((ss) =>
         ss.map((s, i) => (i === idx ? (typeof patch === "function" ? patch(s) : { ...s, ...patch }) : s))
       );
@@ -342,6 +346,7 @@ function Designer({ template }: { template: Template }) {
   );
 
   const applySample = useCallback((sample: SampleResponse, filename: string) => {
+    setDirty(true);
     setSrcNodes(
       sample.columns.map((col, i) =>
         makeFieldNode("src", col.name, i, { fieldType: col.type, label: col.name })
@@ -396,6 +401,7 @@ function Designer({ template }: { template: Template }) {
   const addSourceField = (name: string) => {
     const id = nodeIdFor("src", name);
     if (srcNodes.some((n) => n.id === id)) return void toast.error("Field already exists");
+    setDirty(true);
     setSrcNodes((ns) => [...ns, makeFieldNode("src", name, ns.length, { label: name, fieldType: "string" })]);
   };
 
@@ -428,6 +434,7 @@ function Designer({ template }: { template: Template }) {
   const addStep = (name: string) => {
     if (!STEP_NAME_RE.test(name)) return void toast.error("Step names must match [A-Za-z_][A-Za-z0-9_]*");
     if (steps.some((s) => s.name === name)) return void toast.error("Step name already used");
+    setDirty(true);
     setSteps((ss) => [...ss, { name, nodes: [], edges: [], url: "", method: "POST", responseSchema: null }]);
     setActive(steps.length);
   };
@@ -439,6 +446,7 @@ function Designer({ template }: { template: Template }) {
       (s, i) => i !== idx && s.nodes.some((n) => parseRespNode(n.id)?.step === name)
     );
     if (referenced) return void toast.error(`Later steps reference "${name}"'s response; remove those refs first`);
+    setDirty(true);
     setSteps((ss) => ss.filter((_, i) => i !== idx));
     setActive((a) => Math.max(0, a > idx ? a - 1 : Math.min(a, steps.length - 2)));
   };
@@ -459,6 +467,7 @@ function Designer({ template }: { template: Template }) {
       );
     }
     setSteps((ss) => ss.map((s, i) => (i === idx ? { ...s, name: newName } : s)));
+    setDirty(true);
     toast.success(`Renamed step to ${newName}`);
   };
 
@@ -548,6 +557,7 @@ function Designer({ template }: { template: Template }) {
       const src = initSrcNodes(res.template).length;
       setSrcNodes(initSrcNodes(res.template));
       setSteps(schemaSteps(res.template).map((s) => initStepUI(s, src)));
+      setDirty(true);
       setActive(0);
       toast.success(`Applied suggestion from ${res.model}${res.redacted ? " (samples were PII-redacted)" : ""}`);
     },
@@ -558,6 +568,17 @@ function Designer({ template }: { template: Template }) {
     () => deriveTemplateJson(template, srcNodes, steps),
     [template, srcNodes, steps]
   );
+  const validationErrors = useMemo(() => {
+    const issues: string[] = [];
+    if (srcNodes.filter((node) => node.id !== "src:__hint").length === 0) issues.push("Add at least one source field.");
+    steps.forEach((item, index) => {
+      if (!/^https?:\/\//.test(item.url)) issues.push(`Step ${index + 1} (${item.name}) needs an absolute HTTP(S) destination URL.`);
+      const targets = item.nodes.filter((node) => ["dst", "path", "query", "hdr"].includes(kindOfNode(node.id) ?? ""));
+      if (targets.length === 0) issues.push(`Step ${index + 1} (${item.name}) has no destination fields.`);
+      if (targets.some((target) => !item.edges.some((edge) => edge.target === target.id))) issues.push(`Step ${index + 1} (${item.name}) has unmapped destination fields.`);
+    });
+    return issues;
+  }, [srcNodes, steps]);
 
   const save = useMutation({
     mutationFn: async () =>
@@ -621,14 +642,13 @@ function Designer({ template }: { template: Template }) {
 
   return (
     <div className="space-y-4">
-      {/* Top bar */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <h1 className="text-xl font-semibold tracking-tight text-slate-900">{template.name}</h1>
+      <PageHeader
+        title={template.name}
+        description="Map source fields into one or more ordered destination calls. Save changes as a new draft version, then publish that version for jobs and schedules."
+        eyebrow={<Breadcrumbs items={[{ label: "Templates", href: "/templates" }, { label: template.name }]} />}
+        actions={<>
           <Badge tone={template.published ? "ok" : "warn"}>{template.published ? "published" : "draft"}</Badge>
           <span className="text-sm text-slate-500">v{template.version}</span>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
           <input
             ref={fileInputRef}
             type="file"
@@ -641,16 +661,24 @@ function Designer({ template }: { template: Template }) {
             {sample.isPending ? "Sampling…" : "Sample file"}
           </Button>
           <Button variant="ghost" onClick={() => dryRun.mutate()} disabled={dryRun.isPending}>
-            Dry run
+            {dryRun.isPending ? "Running…" : "Dry run"}
           </Button>
-          <Button onClick={() => save.mutate()} disabled={save.isPending}>
-            Save version
+          <Button variant="secondary" onClick={() => save.mutate()} disabled={save.isPending || !dirty || validationErrors.length > 0}>
+            {save.isPending ? "Saving…" : "Save new version"}
           </Button>
-          <Button onClick={() => publish.mutate()} disabled={publish.isPending || template.published}>
-            Publish
+          <Button onClick={() => window.confirm(`Publish ${template.name} v${template.version}? Jobs and schedules can use it immediately.`) && publish.mutate()} disabled={publish.isPending || template.published || dirty || validationErrors.length > 0}>
+            {publish.isPending ? "Publishing…" : "Publish version"}
           </Button>
+        </>}
+      />
+
+      {dirty ? <div className="rounded border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900">You have unsaved changes. Save a new version before publishing.</div> : null}
+      {validationErrors.length ? (
+        <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+          <div className="flex items-center gap-2 font-medium text-amber-950"><AlertTriangle className="h-4 w-4" />Resolve {validationErrors.length} validation issue{validationErrors.length === 1 ? "" : "s"}</div>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-amber-900">{validationErrors.map((issue) => <li key={issue}>{issue}</li>)}</ul>
         </div>
-      </div>
+      ) : null}
 
       {sampleSummary ? (
         <div className="flex items-center gap-2 text-xs text-slate-600">
@@ -752,12 +780,13 @@ function Designer({ template }: { template: Template }) {
           </div>
 
           <div className="h-[560px]">
+            <p className="sr-only">Connect a source field to a destination field using the mapping canvas. The mapping list below provides a text summary.</p>
             <MappingCanvas
               resetKey={`${active}:${step.name}`}
               srcNodes={srcNodes}
               stepNodes={step.nodes}
               edges={step.edges}
-              onSrcNodesChange={setSrcNodes}
+              onSrcNodesChange={(nodes) => { setDirty(true); setSrcNodes(nodes); }}
               onStepNodesChange={(nodes) => updateStep(active, { nodes })}
               onEdgesChange={(edges) => updateStep(active, { edges })}
             />
@@ -902,15 +931,18 @@ function Designer({ template }: { template: Template }) {
             </p>
           </Card>
 
-          <Card>
-            <h3 className="mb-2 text-sm font-semibold text-slate-900">Template JSON</h3>
+          <details className="group rounded-lg border border-slate-200 bg-white shadow-sm">
+            <summary className="flex cursor-pointer list-none items-center justify-between p-4 text-sm font-semibold text-slate-900">Advanced template JSON <ChevronDown className="h-4 w-4 transition group-open:rotate-180" /></summary>
+            <div className="border-t border-slate-100 p-3">
             <MonacoEditor
               height="180px"
               language="json"
               value={JSON.stringify(templateJson, null, 2)}
               options={{ readOnly: true, minimap: { enabled: false }, fontSize: 11, scrollBeyondLastLine: false }}
             />
-          </Card>
+            <p className="mt-2 text-xs text-slate-500">Read-only representation generated from the visual designer.</p>
+            </div>
+          </details>
 
           <Card>
             <h3 className="mb-2 text-sm font-semibold text-slate-900">Dry-run rows</h3>
@@ -1113,8 +1145,8 @@ export default function TemplatePage({ params }: { params: { id: string } }) {
     queryKey: ["template", params.id],
     queryFn: () => apiFetch<Template>(`/rule-templates/${params.id}`)
   });
-  if (isLoading) return <Card>Loading…</Card>;
-  if (error) return <Card className="text-sm text-rose-700">{String(error)}</Card>;
+  if (isLoading) return <LoadingState label="Loading template designer" />;
+  if (error) return <ErrorState error={error} />;
   if (!data) return null;
   return <Designer template={data} />;
 }

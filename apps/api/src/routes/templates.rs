@@ -21,12 +21,19 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/rule-templates", get(list_templates).post(create_template))
-        .route("/rule-templates/:id", get(get_template).delete(delete_template))
-        .route("/rule-templates/:id/versions", get(list_versions).post(create_version))
+        .route(
+            "/rule-templates/:id",
+            get(get_template).delete(delete_template),
+        )
+        .route(
+            "/rule-templates/:id/versions",
+            get(list_versions).post(create_version),
+        )
         .route("/rule-templates/:id/publish", post(publish_template))
 }
 
-const RULE_SCHEMA: &str = include_str!("../../../../packages/rule-schema/schema/rule-template.schema.json");
+const RULE_SCHEMA: &str =
+    include_str!("../../../../packages/rule-schema/schema/rule-template.schema.json");
 
 static COMPILED_SCHEMA: LazyLock<JSONSchema> = LazyLock::new(|| {
     let schema_value: Value = serde_json::from_str(RULE_SCHEMA).expect("schema parse");
@@ -38,7 +45,9 @@ static COMPILED_SCHEMA: LazyLock<JSONSchema> = LazyLock::new(|| {
 
 pub(crate) fn validate_template(body: &Value) -> ApiResult<RuleTemplate> {
     if let Err(errors) = COMPILED_SCHEMA.validate(body) {
-        let errs: Vec<String> = errors.map(|e| format!("{}: {}", e.instance_path, e)).collect();
+        let errs: Vec<String> = errors
+            .map(|e| format!("{}: {}", e.instance_path, e))
+            .collect();
         return Err(ApiError::ValidationFailed(errs.join("; ")));
     }
     let tpl: RuleTemplate = serde_json::from_value(body.clone())

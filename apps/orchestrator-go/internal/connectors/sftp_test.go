@@ -39,6 +39,25 @@ func TestParseSftpConfigDefaults(t *testing.T) {
 	require.Equal(t, "*.csv", cfg.Glob)
 	require.Equal(t, "migration", cfg.StagingBucket)
 	require.True(t, cfg.InsecureIgnoreHostKey)
+	require.Equal(t, int64(1<<30), cfg.MaxFileBytes)
+	require.Equal(t, 1000, cfg.MaxListEntries)
+	require.Equal(t, 30*time.Second, cfg.SettleAge)
+}
+
+func TestParseSftpConfigBounds(t *testing.T) {
+	cfg, err := ParseSftpConfig(map[string]any{
+		"host": "sftp.example.com", "username": "drop",
+		"max_file_bytes": "4096", "max_list_entries": float64(25), "settle_seconds": float64(60),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(4096), cfg.MaxFileBytes)
+	require.Equal(t, 25, cfg.MaxListEntries)
+	require.Equal(t, time.Minute, cfg.SettleAge)
+
+	_, err = ParseSftpConfig(map[string]any{
+		"host": "sftp.example.com", "username": "drop", "max_list_entries": float64(10001),
+	})
+	require.Error(t, err)
 }
 
 func TestParseSftpConfigRequiresHostUser(t *testing.T) {

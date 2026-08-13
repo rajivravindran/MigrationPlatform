@@ -14,14 +14,14 @@ import (
 )
 
 type watchStub struct {
-	conn           activities.LoadConnectorOutput
-	objects        []connectors.ObjectInfo
-	jobs           []activities.StartWatchObjectJobInput
-	batches        []activities.StartBatchInput
-	cursor         map[string]string
-	staged         []activities.StageSftpObjectInput
-	stagingBucket  string
-	stagingPrefix  string
+	conn          activities.LoadConnectorOutput
+	objects       []connectors.ObjectInfo
+	jobs          []activities.StartWatchObjectJobInput
+	batches       []activities.StartBatchInput
+	cursor        map[string]string
+	staged        []activities.StageSftpObjectInput
+	stagingBucket string
+	stagingPrefix string
 }
 
 func (s *watchStub) LoadConnector(_ context.Context, _ activities.LoadConnectorInput) (activities.LoadConnectorOutput, error) {
@@ -64,10 +64,13 @@ func (s *watchStub) StartBatch(_ context.Context, in activities.StartBatchInput)
 	wid := activities.BatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag)
 	return activities.StartBatchOutput{BatchID: int64(len(s.batches)), WorkflowID: wid, Created: true}, nil
 }
-func (s *watchStub) MarkJobRunning(_ context.Context, _ activities.MarkJobRunningInput) error { return nil }
+func (s *watchStub) MarkJobRunning(_ context.Context, _ activities.MarkJobRunningInput) error {
+	return nil
+}
 func (s *watchStub) MarkBatchRunning(_ context.Context, _ activities.MarkBatchRunningInput) error {
 	return nil
 }
+func (s *watchStub) RequireLicensed(_ context.Context) error { return nil }
 func (s *watchStub) AdvanceConnectorCursor(_ context.Context, in activities.AdvanceConnectorCursorInput) error {
 	s.cursor = in.Seen
 	return nil
@@ -91,6 +94,9 @@ func (s *watchStub) PublishProgress(_ context.Context, _ activities.PublishProgr
 	return nil
 }
 func (s *watchStub) FinalizeJob(_ context.Context, _ activities.FinalizeJobInput) error { return nil }
+func (s *watchStub) ExportJobResults(_ context.Context, _ activities.ExportJobResultsInput) error {
+	return nil
+}
 func (s *watchStub) LoadRowState(_ context.Context, _ activities.LoadRowStateInput) (activities.LoadRowStateOutput, error) {
 	return activities.LoadRowStateOutput{}, nil
 }
@@ -125,7 +131,9 @@ func (s *watchStub) StartBatchStageJob(_ context.Context, in activities.StartBat
 func (s *watchStub) FinalizeBatchStage(_ context.Context, _ activities.FinalizeBatchStageInput) error {
 	return nil
 }
-func (s *watchStub) FinalizeBatch(_ context.Context, _ activities.FinalizeBatchInput) error { return nil }
+func (s *watchStub) FinalizeBatch(_ context.Context, _ activities.FinalizeBatchInput) error {
+	return nil
+}
 func (s *watchStub) QuarantineArchive(_ context.Context, _ activities.QuarantineArchiveInput) (activities.QuarantineArchiveOutput, error) {
 	return activities.QuarantineArchiveOutput{}, nil
 }
@@ -231,6 +239,7 @@ func TestWatchPrefixWorkflowSftpStagesAndStarts(t *testing.T) {
 }
 
 func registerWatchStub(env *testsuite.TestWorkflowEnvironment, stub *watchStub) {
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.LoadConnector, activities.RegisterOptions("LoadConnector"))
 	env.RegisterActivityWithOptions(stub.ListPrefixObjects, activities.RegisterOptions("ListPrefixObjects"))
 	env.RegisterActivityWithOptions(stub.ListSftpObjects, activities.RegisterOptions("ListSftpObjects"))
@@ -247,6 +256,7 @@ func registerWatchStub(env *testsuite.TestWorkflowEnvironment, stub *watchStub) 
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
 	env.RegisterActivityWithOptions(stub.FinalizeJob, activities.RegisterOptions("FinalizeJob"))
+	env.RegisterActivityWithOptions(stub.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
 	env.RegisterActivityWithOptions(stub.UnpackAndStageArchive, activities.RegisterOptions("UnpackAndStageArchive"))
 	env.RegisterActivityWithOptions(stub.MaterializeBatchStages, activities.RegisterOptions("MaterializeBatchStages"))
@@ -390,9 +400,9 @@ func TestBatchWorkflowDAGContinueAllowsSibling(t *testing.T) {
 	var result BatchWorkflowResult
 	require.NoError(t, env.GetWorkflowResult(&result))
 	require.Equal(t, "partial", result.Status)
-	require.Equal(t, 1, result.StagesOK)       // b succeeds
-	require.Equal(t, 2, result.StagesFailed)   // a failed + c skipped
-	require.Equal(t, 1, stub.startedJobs)      // only b
+	require.Equal(t, 1, result.StagesOK)     // b succeeds
+	require.Equal(t, 2, result.StagesFailed) // a failed + c skipped
+	require.Equal(t, 1, stub.startedJobs)    // only b
 }
 
 type batchStub struct {
@@ -401,6 +411,8 @@ type batchStub struct {
 	startedJobs int
 	finalStatus string
 }
+
+func (s *batchStub) RequireLicensed(_ context.Context) error { return nil }
 
 func (s *batchStub) MarkBatchRunning(_ context.Context, _ activities.MarkBatchRunningInput) error {
 	return nil
@@ -429,7 +441,9 @@ func (s *batchStub) StartBatchStageJob(_ context.Context, in activities.StartBat
 		JobID: int64(s.startedJobs), WorkflowID: activities.StageWorkflowID(in.BatchID, in.StageKey), Created: true,
 	}, nil
 }
-func (s *batchStub) MarkJobRunning(_ context.Context, _ activities.MarkJobRunningInput) error { return nil }
+func (s *batchStub) MarkJobRunning(_ context.Context, _ activities.MarkJobRunningInput) error {
+	return nil
+}
 func (s *batchStub) FinalizeBatchStage(_ context.Context, _ activities.FinalizeBatchStageInput) error {
 	return nil
 }
@@ -459,6 +473,9 @@ func (s *batchStub) PublishProgress(_ context.Context, _ activities.PublishProgr
 	return nil
 }
 func (s *batchStub) FinalizeJob(_ context.Context, _ activities.FinalizeJobInput) error { return nil }
+func (s *batchStub) ExportJobResults(_ context.Context, _ activities.ExportJobResultsInput) error {
+	return nil
+}
 func (s *batchStub) LoadRowState(_ context.Context, _ activities.LoadRowStateInput) (activities.LoadRowStateOutput, error) {
 	return activities.LoadRowStateOutput{}, nil
 }
@@ -466,6 +483,7 @@ func (s *batchStub) LoadRowState(_ context.Context, _ activities.LoadRowStateInp
 func registerBatchStub(env *testsuite.TestWorkflowEnvironment, stub *batchStub) {
 	env.RegisterActivityWithOptions(stub.MarkBatchRunning, activities.RegisterOptions("MarkBatchRunning"))
 	env.RegisterActivityWithOptions(stub.UnpackAndStageArchive, activities.RegisterOptions("UnpackAndStageArchive"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.MaterializeBatchStages, activities.RegisterOptions("MaterializeBatchStages"))
 	env.RegisterActivityWithOptions(stub.StartBatchStageJob, activities.RegisterOptions("StartBatchStageJob"))
 	env.RegisterActivityWithOptions(stub.MarkJobRunning, activities.RegisterOptions("MarkJobRunning"))
@@ -479,5 +497,6 @@ func registerBatchStub(env *testsuite.TestWorkflowEnvironment, stub *batchStub) 
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
 	env.RegisterActivityWithOptions(stub.FinalizeJob, activities.RegisterOptions("FinalizeJob"))
+	env.RegisterActivityWithOptions(stub.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
 }

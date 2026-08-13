@@ -38,14 +38,14 @@ pub struct JwtKeys {
 
 impl JwtKeys {
     pub fn load(cfg: &Config) -> Result<Self> {
-        let (private_pem, public_pem) =
-            match (&cfg.jwt_private_key_path, &cfg.jwt_public_key_path) {
-                (Some(priv_path), Some(pub_path)) => (
-                    fs::read(priv_path).context("read JWT private key")?,
-                    fs::read(pub_path).context("read JWT public key")?,
-                ),
-                _ => generate_ephemeral_keypair()?,
-            };
+        let (private_pem, public_pem) = match (&cfg.jwt_private_key_path, &cfg.jwt_public_key_path)
+        {
+            (Some(priv_path), Some(pub_path)) => (
+                fs::read(priv_path).context("read JWT private key")?,
+                fs::read(pub_path).context("read JWT public key")?,
+            ),
+            _ => generate_ephemeral_keypair()?,
+        };
 
         let encoding = EncodingKey::from_rsa_pem(&private_pem).context("parse RSA private key")?;
         let decoding = DecodingKey::from_rsa_pem(&public_pem).context("parse RSA public key")?;
@@ -74,9 +74,10 @@ impl JwtKeys {
 
     pub fn verify(&self, token: &str) -> ApiResult<Claims> {
         let mut v = Validation::new(Algorithm::RS256);
-        v.set_issuer(&[self.issuer.clone()]);
-        v.set_audience(&[self.audience.clone()]);
-        let data = decode::<Claims>(token, &self.decoding, &v).map_err(|_| ApiError::Unauthorized)?;
+        v.set_issuer(std::slice::from_ref(&self.issuer));
+        v.set_audience(std::slice::from_ref(&self.audience));
+        let data =
+            decode::<Claims>(token, &self.decoding, &v).map_err(|_| ApiError::Unauthorized)?;
         Ok(data.claims)
     }
 }

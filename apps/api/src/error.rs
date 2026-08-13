@@ -45,7 +45,9 @@ impl ApiError {
             ApiError::LicenseRequired(_) => (StatusCode::PAYMENT_REQUIRED, "license_required"),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
-            ApiError::ValidationFailed(_) => (StatusCode::UNPROCESSABLE_ENTITY, "validation_failed"),
+            ApiError::ValidationFailed(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "validation_failed")
+            }
             ApiError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             ApiError::Database(_) | ApiError::Json(_) | ApiError::Io(_) | ApiError::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
@@ -71,6 +73,10 @@ impl IntoResponse for ApiError {
             }
             other => other.to_string(),
         };
-        (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
+        (
+            status,
+            Json(json!({ "error": { "code": code, "message": message } })),
+        )
+            .into_response()
     }
 }

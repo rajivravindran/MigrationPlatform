@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { toast } from "sonner";
 
-import { Button, Card, Input } from "@/components/ui";
+import { Breadcrumbs, Button, Card, FormField, Input, PageHeader } from "@/components/ui";
 import { apiFetch } from "@/lib/api";
 
 const SKELETON = {
@@ -39,18 +39,17 @@ export default function NewTemplatePage() {
   }
 
   return (
-    <div className="max-w-xl">
+    <div className="mx-auto max-w-2xl space-y-6">
+      <PageHeader title="Create template" description="Start a draft mapping definition. Source fields, destination operations, and validation are configured in the designer." eyebrow={<Breadcrumbs items={[{ label: "Templates", href: "/templates" }, { label: "Create" }]} />} />
       <Card>
-        <h1 className="mb-4 text-xl font-semibold">Create rule template</h1>
-        <label className="mb-3 block text-sm">
-          Name
-          <Input className="mt-1" value={name} onChange={(e) => setName(e.target.value)} />
-        </label>
+        <FormField label="Template name" required hint="Use a stable business name operators can recognize in jobs and schedules.">
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Customer account import" />
+        </FormField>
         <p className="mb-4 text-xs text-slate-500">
-          A blank template is created in draft. You&apos;ll configure source schema, mapping, and destination on the next screen.
+          A draft is created first. It cannot be used by jobs or schedules until its mapping is valid and the version is published.
         </p>
         <Button onClick={create} disabled={busy || !name}>
-          {busy ? "Creating..." : "Create"}
+          {busy ? "Creating…" : "Create draft"}
         </Button>
       </Card>
     </div>

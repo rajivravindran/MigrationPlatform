@@ -18,7 +18,12 @@ use crate::temporal::normalise_spec;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/schedules", get(list_schedules).post(create_schedule))
-        .route("/schedules/:id", get(get_schedule).put(update_schedule).delete(delete_schedule))
+        .route(
+            "/schedules/:id",
+            get(get_schedule)
+                .put(update_schedule)
+                .delete(delete_schedule),
+        )
         .route("/schedules/:id/pause", post(pause_schedule))
         .route("/schedules/:id/resume", post(resume_schedule))
         .route("/schedules/:id/trigger", post(trigger_schedule))
@@ -64,11 +69,17 @@ async fn create_schedule(
 ) -> ApiResult<Json<ScheduleRow>> {
     require_role(&claims, &["admin", "editor"])?;
     crate::security::license::require_licensed()?;
-    let normalised_spec = normalise_spec(&req.spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let normalised_spec =
+        normalise_spec(&req.spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let timezone = req.timezone.unwrap_or_else(|| "UTC".to_string());
     let overlap = req.overlap_policy.unwrap_or_else(|| "skip".to_string());
-    if !matches!(overlap.as_str(), "skip" | "buffer_one" | "buffer_all" | "cancel_other" | "allow_all") {
-        return Err(ApiError::BadRequest(format!("invalid overlap_policy {overlap}")));
+    if !matches!(
+        overlap.as_str(),
+        "skip" | "buffer_one" | "buffer_all" | "cancel_other" | "allow_all"
+    ) {
+        return Err(ApiError::BadRequest(format!(
+            "invalid overlap_policy {overlap}"
+        )));
     }
     let catchup = req.catchup_window_seconds.unwrap_or(3600).max(0);
     let enabled = req.enabled.unwrap_or(true);
@@ -179,6 +190,9 @@ async fn update_schedule(
     Json(req): Json<UpdateSchedule>,
 ) -> ApiResult<Json<ScheduleRow>> {
     require_role(&claims, &["admin", "editor"])?;
+    if req.enabled == Some(true) {
+        crate::security::license::require_licensed()?;
+    }
     let mut existing: ScheduleRow = sqlx::query_as(
         "SELECT id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, created_by, created_at, updated_at
          FROM schedules WHERE id = $1 AND org_id = $2",
@@ -204,17 +218,34 @@ async fn update_schedule(
         existing.enabled = enabled;
         if let Some(id) = existing.temporal_schedule_id.clone() {
             if enabled {
-                state.temporal.unpause_schedule(&id).await.map_err(|e| ApiError::External(e.to_string()))?;
+                state
+                    .temporal
+                    .unpause_schedule(&id)
+                    .await
+                    .map_err(|e| ApiError::External(e.to_string()))?;
             } else {
-                state.temporal.pause_schedule(&id).await.map_err(|e| ApiError::External(e.to_string()))?;
+                state
+                    .temporal
+                    .pause_schedule(&id)
+                    .await
+                    .map_err(|e| ApiError::External(e.to_string()))?;
             }
         }
     }
-    if let Some(c) = req.catchup_window_seconds { existing.catchup_window_seconds = c.max(0); }
-    if let Some(tz) = req.timezone { existing.timezone = tz; }
+    if let Some(c) = req.catchup_window_seconds {
+        existing.catchup_window_seconds = c.max(0);
+    }
+    if let Some(tz) = req.timezone {
+        existing.timezone = tz;
+    }
     if let Some(overlap) = req.overlap_policy {
-        if !matches!(overlap.as_str(), "skip"|"buffer_one"|"buffer_all"|"cancel_other"|"allow_all") {
-            return Err(ApiError::BadRequest(format!("invalid overlap_policy {overlap}")));
+        if !matches!(
+            overlap.as_str(),
+            "skip" | "buffer_one" | "buffer_all" | "cancel_other" | "allow_all"
+        ) {
+            return Err(ApiError::BadRequest(format!(
+                "invalid overlap_policy {overlap}"
+            )));
         }
         existing.overlap_policy = overlap;
     }
@@ -233,7 +264,17 @@ async fn update_schedule(
     .bind(claims.org)
     .fetch_one(&state.db)
     .await?;
-    record_audit(&state.db, claims.org, &claims.sub, "schedule", Some(id.to_string()), "update", None, Some(&serde_json::to_value(&row)?)).await?;
+    record_audit(
+        &state.db,
+        claims.org,
+        &claims.sub,
+        "schedule",
+        Some(id.to_string()),
+        "update",
+        None,
+        Some(&serde_json::to_value(&row)?),
+    )
+    .await?;
     Ok(Json(row))
 }
 
@@ -252,7 +293,11 @@ async fn delete_schedule(
     .await?
     .flatten();
     if let Some(sid) = sched_id {
-        state.temporal.delete_schedule(&sid).await.map_err(|e| ApiError::External(e.to_string()))?;
+        state
+            .temporal
+            .delete_schedule(&sid)
+            .await
+            .map_err(|e| ApiError::External(e.to_string()))?;
     }
     let affected = sqlx::query("DELETE FROM schedules WHERE id = $1 AND org_id = $2")
         .bind(id)
@@ -260,36 +305,111 @@ async fn delete_schedule(
         .execute(&state.db)
         .await?
         .rows_affected();
-    if affected == 0 { return Err(ApiError::NotFound); }
-    record_audit(&state.db, claims.org, &claims.sub, "schedule", Some(id.to_string()), "delete", None, None).await?;
+    if affected == 0 {
+        return Err(ApiError::NotFound);
+    }
+    record_audit(
+        &state.db,
+        claims.org,
+        &claims.sub,
+        "schedule",
+        Some(id.to_string()),
+        "delete",
+        None,
+        None,
+    )
+    .await?;
     Ok(Json(json!({"deleted": true})))
 }
 
-async fn pause_schedule(State(s): State<AppState>, AuthUser(c): AuthUser, Path(id): Path<i64>) -> ApiResult<impl IntoResponse> {
+async fn pause_schedule(
+    State(s): State<AppState>,
+    AuthUser(c): AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
     require_role(&c, &["admin", "editor", "operator"])?;
     let sid = temporal_id(&s.db, id, c.org).await?;
-    s.temporal.pause_schedule(&sid).await.map_err(|e| ApiError::External(e.to_string()))?;
-    sqlx::query("UPDATE schedules SET enabled = false, updated_at = now() WHERE id = $1 AND org_id = $2")
-        .bind(id).bind(c.org).execute(&s.db).await?;
-    record_audit(&s.db, c.org, &c.sub, "schedule", Some(id.to_string()), "pause", None, None).await?;
+    s.temporal
+        .pause_schedule(&sid)
+        .await
+        .map_err(|e| ApiError::External(e.to_string()))?;
+    sqlx::query(
+        "UPDATE schedules SET enabled = false, updated_at = now() WHERE id = $1 AND org_id = $2",
+    )
+    .bind(id)
+    .bind(c.org)
+    .execute(&s.db)
+    .await?;
+    record_audit(
+        &s.db,
+        c.org,
+        &c.sub,
+        "schedule",
+        Some(id.to_string()),
+        "pause",
+        None,
+        None,
+    )
+    .await?;
     Ok(Json(json!({"id": id, "enabled": false})))
 }
 
-async fn resume_schedule(State(s): State<AppState>, AuthUser(c): AuthUser, Path(id): Path<i64>) -> ApiResult<impl IntoResponse> {
+async fn resume_schedule(
+    State(s): State<AppState>,
+    AuthUser(c): AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
     require_role(&c, &["admin", "editor", "operator"])?;
+    crate::security::license::require_licensed()?;
     let sid = temporal_id(&s.db, id, c.org).await?;
-    s.temporal.unpause_schedule(&sid).await.map_err(|e| ApiError::External(e.to_string()))?;
-    sqlx::query("UPDATE schedules SET enabled = true, updated_at = now() WHERE id = $1 AND org_id = $2")
-        .bind(id).bind(c.org).execute(&s.db).await?;
-    record_audit(&s.db, c.org, &c.sub, "schedule", Some(id.to_string()), "resume", None, None).await?;
+    s.temporal
+        .unpause_schedule(&sid)
+        .await
+        .map_err(|e| ApiError::External(e.to_string()))?;
+    sqlx::query(
+        "UPDATE schedules SET enabled = true, updated_at = now() WHERE id = $1 AND org_id = $2",
+    )
+    .bind(id)
+    .bind(c.org)
+    .execute(&s.db)
+    .await?;
+    record_audit(
+        &s.db,
+        c.org,
+        &c.sub,
+        "schedule",
+        Some(id.to_string()),
+        "resume",
+        None,
+        None,
+    )
+    .await?;
     Ok(Json(json!({"id": id, "enabled": true})))
 }
 
-async fn trigger_schedule(State(s): State<AppState>, AuthUser(c): AuthUser, Path(id): Path<i64>) -> ApiResult<impl IntoResponse> {
+async fn trigger_schedule(
+    State(s): State<AppState>,
+    AuthUser(c): AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
     require_role(&c, &["admin", "editor", "operator"])?;
+    crate::security::license::require_licensed()?;
     let sid = temporal_id(&s.db, id, c.org).await?;
-    s.temporal.trigger_schedule(&sid).await.map_err(|e| ApiError::External(e.to_string()))?;
-    record_audit(&s.db, c.org, &c.sub, "schedule", Some(id.to_string()), "trigger_now", None, None).await?;
+    s.temporal
+        .trigger_schedule(&sid)
+        .await
+        .map_err(|e| ApiError::External(e.to_string()))?;
+    record_audit(
+        &s.db,
+        c.org,
+        &c.sub,
+        "schedule",
+        Some(id.to_string()),
+        "trigger_now",
+        None,
+        None,
+    )
+    .await?;
     Ok(Json(json!({"id": id, "triggered": true})))
 }
 
@@ -299,10 +419,23 @@ async fn list_runs(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<Value>> {
     // Ensure ownership.
-    let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM schedules WHERE id = $1 AND org_id = $2)")
-        .bind(id).bind(claims.org).fetch_one(&state.db).await?;
-    if !owned { return Err(ApiError::NotFound); }
-    let rows: Vec<(i64, Option<i64>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, String)> = sqlx::query_as(
+    let owned: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM schedules WHERE id = $1 AND org_id = $2)")
+            .bind(id)
+            .bind(claims.org)
+            .fetch_one(&state.db)
+            .await?;
+    if !owned {
+        return Err(ApiError::NotFound);
+    }
+    type ScheduleRun = (
+        i64,
+        Option<i64>,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        String,
+    );
+    let rows: Vec<ScheduleRun> = sqlx::query_as(
         "SELECT id, job_id, scheduled_time, actual_start_time, status::text AS status
          FROM schedule_runs WHERE schedule_id = $1 ORDER BY scheduled_time DESC LIMIT 100",
     )

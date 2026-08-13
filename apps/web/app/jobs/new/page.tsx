@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { Button, Card, Input } from "@/components/ui";
+import { Breadcrumbs, Button, Card, FormField, Input, PageHeader, Select, Textarea } from "@/components/ui";
 import { apiFetch, getToken } from "@/lib/api";
 
 type Template = { id: number; name: string; published: boolean; version: number };
@@ -15,6 +15,8 @@ export default function NewJobPage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [templateId, setTemplateId] = useState<number | null>(null);
   const [connectorOverride, setConnectorOverride] = useState("");
+  const [advanced, setAdvanced] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
 
   const templates = useQuery({
     queryKey: ["templates", "published"],
@@ -24,7 +26,8 @@ export default function NewJobPage() {
 
   const start = useMutation({
     mutationFn: async () => {
-      if (!templateId) throw new Error("pick a template");
+      setSubmitted(true);
+      if (!templateId) throw new Error("Select a published template.");
       let sourceRef: Record<string, unknown>;
       if (fileRef.current?.files?.[0]) {
         const form = new FormData();
@@ -40,7 +43,7 @@ export default function NewJobPage() {
       } else if (connectorOverride) {
         sourceRef = JSON.parse(connectorOverride);
       } else {
-        throw new Error("upload a file or paste a source_ref JSON");
+        throw new Error("Upload a source file or provide an advanced source reference.");
       }
       return apiFetch<{ id: number }>("/jobs", {
         method: "POST",
@@ -57,50 +60,56 @@ export default function NewJobPage() {
   const published = templates.data?.items ?? [];
 
   return (
-    <div className="max-w-2xl space-y-4">
-      <h1 className="text-2xl font-semibold">Start a new job</h1>
+    <div className="mx-auto max-w-3xl space-y-6">
+      <PageHeader title="Start a job" description="Run a published migration template against an uploaded source file." eyebrow={<Breadcrumbs items={[{ label: "Jobs", href: "/jobs" }, { label: "Start" }]} />} />
 
       <Card>
-        <h2 className="mb-2 text-lg font-medium">1. Choose a published template</h2>
+        <h2 className="mb-1 text-lg font-semibold">1. Choose a migration template</h2>
+        <p className="mb-4 text-sm text-slate-500">Jobs use the selected published version.</p>
         {published.length === 0 ? (
           <p className="text-sm text-slate-500">No published templates. Publish one from the Templates page first.</p>
         ) : (
-          <select
-            className="w-full rounded border border-slate-300 px-2 py-1.5 text-sm"
+          <FormField label="Published template" required error={submitted && !templateId ? "Select a template." : undefined}>
+          <Select
             value={templateId ?? ""}
-            onChange={(e) => setTemplateId(Number(e.target.value))}
+            onChange={(e) => setTemplateId(e.target.value ? Number(e.target.value) : null)}
           >
-            <option value="">— select —</option>
+            <option value="">Select a template…</option>
             {published.map((t) => (
               <option key={t.id} value={t.id}>{t.name} (v{t.version})</option>
             ))}
-          </select>
+          </Select>
+          </FormField>
         )}
       </Card>
 
       <Card>
-        <h2 className="mb-2 text-lg font-medium">2. Source</h2>
+        <h2 className="mb-1 text-lg font-semibold">2. Add source data</h2>
+        <p className="mb-4 text-sm text-slate-500">CSV, JSON, NDJSON, and XML files are supported.</p>
         <div className="space-y-3">
-          <div>
-            <div className="mb-1 text-xs text-slate-500">Upload a file (CSV/JSON/XML)</div>
-            <Input type="file" ref={fileRef} />
-          </div>
-          <div className="text-center text-xs uppercase text-slate-400">— or —</div>
-          <div>
-            <div className="mb-1 text-xs text-slate-500">Paste a source_ref JSON (connector-driven)</div>
-            <textarea
-              className="h-28 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+          <FormField label="Source file" required={!advanced} hint="The file is uploaded securely before the job starts.">
+            <Input type="file" ref={fileRef} accept=".csv,.json,.ndjson,.jsonl,.xml" />
+          </FormField>
+          <details onToggle={(event) => setAdvanced(event.currentTarget.open)} className="rounded border border-slate-200">
+            <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-slate-700">Advanced source reference</summary>
+            <div className="border-t border-slate-100 p-3">
+            <FormField label="Source reference JSON" hint="For connector-driven sources. This object is passed to the jobs API unchanged.">
+            <Textarea
+              className="font-mono text-xs"
+              rows={6}
               placeholder='{"type":"salesforce","connectorId":3,"extra":{"soql":"SELECT Id FROM Account"}}'
               value={connectorOverride}
               onChange={(e) => setConnectorOverride(e.target.value)}
             />
-          </div>
+            </FormField>
+            </div>
+          </details>
         </div>
       </Card>
 
-      <Button onClick={() => start.mutate()} disabled={start.isPending || !templateId}>
-        {start.isPending ? "Starting..." : "Start job"}
-      </Button>
+      <div className="flex justify-end border-t border-slate-200 pt-5"><Button onClick={() => start.mutate()} disabled={start.isPending || !templateId}>
+        {start.isPending ? "Uploading and starting…" : "Start job"}
+      </Button></div>
     </div>
   );
 }

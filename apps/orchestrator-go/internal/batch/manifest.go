@@ -3,10 +3,15 @@
 package batch
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"regexp"
 	"strings"
 )
+
+var safeStageID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 // Manifest is the root document required inside every batch archive.
 type Manifest struct {
@@ -30,8 +35,13 @@ type ManifestStage struct {
 // ParseManifest unmarshals and validates a batch manifest.
 func ParseManifest(raw []byte) (*Manifest, error) {
 	var m Manifest
-	if err := json.Unmarshal(raw, &m); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&m); err != nil {
 		return nil, fmt.Errorf("manifest json: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("manifest json: trailing content")
 	}
 	if err := m.Validate(); err != nil {
 		return nil, err
@@ -61,6 +71,9 @@ func (m *Manifest) Validate() error {
 	for i, s := range m.Stages {
 		if strings.TrimSpace(s.ID) == "" {
 			return fmt.Errorf("stages[%d].id is required", i)
+		}
+		if !safeStageID.MatchString(s.ID) {
+			return fmt.Errorf("stages[%d].id %q is not a safe path component", i, s.ID)
 		}
 		if _, ok := seen[s.ID]; ok {
 			return fmt.Errorf("duplicate stage id %q", s.ID)

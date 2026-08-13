@@ -1,0 +1,5 @@
+**/*signing_key*.pem
+**/dev_license_signing_key.pem
+.git
+target
+**/node_modules

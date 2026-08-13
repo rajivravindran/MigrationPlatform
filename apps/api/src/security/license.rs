@@ -131,7 +131,9 @@ pub async fn enforce_at_startup() -> Result<()> {
     let enforce = std::env::var("LICENSE_ENFORCE").ok().as_deref() == Some("true");
     let _ = ENFORCE.set(enforce);
 
-    let fp = install_fingerprint();
+    let fp = install_fingerprint().context(
+        "loading durable installation ID; mount LICENSE_INSTALLATION_ID_PATH on shared durable storage",
+    )?;
     tracing::info!(fingerprint = %short_fingerprint(&fp), "install fingerprint ready");
     let _ = FINGERPRINT.set(fp.clone());
 
@@ -167,6 +169,8 @@ pub async fn enforce_at_startup() -> Result<()> {
 }
 
 fn activate(doc: LicenseDoc) {
+    metrics::counter!("license_activation_total", "kind" => format!("{:?}", doc.kind).to_lowercase())
+        .increment(1);
     tracing::info!(
         licensee = %doc.licensee,
         kind = ?doc.kind,
@@ -241,13 +245,20 @@ async fn activate_trial_phone_home(fp: &str) -> Result<LicenseDoc> {
 
     let resp = client
         .post(&url)
+        .bearer_auth(
+            std::env::var("LICENSE_SERVER_TOKEN")
+                .context("LICENSE_SERVER_TOKEN is required for trial activation")?,
+        )
         .json(&body)
         .send()
         .await
         .with_context(|| format!("calling license server {url}"))?;
 
     let status = resp.status();
-    let raw = resp.text().await.context("reading license server response")?;
+    let raw = resp
+        .text()
+        .await
+        .context("reading license server response")?;
     if !status.is_success() {
         bail!("license server returned {status}: {raw}");
     }
@@ -332,7 +343,11 @@ pub fn verify_license(raw: &str, key: &RsaPublicKey) -> Result<LicenseDoc> {
     let doc: LicenseDoc =
         serde_json::from_value(file.license).context("license payload has an invalid shape")?;
     if doc.expires_at <= Utc::now() {
-        bail!("license for {:?} expired at {}", doc.licensee, doc.expires_at);
+        bail!(
+            "license for {:?} expired at {}",
+            doc.licensee,
+            doc.expires_at
+        );
     }
     Ok(doc)
 }
@@ -358,6 +373,11 @@ pub fn require_licensed() -> Result<(), crate::error::ApiError> {
     if is_licensed() {
         return Ok(());
     }
+    if active_license().is_some_and(|doc| doc.expires_at <= Utc::now()) {
+        metrics::counter!("license_expired_denied_total").increment(1);
+    }
+    metrics::counter!("license_denied_total").increment(1);
+    tracing::warn!("work-producing operation denied by runtime license gate");
     Err(crate::error::ApiError::LicenseRequired(
         "A valid license is required. Start a trial (LICENSE_SERVER_URL) or mount a commercial \
          LICENSE_FILE. See Settings → License."

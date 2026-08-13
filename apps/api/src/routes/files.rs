@@ -139,15 +139,13 @@ async fn sample_file(
         .bucket
         .clone()
         .unwrap_or_else(|| state.cfg.minio_bucket.clone());
-    let row_cap = req.rows.unwrap_or(DEFAULT_ROW_CAP).min(MAX_ROW_CAP).max(1);
+    let row_cap = req.rows.unwrap_or(DEFAULT_ROW_CAP).clamp(1, MAX_ROW_CAP);
     let format = req
         .format
         .clone()
         .or_else(|| sniff_format_from_key(&req.key))
         .ok_or_else(|| {
-            ApiError::BadRequest(
-                "could not determine format; pass `format` (csv|json|xml)".into(),
-            )
+            ApiError::BadRequest("could not determine format; pass `format` (csv|json|xml)".into())
         })?;
     let format = format.to_ascii_lowercase();
 
@@ -176,7 +174,9 @@ async fn sample_file(
 
     let result = match format.as_str() {
         "csv" => sampling::csv::sample(&body_bytes, row_cap, truncated_input),
-        "json" | "ndjson" | "jsonl" => sampling::json::sample(&body_bytes, row_cap, truncated_input),
+        "json" | "ndjson" | "jsonl" => {
+            sampling::json::sample(&body_bytes, row_cap, truncated_input)
+        }
         "xml" => sampling::xml::sample(
             &body_bytes,
             row_cap,

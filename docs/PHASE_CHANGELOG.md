@@ -5,6 +5,9 @@
 Per-phase record of what changed, key files, how to test, what is NOT done, and
 locked product decisions. Companion to [`AGENT_HANDOFF.md`](AGENT_HANDOFF.md).
 
+> Production status: conditional-release MVP. Feature completion below does not
+> supersede the release gates in `AGENT_HANDOFF.md` and `install.md`.
+
 ---
 
 ## P0a — Renamable steps

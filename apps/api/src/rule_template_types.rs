@@ -47,7 +47,11 @@ pub struct Source {
     pub schema: Option<Vec<SourceField>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "connectorId")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "connectorId"
+    )]
     pub connector_id: Option<i64>,
 }
 
@@ -79,7 +83,11 @@ pub struct Auth {
     pub auth_type: AuthType,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "secretRef")]
     pub secret_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "headerName")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "headerName"
+    )]
     pub header_name: Option<String>,
 }
 
@@ -102,10 +110,18 @@ pub struct Destination {
     pub url: String,
     /// Substituted into `{name}` placeholders in `url`. Each value is either a
     /// literal string, `{"$from": "field"}`, or `{"$literal": "..."}`.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "pathParams")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "pathParams"
+    )]
     pub path_params: Option<std::collections::BTreeMap<String, Value>>,
     /// Appended to `url` as `?k=v`. Array values produce repeated keys.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "queryParams")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "queryParams"
+    )]
     pub query_params: Option<std::collections::BTreeMap<String, Value>>,
     /// Header values are templated like `pathParams`; literal strings are kept
     /// as-is for backwards compatibility with templates authored before
@@ -114,9 +130,17 @@ pub struct Destination {
     pub headers: Option<std::collections::BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "idempotencyKey")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "idempotencyKey"
+    )]
     pub idempotency_key: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "idempotencyHeader")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "idempotencyHeader"
+    )]
     pub idempotency_header: Option<String>,
 }
 
@@ -130,11 +154,19 @@ pub enum BackoffKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Retry {
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "maxAttempts")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "maxAttempts"
+    )]
     pub max_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff: Option<BackoffKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "initialIntervalMs")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "initialIntervalMs"
+    )]
     pub initial_interval_ms: Option<u64>,
 }
 
@@ -191,6 +223,30 @@ pub struct RuleTemplate {
     pub retry: Option<Retry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<ExportSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ExportSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<ExportColumn>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExportColumn {
+    pub name: String,
+    #[serde(default, rename = "$from", skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(
+        default,
+        rename = "$fromResponse",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub from_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl RuleTemplate {
@@ -262,8 +318,7 @@ mod tests {
     #[test]
     fn golden_url_templating_roundtrips() {
         let original: Value = serde_json::from_str(GOLDEN_URL_TPL).expect("parse value");
-        let typed: RuleTemplate =
-            serde_json::from_value(original.clone()).expect("parse typed");
+        let typed: RuleTemplate = serde_json::from_value(original.clone()).expect("parse typed");
         assert!(typed
             .destination
             .as_ref()

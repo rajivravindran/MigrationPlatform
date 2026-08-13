@@ -76,6 +76,17 @@ export const RetrySchema = z.object({
   initialIntervalMs: z.number().int().min(10).optional()
 });
 
+export const ExportColumnSchema = z.object({
+  name: z.string().min(1),
+  $from: z.string().min(1).optional(),
+  $fromResponse: z.string().min(1).optional(),
+  path: z.string().min(1).optional()
+});
+
+export const ExportSchema = z.object({
+  columns: z.array(ExportColumnSchema).max(64).optional()
+});
+
 const RuleTemplateBase = z.object({
   id: z.string().min(1),
   version: z.number().int().min(1),
@@ -83,7 +94,8 @@ const RuleTemplateBase = z.object({
   source: SourceSchema,
   preprocess: z.array(PreprocessStepSchema),
   retry: RetrySchema.optional(),
-  concurrency: z.number().int().min(1).max(512).optional()
+  concurrency: z.number().int().min(1).max(512).optional(),
+  export: ExportSchema.optional()
 });
 
 /** Single-destination (legacy / one-step) shape. */

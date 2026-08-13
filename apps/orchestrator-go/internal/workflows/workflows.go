@@ -65,6 +65,9 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 
 	ao := defaultActivityOptions(nil)
 	ctx = workflow.WithActivityOptions(ctx, ao)
+	if err := requireLicensed(ctx); err != nil {
+		return nil, err
+	}
 
 	if in.RetryRow != nil {
 		return runSingleRowRetry(ctx, in)
@@ -162,10 +165,17 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 	}
 
 	log.Info("MigrationWorkflow done", "processed", result.Processed, "failed", result.Failed)
-	_ = workflow.ExecuteActivity(ctx, "FinalizeJob", activities.FinalizeJobInput{
-		JobID: in.JobID, Cancelled: result.Cancelled,
-	}).Get(ctx, nil)
+	finalizeAndExport(ctx, in.JobID, result.Cancelled)
 	return result, nil
+}
+
+func finalizeAndExport(ctx workflow.Context, jobID int64, cancelled bool) {
+	_ = workflow.ExecuteActivity(ctx, "FinalizeJob", activities.FinalizeJobInput{
+		JobID: jobID, Cancelled: cancelled,
+	}).Get(ctx, nil)
+	_ = workflow.ExecuteActivity(ctx, "ExportJobResults", activities.ExportJobResultsInput{
+		JobID: jobID,
+	}).Get(ctx, nil)
 }
 
 // preprocessRows runs the template's preprocess steps on the Python sandbox
@@ -420,9 +430,7 @@ func runSingleRowRetry(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 	_ = workflow.ExecuteActivity(ctx, "PublishProgress", activities.PublishProgressInput{
 		JobID: in.RetryRow.JobID, Processed: result.Processed, Failed: result.Failed,
 	}).Get(ctx, nil)
-	_ = workflow.ExecuteActivity(ctx, "FinalizeJob", activities.FinalizeJobInput{
-		JobID: in.RetryRow.JobID,
-	}).Get(ctx, nil)
+	finalizeAndExport(ctx, in.RetryRow.JobID, false)
 	return result, nil
 }
 
@@ -442,6 +450,10 @@ type RetryFailedRowsInput struct {
 // single-row retry). Pages through failed rows and continue-as-news every few
 // thousand to keep history bounded.
 func RetryFailedRowsWorkflow(ctx workflow.Context, in RetryFailedRowsInput) (*MigrationWorkflowResult, error) {
+	ctx = workflow.WithActivityOptions(ctx, defaultActivityOptions(nil))
+	if err := requireLicensed(ctx); err != nil {
+		return nil, err
+	}
 	ao := defaultActivityOptions(nil)
 	ctx = workflow.WithActivityOptions(ctx, ao)
 
@@ -488,9 +500,7 @@ func RetryFailedRowsWorkflow(ctx workflow.Context, in RetryFailedRowsInput) (*Mi
 			return nil, workflow.NewContinueAsNewError(ctx, RetryFailedRowsWorkflow, next)
 		}
 	}
-	_ = workflow.ExecuteActivity(ctx, "FinalizeJob", activities.FinalizeJobInput{
-		JobID: in.JobID,
-	}).Get(ctx, nil)
+	finalizeAndExport(ctx, in.JobID, false)
 	return result, nil
 }
 
@@ -543,7 +553,18 @@ func ProcessShardWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Mig
 // with a RetryRow input set. Kept as a distinct workflow type so the API can
 // dispatch unambiguously.
 func RetryRowWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*MigrationWorkflowResult, error) {
+	ctx = workflow.WithActivityOptions(ctx, defaultActivityOptions(nil))
+	if err := requireLicensed(ctx); err != nil {
+		return nil, err
+	}
 	return MigrationWorkflow(ctx, in)
+}
+
+func requireLicensed(ctx workflow.Context) error {
+	if err := workflow.ExecuteActivity(ctx, "RequireLicensed").Get(ctx, nil); err != nil {
+		return fmt.Errorf("runtime license gate: %w", err)
+	}
+	return nil
 }
 
 // --------- helpers ---------

@@ -38,6 +38,23 @@ func TestParseManifestRejectsTraversal(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestParseManifestRejectsUnsafeStageID(t *testing.T) {
+	_, err := batch.ParseManifest([]byte(`{
+		"version": 1,
+		"stages": [{"id": "../escape", "file": "a.csv", "templateKey": "t"}]
+	}`))
+	require.ErrorContains(t, err, "safe path component")
+}
+
+func TestParseManifestRejectsUnknownFields(t *testing.T) {
+	_, err := batch.ParseManifest([]byte(`{
+		"version": 1,
+		"unexpected": true,
+		"stages": [{"id": "a", "file": "a.csv", "templateKey": "t"}]
+	}`))
+	require.ErrorContains(t, err, "unknown field")
+}
+
 func TestUnpackTarGzRejectsParentPath(t *testing.T) {
 	dir := t.TempDir()
 	archive := filepath.Join(dir, "bad.tar.gz")

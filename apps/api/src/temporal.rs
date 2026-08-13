@@ -42,7 +42,12 @@ impl TemporalClient {
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let Some(base) = &self.bridge_url else {
-            tracing::warn!(target = "temporal", path, ?body, "bridge not configured; stub mode");
+            tracing::warn!(
+                target = "temporal",
+                path,
+                ?body,
+                "bridge not configured; stub mode"
+            );
             return Ok(json!({"stub": true}));
         };
         let resp = self
@@ -58,7 +63,10 @@ impl TemporalClient {
         if !status.is_success() {
             bail!(
                 "bridge {path} returned {status}: {}",
-                payload.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error")
+                payload
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown error")
             );
         }
         Ok(payload)
@@ -95,10 +103,16 @@ impl TemporalClient {
         workflow_id: &str,
         input: &Value,
     ) -> Result<String> {
-        self.start_workflow(workflow_id, "MigrationWorkflow", input).await
+        self.start_workflow(workflow_id, "MigrationWorkflow", input)
+            .await
     }
 
-    pub async fn signal_workflow(&self, workflow_id: &str, signal: &str, payload: &Value) -> Result<()> {
+    pub async fn signal_workflow(
+        &self,
+        workflow_id: &str,
+        signal: &str,
+        payload: &Value,
+    ) -> Result<()> {
         self.post(
             "/v1/workflows/signal",
             &json!({"workflowId": workflow_id, "signal": signal, "payload": payload}),
@@ -108,7 +122,17 @@ impl TemporalClient {
     }
 
     pub async fn cancel_workflow(&self, workflow_id: &str) -> Result<()> {
-        self.post("/v1/workflows/cancel", &json!({"workflowId": workflow_id})).await?;
+        self.post("/v1/workflows/cancel", &json!({"workflowId": workflow_id}))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn test_sftp_connector(&self, org_id: i64, connector_id: i64) -> Result<()> {
+        self.post(
+            "/v1/connectors/sftp/test",
+            &json!({"orgId": org_id, "connectorId": connector_id}),
+        )
+        .await?;
         Ok(())
     }
 
@@ -148,22 +172,26 @@ impl TemporalClient {
     }
 
     pub async fn pause_schedule(&self, schedule_id: &str) -> Result<()> {
-        self.post("/v1/schedules/pause", &json!({"scheduleId": schedule_id})).await?;
+        self.post("/v1/schedules/pause", &json!({"scheduleId": schedule_id}))
+            .await?;
         Ok(())
     }
 
     pub async fn unpause_schedule(&self, schedule_id: &str) -> Result<()> {
-        self.post("/v1/schedules/unpause", &json!({"scheduleId": schedule_id})).await?;
+        self.post("/v1/schedules/unpause", &json!({"scheduleId": schedule_id}))
+            .await?;
         Ok(())
     }
 
     pub async fn delete_schedule(&self, schedule_id: &str) -> Result<()> {
-        self.post("/v1/schedules/delete", &json!({"scheduleId": schedule_id})).await?;
+        self.post("/v1/schedules/delete", &json!({"scheduleId": schedule_id}))
+            .await?;
         Ok(())
     }
 
     pub async fn trigger_schedule(&self, schedule_id: &str) -> Result<()> {
-        self.post("/v1/schedules/trigger", &json!({"scheduleId": schedule_id})).await?;
+        self.post("/v1/schedules/trigger", &json!({"scheduleId": schedule_id}))
+            .await?;
         Ok(())
     }
 }
@@ -177,17 +205,60 @@ fn merge_spec(body: &mut Value, spec: &Value) {
     }
 }
 
+/// Expand POSIX 5-field cron (`m h dom mon dow`) to the 6-field form the
+/// `cron` crate expects (`s m h dom mon dow`). Temporal accepts both; we keep
+/// the caller's original string in stored specs so the UI/docs stay 5-field.
+fn cron_for_validation(expr: &str) -> Result<String> {
+    let trimmed = expr.trim();
+    let fields = trimmed.split_whitespace().count();
+    match fields {
+        5 => Ok(format!("0 {trimmed}")),
+        6 | 7 => Ok(trimmed.to_string()),
+        _ => bail!(
+            "invalid cron: expected 5-field POSIX (m h dom mon dow) or 6/7-field with seconds, got {fields} fields"
+        ),
+    }
+}
+
 /// Convert a simple cron expression or interval spec into the structured
 /// payload Temporal expects for Schedules.
 pub fn normalise_spec(raw: &Value) -> Result<Value> {
     if raw.get("cron").is_some() {
-        let cron = raw.get("cron").and_then(|v| v.as_str()).context("cron missing")?;
-        cron::Schedule::try_from(cron).context("invalid cron")?;
-        return Ok(json!({"cron": cron}));
+        let cron = raw
+            .get("cron")
+            .and_then(|v| v.as_str())
+            .context("cron missing")?;
+        let trimmed = cron.trim();
+        let for_parse = cron_for_validation(trimmed)?;
+        cron::Schedule::try_from(for_parse.as_str()).context("invalid cron")?;
+        return Ok(json!({"cron": trimmed}));
     }
     if let Some(interval) = raw.get("every").and_then(|v| v.as_str()) {
         humantime::parse_duration(interval).context("invalid interval")?;
         return Ok(json!({"every": interval}));
     }
     anyhow::bail!("spec must contain 'cron' or 'every'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_five_field_posix_cron() {
+        let out = normalise_spec(&json!({"cron": "0 2 * * *"})).unwrap();
+        assert_eq!(out, json!({"cron": "0 2 * * *"}));
+    }
+
+    #[test]
+    fn accepts_six_field_cron_with_seconds() {
+        let out = normalise_spec(&json!({"cron": "0 0 2 * * *"})).unwrap();
+        assert_eq!(out, json!({"cron": "0 0 2 * * *"}));
+    }
+
+    #[test]
+    fn rejects_malformed_cron() {
+        assert!(normalise_spec(&json!({"cron": "not-a-cron"})).is_err());
+        assert!(normalise_spec(&json!({"cron": "* * *"})).is_err());
+    }
 }

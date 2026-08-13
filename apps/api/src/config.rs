@@ -40,7 +40,9 @@ impl Config {
             redis_url: env_default("REDIS_URL", "redis://localhost:6379/0"),
             temporal_host_port: env_default("TEMPORAL_ADDRESS", "localhost:7233"),
             temporal_namespace: env_default("TEMPORAL_NAMESPACE", "default"),
-            orchestrator_bridge_url: env::var("ORCHESTRATOR_BRIDGE_URL").ok().filter(|v| !v.is_empty()),
+            orchestrator_bridge_url: env::var("ORCHESTRATOR_BRIDGE_URL")
+                .ok()
+                .filter(|v| !v.is_empty()),
             bridge_token: env::var("BRIDGE_TOKEN").ok().filter(|v| !v.is_empty()),
             otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
             minio_endpoint: env_default("MINIO_ENDPOINT", "http://localhost:9000"),

@@ -94,6 +94,20 @@ type RuleTemplate struct {
 	Steps       []Step                 `json:"steps,omitempty"`
 	Retry       *Retry                 `json:"retry,omitempty"`
 	Concurrency int                    `json:"concurrency,omitempty"`
+	Export      *ExportSpec            `json:"export,omitempty"`
+}
+
+// ExportSpec is the optional results-CSV column projector.
+type ExportSpec struct {
+	Columns []ExportColumn `json:"columns,omitempty"`
+}
+
+// ExportColumn maps a source field or response JSONPath onto a CSV header.
+type ExportColumn struct {
+	Name         string `json:"name"`
+	From         string `json:"$from,omitempty"`
+	FromResponse string `json:"$fromResponse,omitempty"`
+	Path         string `json:"path,omitempty"`
 }
 
 func (rt *RuleTemplate) PayloadTemplate() map[string]any {

@@ -71,9 +71,13 @@ async fn put_config(
     Json(req): Json<PutConfig>,
 ) -> ApiResult<Json<Value>> {
     require_role(&claims, &["admin"])?;
-    let provider = req.provider.unwrap_or_else(|| "openai-compatible".to_string());
+    let provider = req
+        .provider
+        .unwrap_or_else(|| "openai-compatible".to_string());
     if provider != "openai-compatible" {
-        return Err(ApiError::BadRequest(format!("unsupported provider {provider:?}")));
+        return Err(ApiError::BadRequest(format!(
+            "unsupported provider {provider:?}"
+        )));
     }
     let updated_by: i64 = claims.sub.parse().map_err(|_| ApiError::Unauthorized)?;
 
@@ -128,7 +132,17 @@ async fn put_config(
     .await?;
     tx.commit().await?;
 
-    record_audit(&state.db, claims.org, &claims.sub, "llm_config", None, "update", None, None).await?;
+    record_audit(
+        &state.db,
+        claims.org,
+        &claims.sub,
+        "llm_config",
+        None,
+        "update",
+        None,
+        None,
+    )
+    .await?;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -177,38 +191,52 @@ async fn suggest_mapping(
         ));
     };
     if !enabled {
-        return Err(ApiError::BadRequest("LLM suggestions are disabled for this organization".into()));
+        return Err(ApiError::BadRequest(
+            "LLM suggestions are disabled for this organization".into(),
+        ));
     }
     let api_key = match secret_id {
         Some(sid) => {
-            let row: Option<(Vec<u8>, Vec<u8>)> =
-                sqlx::query_as("SELECT ciphertext, nonce FROM secrets WHERE id = $1 AND org_id = $2")
-                    .bind(sid)
-                    .bind(claims.org)
-                    .fetch_optional(&state.db)
-                    .await?;
-            let (ct, nonce) = row.ok_or_else(|| ApiError::BadRequest("LLM API key secret missing".into()))?;
+            let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+                "SELECT ciphertext, nonce FROM secrets WHERE id = $1 AND org_id = $2",
+            )
+            .bind(sid)
+            .bind(claims.org)
+            .fetch_optional(&state.db)
+            .await?;
+            let (ct, nonce) =
+                row.ok_or_else(|| ApiError::BadRequest("LLM API key secret missing".into()))?;
             let plain = state.master_key.decrypt(&ct, &nonce)?;
-            String::from_utf8(plain).map_err(|_| ApiError::Internal(anyhow::anyhow!("api key not utf8")))?
+            String::from_utf8(plain)
+                .map_err(|_| ApiError::Internal(anyhow::anyhow!("api key not utf8")))?
         }
-        None => return Err(ApiError::BadRequest("LLM API key not set; PUT /llm-config with api_key".into())),
+        None => {
+            return Err(ApiError::BadRequest(
+                "LLM API key not set; PUT /llm-config with api_key".into(),
+            ))
+        }
     };
 
     // Optional OpenAPI operation context.
     let operation: Option<Value> = match (req.spec_id, &req.operation_id) {
         (Some(spec_id), Some(op_id)) => {
-            let spec: Option<(Value, Option<String>)> =
-                sqlx::query_as("SELECT spec_json, source_url FROM openapi_specs WHERE id = $1 AND org_id = $2")
-                    .bind(spec_id)
-                    .bind(claims.org)
-                    .fetch_optional(&state.db)
-                    .await?;
-            let Some((spec, source_url)) = spec else { return Err(ApiError::NotFound) };
+            let spec: Option<(Value, Option<String>)> = sqlx::query_as(
+                "SELECT spec_json, source_url FROM openapi_specs WHERE id = $1 AND org_id = $2",
+            )
+            .bind(spec_id)
+            .bind(claims.org)
+            .fetch_optional(&state.db)
+            .await?;
+            let Some((spec, source_url)) = spec else {
+                return Err(ApiError::NotFound);
+            };
             let op = super::specs::parse_operations(&spec, source_url.as_deref())
                 .into_iter()
                 .find(|o| o.get("operation_id").and_then(|v| v.as_str()) == Some(op_id.as_str()));
             if op.is_none() {
-                return Err(ApiError::BadRequest(format!("operation {op_id:?} not found in spec {spec_id}")));
+                return Err(ApiError::BadRequest(format!(
+                    "operation {op_id:?} not found in spec {spec_id}"
+                )));
             }
             op
         }
@@ -223,7 +251,13 @@ async fn suggest_mapping(
         }
     }
 
-    let prompt = build_prompt(&req.columns, &rows, operation.as_ref(), req.instructions.as_deref(), req.source_type.as_deref());
+    let prompt = build_prompt(
+        &req.columns,
+        &rows,
+        operation.as_ref(),
+        req.instructions.as_deref(),
+        req.source_type.as_deref(),
+    );
 
     // One retry with the validation error appended: schema-invalid output is
     // the dominant failure mode and models usually self-correct given the error.
@@ -244,7 +278,9 @@ async fn suggest_mapping(
                     Some(&json!({"model": model, "redacted": redact_pii, "operation": req.operation_id})),
                 )
                 .await?;
-                return Ok(Json(json!({"template": candidate, "model": model, "redacted": redact_pii})));
+                return Ok(Json(
+                    json!({"template": candidate, "model": model, "redacted": redact_pii}),
+                ));
             }
             Err(e) => {
                 last_err = e.to_string();
@@ -305,7 +341,12 @@ fn build_prompt(
     p
 }
 
-async fn call_llm(base_url: &str, api_key: &str, model: &str, messages: &[Value]) -> ApiResult<String> {
+async fn call_llm(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Value],
+) -> ApiResult<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
@@ -357,9 +398,8 @@ fn extract_json(content: &str) -> Option<Value> {
 static EMAIL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b").expect("email re")
 });
-static PHONE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"\+?\d[\d\s().-]{7,}\d").expect("phone re")
-});
+static PHONE_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\+?\d[\d\s().-]{7,}\d").expect("phone re"));
 static LONG_DIGITS_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     // Card/SSN/account-like runs of 9+ digits.
     regex::Regex::new(r"\b\d{9,}\b").expect("digits re")
@@ -407,9 +447,15 @@ mod tests {
         assert_eq!(v["name"], "Jane");
         assert_eq!(v["nested"][0]["contact"], "user@example.com");
         let phone = v["phone"].as_str().unwrap();
-        assert!(!phone.contains("98765"), "phone digits must be masked: {phone}");
+        assert!(
+            !phone.contains("98765"),
+            "phone digits must be masked: {phone}"
+        );
         let card = v["card"].as_str().unwrap();
-        assert!(!card.contains("4111111111111111"), "card digits must be masked: {card}");
+        assert!(
+            !card.contains("4111111111111111"),
+            "card digits must be masked: {card}"
+        );
     }
 
     #[test]

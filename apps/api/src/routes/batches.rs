@@ -53,6 +53,7 @@ pub struct BatchStageRow {
     pub job_id: Option<i64>,
     pub status: String,
     pub on_stage_failure: Option<String>,
+    pub depends_on: Vec<String>,
     pub error_message: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -74,7 +75,7 @@ pub struct ListQuery {
 
 const BATCH_COLS: &str = "id, org_id, schedule_id, connector_id, batch_key, source_ref, status::text AS status, on_stage_failure, manifest_json, temporal_workflow_id, temporal_run_id, error_message, quarantine_ref, started_at, finished_at, created_at, updated_at";
 
-const STAGE_COLS: &str = "id, batch_id, stage_index, stage_key, file_path, template_key, rule_template_id, rule_template_version, job_id, status::text AS status, on_stage_failure, error_message, created_at, updated_at";
+const STAGE_COLS: &str = "id, batch_id, stage_index, stage_key, file_path, template_key, rule_template_id, rule_template_version, job_id, status::text AS status, on_stage_failure, depends_on, error_message, created_at, updated_at";
 
 async fn list_batches(
     State(state): State<AppState>,
@@ -147,6 +148,7 @@ async fn create_batch(
     Json(req): Json<BatchCreate>,
 ) -> ApiResult<Json<BatchRow>> {
     require_role(&claims, &["admin", "editor", "operator"])?;
+    crate::security::license::require_licensed()?;
 
     let src_type = req
         .source_ref
@@ -193,11 +195,7 @@ async fn create_batch(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
-    let workflow_id = format!(
-        "batch-{}-{}",
-        claims.org,
-        uuid::Uuid::new_v4().simple()
-    );
+    let workflow_id = format!("batch-{}-{}", claims.org, uuid::Uuid::new_v4().simple());
 
     let mut row: BatchRow = sqlx::query_as(&format!(
         "INSERT INTO batches (org_id, connector_id, source_ref, status, temporal_workflow_id, started_at)

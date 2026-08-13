@@ -24,11 +24,13 @@ spec:
     spec:
       containers:
         - name: orchestrator
-          image: {{ include "mp.image" .Values.orchestrator.image }}
+          image: {{ tpl .Values.orchestrator.image . | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: metrics
               containerPort: {{ .Values.orchestrator.service.metricsPort }}
+            - name: bridge
+              containerPort: 7070
           envFrom:
             - configMapRef:
                 name: {{ include "mp.fullname" . }}-env
@@ -71,6 +73,9 @@ spec:
     - name: metrics
       port: {{ .Values.orchestrator.service.metricsPort }}
       targetPort: metrics
+    - name: bridge
+      port: 7070
+      targetPort: bridge
 {{- if .Values.orchestrator.hpa.enabled }}
 ---
 apiVersion: autoscaling/v2

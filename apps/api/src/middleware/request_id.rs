@@ -14,8 +14,10 @@ pub async fn request_id_layer(mut req: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok().map(str::to_owned))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    req.headers_mut()
-        .insert(HEADER, HeaderValue::from_str(&id).unwrap_or_else(|_| HeaderValue::from_static("-")));
+    req.headers_mut().insert(
+        HEADER,
+        HeaderValue::from_str(&id).unwrap_or_else(|_| HeaderValue::from_static("-")),
+    );
 
     Span::current().record("request_id", tracing::field::display(&id));
 
@@ -29,14 +31,20 @@ pub async fn request_id_layer(mut req: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request as HttpRequest, middleware::from_fn, routing::get, Router};
+    use axum::{
+        body::Body, http::Request as HttpRequest, middleware::from_fn, routing::get, Router,
+    };
     use tower::ServiceExt;
 
-    async fn handler() -> &'static str { "ok" }
+    async fn handler() -> &'static str {
+        "ok"
+    }
 
     #[tokio::test]
     async fn generates_request_id_when_missing() {
-        let app = Router::new().route("/", get(handler)).layer(from_fn(request_id_layer));
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(from_fn(request_id_layer));
         let resp = app
             .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -48,7 +56,9 @@ mod tests {
 
     #[tokio::test]
     async fn echoes_incoming_request_id() {
-        let app = Router::new().route("/", get(handler)).layer(from_fn(request_id_layer));
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(from_fn(request_id_layer));
         let resp = app
             .oneshot(
                 HttpRequest::builder()

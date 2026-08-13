@@ -17,9 +17,15 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/connectors", get(list_connectors).post(create_connector))
-        .route("/connectors/:id", get(get_connector).delete(delete_connector))
+        .route(
+            "/connectors/:id",
+            get(get_connector).delete(delete_connector),
+        )
         .route("/connectors/:id/test", post(test_connector))
-        .route("/connectors/salesforce/oauth/callback", get(sf_oauth_callback))
+        .route(
+            "/connectors/salesforce/oauth/callback",
+            get(sf_oauth_callback),
+        )
 }
 
 #[derive(Deserialize)]
@@ -55,6 +61,10 @@ async fn create_connector(
     Json(req): Json<CreateConnector>,
 ) -> ApiResult<Json<ConnectorRow>> {
     require_role(&claims, &["admin", "editor"])?;
+    let connector_kind = match req.connector_kind.as_str() {
+        "sftp" => "watched_sftp",
+        other => other,
+    };
 
     let mut tx = state.db.begin().await?;
     let secret_id: Option<i64> = if let Some(secret) = req.secret {
@@ -82,7 +92,7 @@ async fn create_connector(
     )
     .bind(claims.org)
     .bind(&req.name)
-    .bind(&req.connector_kind)
+    .bind(connector_kind)
     .bind(&req.config_json)
     .bind(secret_id)
     .bind(created_by)
@@ -143,16 +153,47 @@ async fn delete_connector(
     if affected == 0 {
         return Err(ApiError::NotFound);
     }
-    record_audit(&state.db, claims.org, &claims.sub, "connector", Some(id.to_string()), "delete", None, None).await?;
+    record_audit(
+        &state.db,
+        claims.org,
+        &claims.sub,
+        "connector",
+        Some(id.to_string()),
+        "delete",
+        None,
+        None,
+    )
+    .await?;
     Ok(Json(json!({"deleted": true})))
 }
 
 async fn test_connector(
-    State(_state): State<AppState>,
-    AuthUser(_claims): AuthUser,
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
     Path(id): Path<i64>,
-) -> impl IntoResponse {
-    Json(json!({"id": id, "ok": true, "message": "smoke test passed"}))
+) -> ApiResult<impl IntoResponse> {
+    require_role(&claims, &["admin", "editor", "operator"])?;
+    let kind: Option<String> = sqlx::query_scalar(
+        "SELECT connector_kind::text FROM connectors WHERE id = $1 AND org_id = $2",
+    )
+    .bind(id)
+    .bind(claims.org)
+    .fetch_optional(&state.db)
+    .await?;
+    let kind = kind.ok_or(ApiError::NotFound)?;
+    if kind != "watched_sftp" {
+        return Err(ApiError::BadRequest(format!(
+            "real connector test is not implemented for kind {kind}"
+        )));
+    }
+    state
+        .temporal
+        .test_sftp_connector(claims.org, id)
+        .await
+        .map_err(|e| ApiError::External(format!("connector validation: {e}")))?;
+    Ok(Json(
+        json!({"id": id, "ok": true, "message": "SFTP handshake and bounded listing succeeded"}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -165,6 +206,12 @@ async fn sf_oauth_callback(
     State(_state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<OauthCallback>,
 ) -> impl IntoResponse {
-    tracing::info!(code_len = q.code.len(), state = q.state, "salesforce oauth callback");
-    Json(json!({"ok": true, "instructions":"exchange the code server-side then call POST /connectors"}))
+    tracing::info!(
+        code_len = q.code.len(),
+        state = q.state,
+        "salesforce oauth callback"
+    );
+    Json(
+        json!({"ok": true, "instructions":"exchange the code server-side then call POST /connectors"}),
+    )
 }

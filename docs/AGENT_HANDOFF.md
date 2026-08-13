@@ -1,13 +1,27 @@
 # Agent handoff — what was accomplished
 
 **Last updated:** 2026-08-07  
-**Shipped:** Roadmap **P0a**, **P0b**, **P1**, **P2**, **P3**, **P4**, **P5**  
+**Status:** Feature-complete MVP; web↔API contracts reconciled (SFTP test UX, license `enforce`, batch `depends_on`). Production release remains conditional on the gates below.
 **Plan file:** [`.cursor/plans/batch_arrival_features_a5363f5d.plan.md`](../.cursor/plans/batch_arrival_features_a5363f5d.plan.md)  
 **Commercial (P5) plan:** [`.cursor/plans/trial_and_distribution_fe014b2f.plan.md`](../.cursor/plans/trial_and_distribution_fe014b2f.plan.md)  
 **Per-phase changelog:** [`PHASE_CHANGELOG.md`](PHASE_CHANGELOG.md)
 
-The full roadmap (P0a → P5) is now implemented. This doc captures what each
-phase delivered, how to smoke-test it, and what remains as follow-up.
+The P0a → P5 feature roadmap is implemented as an MVP. It is not an
+unconditional production-readiness claim.
+
+## Production release gates
+
+- License enforcement must pass API and automatic Temporal-schedule tests with
+  `LICENSE_ENFORCE=true`, including expiry while schedules already exist.
+- Helm requires a shared `ReadWriteMany` license PVC and a stable installation
+  Secret; Compose uses the `license-data` named volume.
+- SFTP is poll-based and bounded (`max_file_bytes`, `max_list_entries`,
+  `settle_seconds`). Operators must configure host-key pinning and egress policy.
+- DAG `stop` prevents not-yet-started stages. Siblings already started in the
+  same parallel wave continue and cannot be retroactively stopped.
+- The bundled license server is an MVP single-instance SQLite service. It
+  requires durable storage, bearer authentication, and a runtime-mounted
+  signing key; HA and KMS integration are not implemented.
 
 ---
 
@@ -186,8 +200,9 @@ APIs when unlicensed/expired. Never ship the signing private key.
 5. **Runtime gating** — `require_licensed()` is called on the mutating endpoints: `POST /jobs` ([`routes/jobs.rs`](../apps/api/src/routes/jobs.rs)) and `POST /schedules` ([`routes/schedules.rs`](../apps/api/src/routes/schedules.rs)). Under enforce with no valid license → `402 license_required`. Read APIs stay available so operators can diagnose.
 
 6. **Settings UI** [`web/app/settings/page.tsx`](../apps/web/app/settings/page.tsx):
-   - License card shows kind (trial/commercial), licensee, days left, expiry, short install ID (fingerprint), features, max seats.
+   - License card shows kind (trial/commercial), licensee, days left, expiry, short install ID (fingerprint), features, max seats, and **`enforce`** (on/off) from `GET /license`.
    - Trial with ≤3 days left → warn badge. Unlicensed → development / unlicensed / expired badge + activation hint pointing at `LICENSE_FILE` / `LICENSE_SERVER_URL`.
+   - Copy reflects runtime gate: with enforce on, unlicensed mutating APIs return `402 license_required`.
 
 7. **License status API** [`routes/license.rs`](../apps/api/src/routes/license.rs): `GET /license` returns the read-only status above (auth required).
 
@@ -236,7 +251,8 @@ License shows kind, days left, and the short install ID.
 | **P4b** | S3 object-created events (push instead of poll) — explicitly deferred. Documented as the next arrival source after poll-based MinIO/S3 + SFTP. |
 | **P5.1** | Email-gated trials; commercial license bound to fingerprint; 24h heartbeat with 72h offline grace. |
 | **P5.2** | Stripe / payment portal; per-SKU feature-flag gating. |
-| — | Local-folder source connector; connector config UI by kind. |
+| — | Local-folder source connector. |
+| — | Remote connector test for non-SFTP kinds (`watched_prefix`, Salesforce, custom) — API still rejects; UI messaging is accurate. |
 | — | Recreate pre-P1 schedules that still target `MigrationWorkflow` directly in Temporal (recreate after deploy). |
 
 **Note:** Existing schedules created before P1 still target `MigrationWorkflow`
@@ -252,7 +268,6 @@ cd apps/api && cargo check -p migration-api --all-targets
 cd apps/web && npx tsc --noEmit
 ```
 
-This run confirmed: `cargo check -p migration-api --all-targets` passes (3
-pre-existing warnings only), and `tsc --noEmit` on the web app passes clean.
-`go` is not installed in this environment, so the Go suite was not re-run here —
-run it in a Go toolchain before release.
+Integration pass (2026-08-07): `cargo check -p migration-api --all-targets`
+and `cd apps/web && npx tsc --noEmit` both clean. `go` is not installed here,
+so orchestrator build/tests were not re-run — run them before release.

@@ -23,10 +23,11 @@ type Server struct {
 	temporal client.Client
 	token    string
 	logger   *slog.Logger
+	testSFTP func(context.Context, int64, int64) error
 }
 
-func NewServer(c client.Client, token string, logger *slog.Logger) *Server {
-	return &Server{temporal: c, token: token, logger: logger}
+func NewServer(c client.Client, token string, logger *slog.Logger, testSFTP func(context.Context, int64, int64) error) *Server {
+	return &Server{temporal: c, token: token, logger: logger, testSFTP: testSFTP}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -40,8 +41,33 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/schedules/unpause", s.auth(s.unpauseSchedule))
 	mux.HandleFunc("POST /v1/schedules/delete", s.auth(s.deleteSchedule))
 	mux.HandleFunc("POST /v1/schedules/trigger", s.auth(s.triggerSchedule))
+	mux.HandleFunc("POST /v1/connectors/sftp/test", s.auth(s.testSFTPConnector))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	return mux
+}
+
+type connectorTestRequest struct {
+	OrgID       int64 `json:"orgId"`
+	ConnectorID int64 `json:"connectorId"`
+}
+
+func (s *Server) testSFTPConnector(w http.ResponseWriter, r *http.Request) {
+	var req connectorTestRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
+		badRequest(w, err)
+		return
+	}
+	if req.OrgID <= 0 || req.ConnectorID <= 0 || s.testSFTP == nil {
+		badRequest(w, fmt.Errorf("valid orgId and connectorId are required"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if err := s.testSFTP(ctx, req.OrgID, req.ConnectorID); err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {

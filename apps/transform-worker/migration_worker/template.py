@@ -72,6 +72,19 @@ class Step(BaseModel):
     onFailure: Literal["stop", "continue"] | None = None
 
 
+class ExportColumn(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    name: str
+    from_field: str | None = Field(default=None, alias="$from")
+    from_response: str | None = Field(default=None, alias="$fromResponse")
+    path: str | None = None
+
+
+class ExportSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    columns: list[ExportColumn] | None = None
+
+
 class RuleTemplate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str
@@ -85,6 +98,7 @@ class RuleTemplate(BaseModel):
     steps: list[Step] | None = Field(default=None, min_length=1, max_length=10)
     retry: Retry | None = None
     concurrency: int | None = Field(default=None, ge=1, le=512)
+    export: ExportSpec | None = None
 
     @model_validator(mode="after")
     def _one_shape(self) -> "RuleTemplate":

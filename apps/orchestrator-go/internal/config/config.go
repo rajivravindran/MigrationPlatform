@@ -26,8 +26,9 @@ type Config struct {
 	MaxResponseBytes int64
 
 	// Internal HTTP bridge that lets the Rust API drive Temporal.
-	BridgeAddr  string
-	BridgeToken string
+	BridgeAddr     string
+	BridgeToken    string
+	APIInternalURL string
 }
 
 func Load() (Config, error) {
@@ -73,6 +74,7 @@ func Load() (Config, error) {
 	if cfg.BridgeToken == "" {
 		return cfg, errors.New("BRIDGE_TOKEN is required (shared secret between API and orchestrator)")
 	}
+	cfg.APIInternalURL = getenv("API_INTERNAL_URL", "http://api:8080")
 	return cfg, nil
 }
 

@@ -1,0 +1,28 @@
+{{- $secretName := default (printf "%s-installation" (include "mp.fullname" .)) .Values.license.existingInstallationSecret }}
+{{- if not .Values.license.existingInstallationSecret }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  labels: {{- include "mp.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+stringData:
+  installation-id: {{ if $existing }}{{ index $existing.data "installation-id" | b64dec | quote }}{{ else }}{{ uuidv4 | quote }}{{ end }}
+---
+{{- end }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "mp.fullname" . }}-license
+  labels: {{- include "mp.labels" . | nindent 4 }}
+spec:
+  accessModes: {{- toYaml .Values.license.persistence.accessModes | nindent 4 }}
+  {{- if .Values.global.storageClassName }}
+  storageClassName: {{ .Values.global.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.license.persistence.size }}

@@ -1,0 +1,30 @@
+# Overlay: run app services from Docker Hub instead of building locally.
+#
+#   make keys
+#   make hub-up
+#   make seed
+#
+# Override the tag/namespace if needed:
+#   HUB_IMAGE_PREFIX=rajivravindran IMAGE_TAG=demo make hub-up
+
+services:
+  migrate:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-api:${IMAGE_TAG:-demo}
+    build: !reset
+    entrypoint: ["/app/migration-admin", "migrate"]
+
+  api:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-api:${IMAGE_TAG:-demo}
+    build: !reset
+
+  orchestrator:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-orchestrator:${IMAGE_TAG:-demo}
+    build: !reset
+
+  transform-worker:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-transform-worker:${IMAGE_TAG:-demo}
+    build: !reset
+
+  web:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-web:${IMAGE_TAG:-demo}
+    build: !reset

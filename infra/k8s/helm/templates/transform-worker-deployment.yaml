@@ -24,7 +24,7 @@ spec:
     spec:
       containers:
         - name: transform-worker
-          image: {{ include "mp.image" .Values.transformWorker.image }}
+          image: {{ tpl .Values.transformWorker.image . | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: metrics

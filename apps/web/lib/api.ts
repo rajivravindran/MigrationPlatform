@@ -45,6 +45,30 @@ export async function apiFetch<T = unknown>(
   return text ? (JSON.parse(text) as T) : (undefined as unknown as T);
 }
 
+export async function apiDownload(path: string, filename: string): Promise<void> {
+  const headers = new Headers();
+  const token = getToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const res = await fetch(`${BASE}${path}`, { headers });
+  if (!res.ok) {
+    let msg = res.statusText;
+    try {
+      const body = await res.json();
+      msg = body?.error?.message ?? msg;
+    } catch {}
+    throw new Error(`${res.status} ${msg}`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 export function eventStream(path: string): EventSource {
   const token = getToken();
   const url = `${BASE}${path}${token ? `?token=${encodeURIComponent(token)}` : ""}`;

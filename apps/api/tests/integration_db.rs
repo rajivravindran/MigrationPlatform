@@ -18,7 +18,10 @@ async fn setup() -> (testcontainers::ContainerAsync<PgImage>, PgPool) {
         .connect(&url)
         .await
         .expect("connect pg");
-    sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrate");
     (container, pool)
 }
 
@@ -27,14 +30,12 @@ async fn setup() -> (testcontainers::ContainerAsync<PgImage>, PgPool) {
 async fn migrations_apply_and_seed_roundtrip() {
     let (_c, pool) = setup().await;
 
-    let org_id: i64 = sqlx::query_scalar(
-        "INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id",
-    )
-    .bind("Acme")
-    .bind("acme")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let org_id: i64 =
+        sqlx::query_scalar("INSERT INTO organizations (name) VALUES ($1) RETURNING id")
+            .bind("Acme")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(org_id > 0);
 
     let user_id: i64 = sqlx::query_scalar(
@@ -84,14 +85,18 @@ async fn job_rows_partitioning_is_hash_modulo_32() {
 #[ignore]
 async fn schedule_overlap_enum_accepts_policies() {
     let (_c, pool) = setup().await;
-    for policy in ["skip", "buffer_one", "buffer_all", "cancel_other", "allow_all"] {
-        let row = sqlx::query(
-            "SELECT $1::schedule_overlap AS p",
-        )
-        .bind(policy)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    for policy in [
+        "skip",
+        "buffer_one",
+        "buffer_all",
+        "cancel_other",
+        "allow_all",
+    ] {
+        let row = sqlx::query("SELECT $1::schedule_overlap::text AS p")
+            .bind(policy)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let got: String = row.get("p");
         assert_eq!(got, policy);
     }
@@ -101,12 +106,10 @@ async fn schedule_overlap_enum_accepts_policies() {
 #[ignore]
 async fn user_role_enum_rejects_unknown_role() {
     let (_c, pool) = setup().await;
-    let org: i64 = sqlx::query_scalar(
-        "INSERT INTO organizations (name, slug) VALUES ('O','o') RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let org: i64 = sqlx::query_scalar("INSERT INTO organizations (name) VALUES ('O') RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let res = sqlx::query(
         "INSERT INTO users (org_id, email, role, password_hash) \
          VALUES ($1, 'x@y.z', $2::user_role, 'h')",

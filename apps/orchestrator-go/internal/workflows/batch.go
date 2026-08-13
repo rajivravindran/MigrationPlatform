@@ -45,6 +45,9 @@ func BatchWorkflow(ctx workflow.Context, in BatchWorkflowInput) (*BatchWorkflowR
 
 	ao := defaultActivityOptions(nil)
 	ctx = workflow.WithActivityOptions(ctx, ao)
+	if err := requireLicensed(ctx); err != nil {
+		return nil, err
+	}
 
 	result := &BatchWorkflowResult{Status: "failed"}
 
@@ -52,10 +55,12 @@ func BatchWorkflow(ctx workflow.Context, in BatchWorkflowInput) (*BatchWorkflowR
 		return result, fmt.Errorf("not an archive package: %s", in.Key)
 	}
 
-	_ = workflow.ExecuteActivity(ctx, "MarkBatchRunning", activities.MarkBatchRunningInput{
+	if err := workflow.ExecuteActivity(ctx, "MarkBatchRunning", activities.MarkBatchRunningInput{
 		BatchID: in.BatchID,
 		RunID:   workflow.GetInfo(ctx).WorkflowExecution.RunID,
-	}).Get(ctx, nil)
+	}).Get(ctx, nil); err != nil {
+		return result, fmt.Errorf("mark batch running: %w", err)
+	}
 
 	var unpacked activities.UnpackAndStageArchiveOutput
 	err := workflow.ExecuteActivity(ctx, "UnpackAndStageArchive", activities.UnpackAndStageArchiveInput{
@@ -63,9 +68,11 @@ func BatchWorkflow(ctx workflow.Context, in BatchWorkflowInput) (*BatchWorkflowR
 	}).Get(ctx, &unpacked)
 	if err != nil {
 		log.Error("unpack failed; quarantining", "err", err)
-		_ = workflow.ExecuteActivity(ctx, "QuarantineArchive", activities.QuarantineArchiveInput{
+		if qErr := workflow.ExecuteActivity(ctx, "QuarantineArchive", activities.QuarantineArchiveInput{
 			OrgID: in.OrgID, BatchID: in.BatchID, Bucket: in.Bucket, Key: in.Key, Reason: err.Error(),
-		}).Get(ctx, nil)
+		}).Get(ctx, nil); qErr != nil {
+			return result, fmt.Errorf("unpack failed (%v); quarantine persistence failed: %w", err, qErr)
+		}
 		result.Status = "quarantined"
 		result.Quarantined = true
 		return result, nil
@@ -78,9 +85,11 @@ func BatchWorkflow(ctx workflow.Context, in BatchWorkflowInput) (*BatchWorkflowR
 	}).Get(ctx, &resolved)
 	if err != nil {
 		log.Error("materialize stages failed; quarantining", "err", err)
-		_ = workflow.ExecuteActivity(ctx, "QuarantineArchive", activities.QuarantineArchiveInput{
+		if qErr := workflow.ExecuteActivity(ctx, "QuarantineArchive", activities.QuarantineArchiveInput{
 			OrgID: in.OrgID, BatchID: in.BatchID, Bucket: in.Bucket, Key: in.Key, Reason: err.Error(),
-		}).Get(ctx, nil)
+		}).Get(ctx, nil); qErr != nil {
+			return result, fmt.Errorf("materialize failed (%v); quarantine persistence failed: %w", err, qErr)
+		}
 		result.Status = "quarantined"
 		result.Quarantined = true
 		return result, nil
@@ -90,10 +99,14 @@ func BatchWorkflow(ctx workflow.Context, in BatchWorkflowInput) (*BatchWorkflowR
 	nodes := stageNodes(resolved.Stages)
 	if batch.UsesDependsOnNodes(nodes) {
 		log.Info("BatchWorkflow DAG mode (dependsOn)")
-		runStagesDAG(ctx, in, resolved.Stages, result)
+		if err := runStagesDAG(ctx, in, resolved.Stages, result); err != nil {
+			return result, err
+		}
 	} else {
 		log.Info("BatchWorkflow sequential mode")
-		runStagesSequential(ctx, in, resolved.Stages, result)
+		if err := runStagesSequential(ctx, in, resolved.Stages, result); err != nil {
+			return result, err
+		}
 	}
 
 	final := "succeeded"
@@ -103,9 +116,11 @@ func BatchWorkflow(ctx workflow.Context, in BatchWorkflowInput) (*BatchWorkflowR
 		final = "failed"
 	}
 	result.Status = final
-	_ = workflow.ExecuteActivity(ctx, "FinalizeBatch", activities.FinalizeBatchInput{
+	if err := workflow.ExecuteActivity(ctx, "FinalizeBatch", activities.FinalizeBatchInput{
 		BatchID: in.BatchID, Status: final,
-	}).Get(ctx, nil)
+	}).Get(ctx, nil); err != nil {
+		return result, fmt.Errorf("finalize batch: %w", err)
+	}
 
 	log.Info("BatchWorkflow done", "status", final, "ok", result.StagesOK, "failed", result.StagesFailed)
 	return result, nil
@@ -119,21 +134,27 @@ func stageNodes(stages []activities.ResolvedStage) []batch.StageNode {
 	return nodes
 }
 
-func runStagesSequential(ctx workflow.Context, in BatchWorkflowInput, stages []activities.ResolvedStage, result *BatchWorkflowResult) {
+func runStagesSequential(ctx workflow.Context, in BatchWorkflowInput, stages []activities.ResolvedStage, result *BatchWorkflowResult) error {
 	stopEarly := false
 	for _, st := range stages {
 		if stopEarly {
-			skipStage(ctx, st, "skipped due to prior stage failure", result)
+			if err := skipStage(ctx, st, "skipped due to prior stage failure", result); err != nil {
+				return err
+			}
 			continue
 		}
-		ok, stop := runOneStage(ctx, in, st, result)
+		ok, stop, err := runOneStage(ctx, in, st, result)
+		if err != nil {
+			return err
+		}
 		if !ok && stop {
 			stopEarly = true
 		}
 	}
+	return nil
 }
 
-func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activities.ResolvedStage, result *BatchWorkflowResult) {
+func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activities.ResolvedStage, result *BatchWorkflowResult) error {
 	log := workflow.GetLogger(ctx)
 	nodes := stageNodes(stages)
 	byKey := map[string]activities.ResolvedStage{}
@@ -152,13 +173,17 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 				continue
 			}
 			if stopEarly {
-				skipStage(ctx, byKey[n.ID], "skipped due to prior stage failure", result)
+				if err := skipStage(ctx, byKey[n.ID], "skipped due to prior stage failure", result); err != nil {
+					return err
+				}
 				status[n.ID] = batch.StageSkipped
 				progress = true
 				continue
 			}
 			if batch.DepsBlocking(n, status) {
-				skipStage(ctx, byKey[n.ID], "skipped due to failed dependency", result)
+				if err := skipStage(ctx, byKey[n.ID], "skipped due to failed dependency", result); err != nil {
+					return err
+				}
 				status[n.ID] = batch.StageSkipped
 				progress = true
 			}
@@ -169,7 +194,9 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 			// Any remaining pending is a scheduling deadlock (should not happen after Validate).
 			for _, n := range nodes {
 				if status[n.ID] == batch.StagePending {
-					skipStage(ctx, byKey[n.ID], "skipped: dependencies never satisfied", result)
+					if err := skipStage(ctx, byKey[n.ID], "skipped: dependencies never satisfied", result); err != nil {
+						return err
+					}
 					status[n.ID] = batch.StageSkipped
 				}
 			}
@@ -180,16 +207,18 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 		}
 
 		type waveItem struct {
-			st     activities.ResolvedStage
-			jobID  int64
-			child  workflow.ChildWorkflowFuture
+			st      activities.ResolvedStage
+			jobID   int64
+			child   workflow.ChildWorkflowFuture
 			startOK bool
 		}
 		wave := make([]waveItem, 0, len(readyIDs))
 
 		for _, id := range readyIDs {
 			if stopEarly {
-				skipStage(ctx, byKey[id], "skipped due to prior stage failure", result)
+				if err := skipStage(ctx, byKey[id], "skipped due to prior stage failure", result); err != nil {
+					return err
+				}
 				status[id] = batch.StageSkipped
 				continue
 			}
@@ -200,13 +229,15 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 				OrgID: in.OrgID, BatchID: in.BatchID, StageRowID: st.StageRowID,
 				ScheduleID: in.ScheduleID, RuleTemplateID: st.RuleTemplateID,
 				RuleTemplateVersion: st.RuleTemplateVersion,
-				Bucket: st.Bucket, Key: st.Key, Filename: st.Filename, Size: st.Size,
+				Bucket:              st.Bucket, Key: st.Key, Filename: st.Filename, Size: st.Size,
 				StageKey: st.StageKey,
 			}).Get(ctx, &started)
 			if err != nil {
-				_ = workflow.ExecuteActivity(ctx, "FinalizeBatchStage", activities.FinalizeBatchStageInput{
+				if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 					StageRowID: st.StageRowID, Status: "failed", Error: err.Error(),
-				}).Get(ctx, nil)
+				}); persistErr != nil {
+					return persistErr
+				}
 				result.StagesFailed++
 				status[st.StageKey] = batch.StageFailed
 				if st.OnFailure != "continue" {
@@ -248,9 +279,11 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 					strings.Contains(err.Error(), "already started") || strings.Contains(err.Error(), "AlreadyStarted") {
 					log.Info("stage child already started", "stage", st.StageKey)
 				} else {
-					_ = workflow.ExecuteActivity(ctx, "FinalizeBatchStage", activities.FinalizeBatchStageInput{
+					if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 						StageRowID: st.StageRowID, JobID: started.JobID, Status: "failed", Error: err.Error(),
-					}).Get(ctx, nil)
+					}); persistErr != nil {
+						return persistErr
+					}
 					result.StagesFailed++
 					status[st.StageKey] = batch.StageFailed
 					item.startOK = false
@@ -260,9 +293,11 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 					continue
 				}
 			} else {
-				_ = workflow.ExecuteActivity(ctx, "MarkJobRunning", activities.MarkJobRunningInput{
+				if err := workflow.ExecuteActivity(ctx, "MarkJobRunning", activities.MarkJobRunningInput{
 					JobID: started.JobID, RunID: exec.RunID,
-				}).Get(ctx, nil)
+				}).Get(ctx, nil); err != nil {
+					return fmt.Errorf("mark stage job running: %w", err)
+				}
 			}
 			wave = append(wave, item)
 		}
@@ -296,9 +331,11 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 				result.StagesOK++
 				status[item.st.StageKey] = batch.StageSucceeded
 			}
-			_ = workflow.ExecuteActivity(ctx, "FinalizeBatchStage", activities.FinalizeBatchStageInput{
+			if err := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 				StageRowID: item.st.StageRowID, JobID: item.jobID, Status: stageStatus, Error: stageErr,
-			}).Get(ctx, nil)
+			}); err != nil {
+				return err
+			}
 		}
 
 		pendingLeft := false
@@ -312,17 +349,21 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 			break
 		}
 	}
+	return nil
 }
 
-func skipStage(ctx workflow.Context, st activities.ResolvedStage, reason string, result *BatchWorkflowResult) {
-	_ = workflow.ExecuteActivity(ctx, "FinalizeBatchStage", activities.FinalizeBatchStageInput{
+func skipStage(ctx workflow.Context, st activities.ResolvedStage, reason string, result *BatchWorkflowResult) error {
+	if err := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 		StageRowID: st.StageRowID, Status: "failed", Error: reason,
-	}).Get(ctx, nil)
+	}); err != nil {
+		return fmt.Errorf("persist skipped stage %s: %w", st.StageKey, err)
+	}
 	result.StagesFailed++
+	return nil
 }
 
 // runOneStage starts and waits for a single stage child. Returns (succeeded, shouldStop).
-func runOneStage(ctx workflow.Context, in BatchWorkflowInput, st activities.ResolvedStage, result *BatchWorkflowResult) (ok bool, shouldStop bool) {
+func runOneStage(ctx workflow.Context, in BatchWorkflowInput, st activities.ResolvedStage, result *BatchWorkflowResult) (ok bool, shouldStop bool, persistErr error) {
 	log := workflow.GetLogger(ctx)
 
 	var started activities.StartBatchStageJobOutput
@@ -330,15 +371,17 @@ func runOneStage(ctx workflow.Context, in BatchWorkflowInput, st activities.Reso
 		OrgID: in.OrgID, BatchID: in.BatchID, StageRowID: st.StageRowID,
 		ScheduleID: in.ScheduleID, RuleTemplateID: st.RuleTemplateID,
 		RuleTemplateVersion: st.RuleTemplateVersion,
-		Bucket: st.Bucket, Key: st.Key, Filename: st.Filename, Size: st.Size,
+		Bucket:              st.Bucket, Key: st.Key, Filename: st.Filename, Size: st.Size,
 		StageKey: st.StageKey,
 	}).Get(ctx, &started)
 	if err != nil {
-		_ = workflow.ExecuteActivity(ctx, "FinalizeBatchStage", activities.FinalizeBatchStageInput{
+		if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 			StageRowID: st.StageRowID, Status: "failed", Error: err.Error(),
-		}).Get(ctx, nil)
+		}); persistErr != nil {
+			return false, false, persistErr
+		}
 		result.StagesFailed++
-		return false, st.OnFailure != "continue"
+		return false, st.OnFailure != "continue", nil
 	}
 
 	cwo := workflow.ChildWorkflowOptions{
@@ -373,16 +416,20 @@ func runOneStage(ctx workflow.Context, in BatchWorkflowInput, st activities.Reso
 			strings.Contains(err.Error(), "already started") || strings.Contains(err.Error(), "AlreadyStarted") {
 			log.Info("stage child already started", "stage", st.StageKey)
 		} else {
-			_ = workflow.ExecuteActivity(ctx, "FinalizeBatchStage", activities.FinalizeBatchStageInput{
+			if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 				StageRowID: st.StageRowID, JobID: started.JobID, Status: "failed", Error: err.Error(),
-			}).Get(ctx, nil)
+			}); persistErr != nil {
+				return false, false, persistErr
+			}
 			result.StagesFailed++
-			return false, st.OnFailure != "continue"
+			return false, st.OnFailure != "continue", nil
 		}
 	} else {
-		_ = workflow.ExecuteActivity(ctx, "MarkJobRunning", activities.MarkJobRunningInput{
+		if err := workflow.ExecuteActivity(ctx, "MarkJobRunning", activities.MarkJobRunningInput{
 			JobID: started.JobID, RunID: exec.RunID,
-		}).Get(ctx, nil)
+		}).Get(ctx, nil); err != nil {
+			return false, false, fmt.Errorf("mark stage job running: %w", err)
+		}
 	}
 
 	var childResult MigrationWorkflowResult
@@ -393,23 +440,36 @@ func runOneStage(ctx workflow.Context, in BatchWorkflowInput, st activities.Reso
 		stageStatus = "failed"
 		stageErr = childErr.Error()
 		result.StagesFailed++
-		_ = workflow.ExecuteActivity(ctx, "FinalizeBatchStage", activities.FinalizeBatchStageInput{
+		if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 			StageRowID: st.StageRowID, JobID: started.JobID, Status: stageStatus, Error: stageErr,
-		}).Get(ctx, nil)
-		return false, st.OnFailure != "continue"
+		}); persistErr != nil {
+			return false, false, persistErr
+		}
+		return false, st.OnFailure != "continue", nil
 	}
 	if childResult.Failed > 0 || childResult.Cancelled {
 		stageStatus = "failed"
 		stageErr = fmt.Sprintf("job finished with failed=%d cancelled=%v", childResult.Failed, childResult.Cancelled)
 		result.StagesFailed++
-		_ = workflow.ExecuteActivity(ctx, "FinalizeBatchStage", activities.FinalizeBatchStageInput{
+		if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 			StageRowID: st.StageRowID, JobID: started.JobID, Status: stageStatus, Error: stageErr,
-		}).Get(ctx, nil)
-		return false, st.OnFailure != "continue"
+		}); persistErr != nil {
+			return false, false, persistErr
+		}
+		return false, st.OnFailure != "continue", nil
 	}
 	result.StagesOK++
-	_ = workflow.ExecuteActivity(ctx, "FinalizeBatchStage", activities.FinalizeBatchStageInput{
+	if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 		StageRowID: st.StageRowID, JobID: started.JobID, Status: stageStatus, Error: stageErr,
-	}).Get(ctx, nil)
-	return true, false
+	}); persistErr != nil {
+		return false, false, persistErr
+	}
+	return true, false, nil
+}
+
+func finalizeBatchStage(ctx workflow.Context, in activities.FinalizeBatchStageInput) error {
+	if err := workflow.ExecuteActivity(ctx, "FinalizeBatchStage", in).Get(ctx, nil); err != nil {
+		return fmt.Errorf("finalize batch stage %d: %w", in.StageRowID, err)
+	}
+	return nil
 }

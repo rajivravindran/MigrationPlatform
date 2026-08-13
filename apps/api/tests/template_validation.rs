@@ -21,7 +21,9 @@ fn golden_validates() {
     let g: Value = serde_json::from_str(GOLDEN).unwrap();
     let res = s.validate(&g);
     if let Err(errors) = res {
-        let msgs: Vec<String> = errors.map(|e| format!("{}: {}", e.instance_path, e)).collect();
+        let msgs: Vec<String> = errors
+            .map(|e| format!("{}: {}", e.instance_path, e))
+            .collect();
         panic!("golden fixture failed validation: {:?}", msgs);
     }
 }

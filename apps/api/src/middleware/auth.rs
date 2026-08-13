@@ -15,8 +15,15 @@ pub struct AuthUser(pub Claims);
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = Response;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let Some(auth) = parts.headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let Some(auth) = parts
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+        else {
             return Err((StatusCode::UNAUTHORIZED, "missing bearer token").into_response());
         };
         let Some(token) = auth.strip_prefix("Bearer ").map(str::trim) else {

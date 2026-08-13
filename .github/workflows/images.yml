@@ -15,7 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: api,              dockerfile: apps/api/Dockerfile }
+          - { name: api,              dockerfile: apps/api/Dockerfile, target: final }
+          - { name: license-server,   dockerfile: apps/api/Dockerfile, target: license-server }
           - { name: orchestrator,     dockerfile: apps/orchestrator-go/Dockerfile }
           - { name: transform-worker, dockerfile: apps/transform-worker/Dockerfile }
           - { name: web,              dockerfile: apps/web/Dockerfile }
@@ -39,6 +40,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

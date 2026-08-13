@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lesson 1 — Who is talking to whom?</title>
+  <link rel="stylesheet" href="../assets/lesson.css" />
+  <script defer src="../assets/quiz.js"></script>
+</head>
+<body>
+<main>
+  <p class="meta">Architecture deploy · Lesson 0001 · ~20–30 min</p>
+  <h1>Who is talking to whom?</h1>
+  <p class="muted">Goal: stop guessing “frontend talks to backend” and name the actual callers. This is the foundation every Docker/K8s interview diagram sits on.</p>
+
+  <h2>1. The one sentence to burn in</h2>
+  <div class="box">
+    <p><strong>Your browser</strong> runs the UI and <strong>calls the API over HTTP</strong>. Docker and Kubernetes only package and place those programs—they do not replace the browser.</p>
+  </div>
+  <p>When people say “frontend and backend talk to each other,” they usually mean:</p>
+  <ul>
+    <li><strong>Browser</strong> (Chrome, Edge, …) → <strong>API process</strong> (HTTP JSON, with a login token)</li>
+    <li>The API → databases, object storage, workflow engines, etc.</li>
+  </ul>
+  <p>The Next.js “web” container mostly ships JavaScript/HTML so the browser can do that. It is not (in this product’s normal design) the thing that holds your database password and talks to Postgres on your behalf for every click.</p>
+
+  <h2>2. Diagram: one machine, Docker Compose (conceptual)</h2>
+  <pre class="diagram" aria-label="ASCII architecture diagram">
+┌──────────────┐     HTTPS/HTTP      ┌─────────────────────────────┐
+│   Browser    │ ──────────────────► │  host:3000  (web UI files)  │
+│  (you)       │                     └─────────────────────────────┘
+│              │     HTTPS/HTTP      ┌─────────────────────────────┐
+│              │ ──────────────────► │  host:8080  (API)           │
+└──────────────┘                     │         │                   │
+                                     │         ▼                   │
+                                     │  Postgres, MinIO, Temporal… │
+                                     └─────────────────────────────┘
+  </pre>
+  <p>Important: lines from the <em>browser</em> go to published ports on the host. Containers on the same Compose network can also talk to each other by service name (e.g. <code>api</code> → <code>postgres</code>). That is a <em>second</em> network: container-to-container. Interviews often fail when someone mixes those two.</p>
+
+  <h2>3. Two hosts (what you asked about earlier)</h2>
+  <pre class="diagram" aria-label="Two host split">
+  Machine A                         Machine B
+  ┌────────────┐                    ┌──────────────────┐
+  │ web :3000  │                    │ api :8080        │
+  └─────▲──────┘                    │ + postgres etc.  │
+        │                           └────────▲─────────┘
+        │                                    │
+   Browser loads UI                    Browser calls API
+   from A                              at http://B:8080
+  </pre>
+  <p>The browser must know the API address. In this repo that is typically <code>NEXT_PUBLIC_API_URL</code> (baked in at build or set for the web app). Different origins (A vs B) is why CORS and cookies/tokens matter—we cover that in a later lesson; today you only need to know <em>the browser is the client of the API</em>.</p>
+
+  <h2>4. Primary reading (do this before the quiz)</h2>
+  <ol>
+    <li>Skim <a href="https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/" target="_blank" rel="noopener">What is a container?</a> — focus on “process in isolation,” not every flag.</li>
+    <li>Open <a href="../../apps/web/lib/api.ts" target="_blank" rel="noopener"><code>apps/web/lib/api.ts</code></a> in the repo and find where the API base URL comes from. You do not need to understand every line—just “browser JS → API URL.”</li>
+  </ol>
+
+  <h2>5. Retrieval quiz</h2>
+  <p class="muted">Click one answer. Wrong answers stay visible so you can correct the mental model.</p>
+
+  <div class="quiz" data-correct="1"
+       data-feedback-ok="Yes. The browser is the HTTP client of the API. The web container mainly serves the UI assets."
+       data-feedback-bad="Not quite. Re-read section 1: the browser calls the API. The web container is not the main caller of the API for user clicks.">
+    <p><strong>Q1.</strong> In Migration Platform’s normal browser flow, who primarily calls the API on port 8080?</p>
+    <button type="button" data-choice>The web Docker container, over the Compose network</button>
+    <button type="button" data-choice>Your browser, over HTTP to the published API URL</button>
+    <button type="button" data-choice>Postgres, which then notifies the API</button>
+  </div>
+
+  <div class="quiz" data-correct="2"
+       data-feedback-ok="Correct. Same-host Compose uses both: browser→published ports, and containers→service names."
+       data-feedback-bad="Re-read section 2. There are two networks of talk: browser to host ports, and containers among themselves.">
+    <p><strong>Q2.</strong> On one Docker Compose host, which statement is true?</p>
+    <button type="button" data-choice>Only containers talk; the browser never contacts the API directly</button>
+    <button type="button" data-choice>Only the browser talks; containers never talk to each other</button>
+    <button type="button" data-choice>Both happen: browser→host ports, and containers→each other by name</button>
+  </div>
+
+  <div class="quiz" data-correct="0"
+       data-feedback-ok="Exactly. Split hosts means the browser loads UI from A and calls API on B—config must point at B."
+       data-feedback-bad="Section 3: UI host and API host can differ; the browser still calls the API wherever it is published.">
+    <p><strong>Q3.</strong> Web on machine A, API on machine B. What must be true for login to work?</p>
+    <button type="button" data-choice>The browser must be configured (e.g. API URL) to reach B’s API</button>
+    <button type="button" data-choice>Machine A’s web container must share a Docker network with B (required)</button>
+    <button type="button" data-choice>The user must SSH from A to B for each API call</button>
+  </div>
+
+  <h2>6. Exit ticket (write in chat when done)</h2>
+  <p>Reply with:</p>
+  <ol>
+    <li>One sentence: who calls the API when you click Login?</li>
+    <li>Name the two kinds of “talk” on a single Compose host.</li>
+    <li>Optional: paste the line or symbol from <code>api.ts</code> that sets the API base URL.</li>
+  </ol>
+  <p>After that, Lesson 2 will lock <strong>image vs container</strong> and <strong>published ports</strong>, still before Kubernetes.</p>
+
+  <footer>
+    Mission: <code>learn/architecture-deploy/MISSION.md</code> ·
+    Resources: <code>RESOURCES.md</code>
+  </footer>
+</main>
+</body>
+</html>

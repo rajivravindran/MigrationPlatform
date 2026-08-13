@@ -27,13 +27,9 @@ pub fn init_tracing(service_name: &'static str, otlp_endpoint: Option<&str>) -> 
                     .tonic()
                     .with_endpoint(endpoint),
             )
-            .with_trace_config(
-                sdktrace::Config::default()
-                    .with_resource(Resource::new([opentelemetry::KeyValue::new(
-                        "service.name",
-                        service_name,
-                    )])),
-            )
+            .with_trace_config(sdktrace::Config::default().with_resource(Resource::new([
+                opentelemetry::KeyValue::new("service.name", service_name),
+            ])))
             .install_batch(runtime::Tokio)
             .context("failed to install OTLP tracer")?;
         global::set_tracer_provider(provider.clone());

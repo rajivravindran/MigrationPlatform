@@ -31,6 +31,9 @@ api:
   env:
     API_BIND: "0.0.0.0:8080"
     METRICS_BIND: "0.0.0.0:9464"
+    LICENSE_ENFORCE: "true"
+    LICENSE_STORE_PATH: "/var/lib/migration/license.json"
+    LICENSE_INSTALLATION_ID_PATH: "/run/installation/installation-id"
   readinessProbe:
     httpGet: { path: /healthz, port: 8080 }
     periodSeconds: 5
@@ -120,6 +123,15 @@ secrets:
   masterKey: "change-me-32-byte-key-change-me-32byte"
   jwtPrivateKey: ""
   jwtPublicKey: ""
+  bridgeToken: ""
+  licenseServerToken: ""
+
+license:
+  serverURL: ""
+  existingInstallationSecret: ""
+  persistence:
+    size: 1Gi
+    accessModes: ["ReadWriteMany"]
 
 ingress:
   enabled: true

@@ -60,7 +60,10 @@ pub enum SampleError {
     #[error("empty input")]
     Empty,
     #[error("invalid {format}: {message}")]
-    Invalid { format: &'static str, message: String },
+    Invalid {
+        format: &'static str,
+        message: String,
+    },
     #[error("unsupported sampling format: {0}")]
     Unsupported(String),
 }

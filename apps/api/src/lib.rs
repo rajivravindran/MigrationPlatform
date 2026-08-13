@@ -3,6 +3,7 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod job_source;
 pub mod middleware;
 pub mod routes;
 pub mod rule_template_types;
@@ -34,7 +35,11 @@ pub fn build_router(state: state::AppState) -> axum::Router {
         .merge(routes::license::router())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .layer(axum::middleware::from_fn(middleware::request_id::request_id_layer))
-        .layer(axum::middleware::from_fn(middleware::security_headers::security_headers))
+        .layer(axum::middleware::from_fn(
+            middleware::request_id::request_id_layer,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::security_headers::security_headers,
+        ))
         .with_state(state)
 }

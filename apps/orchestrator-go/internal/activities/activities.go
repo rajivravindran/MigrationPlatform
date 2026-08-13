@@ -28,23 +28,62 @@ type Deps struct {
 	DB               *pgxpool.Pool
 	Redis            *redisbus.Client
 	HTTP             *http.Client
+	LicenseHTTP      *http.Client
 	SecretsMasterKey string
 	// RateLimiter throttles outbound calls per destination host (nil = off).
 	RateLimiter *security.HostLimiter
 	// MaxResponseBytes caps how much of a response body is read/stored.
 	MaxResponseBytes int64
+	// LicenseCheckURL is the API's authenticated runtime authorization endpoint.
+	LicenseCheckURL string
+	BridgeToken     string
 }
 
-type Activities struct{ d Deps }
+type Activities struct {
+	d         Deps
+	sftpSlots chan struct{}
+}
 
-func NewActivities(d Deps) *Activities { return &Activities{d: d} }
+func NewActivities(d Deps) *Activities {
+	return &Activities{d: d, sftpSlots: make(chan struct{}, 8)}
+}
+
+func (a *Activities) acquireSFTP(ctx context.Context) (func(), error) {
+	select {
+	case a.sftpSlots <- struct{}{}:
+		return func() { <-a.sftpSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// RequireLicensed fails closed before a workflow creates or processes work.
+// The API remains the single authority for signature, expiry, and dev-mode policy.
+func (a *Activities) RequireLicensed(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.d.LicenseCheckURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.d.BridgeToken)
+	resp, err := a.d.LicenseHTTP.Do(req)
+	if err != nil {
+		metrics.LicenseDenied.Inc()
+		return fmt.Errorf("license authorization unavailable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		metrics.LicenseDenied.Inc()
+		return fmt.Errorf("license authorization denied (status %d)", resp.StatusCode)
+	}
+	return nil
+}
 
 // ---------------- LoadTemplate ----------------
 
 type LoadTemplateInput struct {
-	OrgID            int64 `json:"orgId"`
-	RuleTemplateID   int64 `json:"ruleTemplateId"`
-	TemplateVersion  int32 `json:"templateVersion,omitempty"`
+	OrgID           int64 `json:"orgId"`
+	RuleTemplateID  int64 `json:"ruleTemplateId"`
+	TemplateVersion int32 `json:"templateVersion,omitempty"`
 }
 
 type LoadTemplateOutput struct {
@@ -78,15 +117,15 @@ func (a *Activities) LoadTemplate(ctx context.Context, in LoadTemplateInput) (Lo
 // ---------------- BootstrapScheduledJob ----------------
 
 type BootstrapScheduledJobInput struct {
-	OrgID                int64                  `json:"orgId"`
-	ScheduleID           int64                  `json:"scheduleId"`
-	RuleTemplateID       int64                  `json:"ruleTemplateId"`
-	RuleTemplateVersion  int32                  `json:"ruleTemplateVersion"`
-	ConnectorID          int64                  `json:"connectorId"`
-	ScheduledTime        time.Time              `json:"scheduledTime"`
-	TemporalWorkflowID   string                 `json:"temporalWorkflowId"`
-	TemporalRunID        string                 `json:"temporalRunId"`
-	ExtraSourceConfig    map[string]any         `json:"extraSourceConfig,omitempty"`
+	OrgID               int64          `json:"orgId"`
+	ScheduleID          int64          `json:"scheduleId"`
+	RuleTemplateID      int64          `json:"ruleTemplateId"`
+	RuleTemplateVersion int32          `json:"ruleTemplateVersion"`
+	ConnectorID         int64          `json:"connectorId"`
+	ScheduledTime       time.Time      `json:"scheduledTime"`
+	TemporalWorkflowID  string         `json:"temporalWorkflowId"`
+	TemporalRunID       string         `json:"temporalRunId"`
+	ExtraSourceConfig   map[string]any `json:"extraSourceConfig,omitempty"`
 }
 
 type BootstrapScheduledJobOutput struct {
@@ -149,7 +188,7 @@ type IngestInput struct {
 }
 
 type IngestOutput struct {
-	Rows      []connectors.Row `json:"rows"`
+	Rows      []connectors.Row  `json:"rows"`
 	NewOffset connectors.Offset `json:"newOffset"`
 	Done      bool              `json:"done"`
 }
@@ -211,11 +250,11 @@ type CallEndpointInput struct {
 }
 
 type CallEndpointOutput struct {
-	Status      int             `json:"status"`
-	Body        json.RawMessage `json:"body"`
-	Succeeded   bool            `json:"succeeded"`
-	Error       string          `json:"error,omitempty"`
-	LatencyMs   int64           `json:"latencyMs"`
+	Status    int             `json:"status"`
+	Body      json.RawMessage `json:"body"`
+	Succeeded bool            `json:"succeeded"`
+	Error     string          `json:"error,omitempty"`
+	LatencyMs int64           `json:"latencyMs"`
 }
 
 func (a *Activities) CallEndpoint(ctx context.Context, in CallEndpointInput) (CallEndpointOutput, error) {
@@ -321,11 +360,11 @@ func excerpt(raw []byte, max int) string {
 // ---------------- PersistOutcome ----------------
 
 type PersistOutcomeInput struct {
-	JobID          int64           `json:"jobId"`
-	RowIndex       int64           `json:"rowIndex"`
-	Status         string          `json:"status"`
-	LastError      string          `json:"lastError,omitempty"`
-	IdempotencyKey string          `json:"idempotencyKey,omitempty"`
+	JobID          int64  `json:"jobId"`
+	RowIndex       int64  `json:"rowIndex"`
+	Status         string `json:"status"`
+	LastError      string `json:"lastError,omitempty"`
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 	// Row is the raw (preprocessed) source row; persisted so single-row
 	// retries never need to re-read the source file.
 	Row      map[string]any  `json:"row,omitempty"`
@@ -468,9 +507,9 @@ func (a *Activities) LoadRowState(ctx context.Context, in LoadRowStateInput) (Lo
 // ---------------- ListFailedRows ----------------
 
 type ListFailedRowsInput struct {
-	JobID  int64 `json:"jobId"`
-	After  int64 `json:"after"` // exclusive row_index cursor
-	Limit  int   `json:"limit"`
+	JobID int64 `json:"jobId"`
+	After int64 `json:"after"` // exclusive row_index cursor
+	Limit int   `json:"limit"`
 }
 
 type ListFailedRowsOutput struct {
@@ -511,12 +550,12 @@ func (a *Activities) ListFailedRows(ctx context.Context, in ListFailedRowsInput)
 // ---------------- PublishProgress ----------------
 
 type PublishProgressInput struct {
-	JobID       int64 `json:"jobId"`
-	Processed   int64 `json:"processed"`
-	Failed      int64 `json:"failed"`
-	Pending     int64 `json:"pending"`
-	ETASeconds  int64 `json:"etaSeconds"`
-	LastRow     int64 `json:"lastRow"`
+	JobID      int64 `json:"jobId"`
+	Processed  int64 `json:"processed"`
+	Failed     int64 `json:"failed"`
+	Pending    int64 `json:"pending"`
+	ETASeconds int64 `json:"etaSeconds"`
+	LastRow    int64 `json:"lastRow"`
 }
 
 func (a *Activities) PublishProgress(ctx context.Context, in PublishProgressInput) error {

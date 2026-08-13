@@ -26,10 +26,32 @@ var (
 		Help:    "Latency of destination endpoint calls.",
 		Buckets: prometheus.ExponentialBuckets(0.01, 2, 14),
 	}, []string{"status"})
+
+	LicenseDenied = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "license_work_denied_total",
+		Help: "Work-producing workflow attempts denied by the runtime license gate.",
+	})
+	SFTPFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sftp_failures_total",
+		Help: "SFTP operations that failed.",
+	}, []string{"operation"})
+	QuarantinedBatches = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "batch_quarantine_total",
+		Help: "Batch archives moved to quarantine.",
+	})
+	WatchLag = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "watch_discovery_lag_seconds",
+		Help:    "Age of the oldest object returned by a bounded watch listing.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 18),
+	}, []string{"connector"})
+	DAGBatches = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "batch_dag_total",
+		Help: "Batch manifests materialized with dependency edges.",
+	})
 )
 
 func init() {
-	prometheus.MustRegister(RowsProcessed, RowsFailed, EndpointLatency)
+	prometheus.MustRegister(RowsProcessed, RowsFailed, EndpointLatency, LicenseDenied, SFTPFailures, QuarantinedBatches, WatchLag, DAGBatches)
 }
 
 func ServeHTTP(addr string) *http.Server {

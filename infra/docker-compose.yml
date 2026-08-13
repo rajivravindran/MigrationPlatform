@@ -11,8 +11,18 @@ volumes:
   tempodata: {}
   grafanadata: {}
   promdata: {}
+  license-data: {}
 
 services:
+  installation-id:
+    image: alpine:3.20
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'test -s /var/lib/migration/installation-id || (umask 077; cat /proc/sys/kernel/random/uuid > /var/lib/migration/installation-id); chown -R 10001:10001 /var/lib/migration; chmod 0444 /var/lib/migration/installation-id'
+    volumes:
+      - license-data:/var/lib/migration
+    restart: "no"
+    networks: [migration]
   # ---------- Data plane ----------
   postgres:
     image: postgres:16
@@ -219,16 +229,23 @@ services:
       MASTER_KEY: "dev-master-key-change-me-000000000000000000000000"
       ORCHESTRATOR_BRIDGE_URL: http://orchestrator:7070
       BRIDGE_TOKEN: "dev-bridge-token-change-me"
+      LICENSE_ENFORCE: "${LICENSE_ENFORCE:-false}"
+      LICENSE_SERVER_URL: "${LICENSE_SERVER_URL:-}"
+      LICENSE_SERVER_TOKEN: "${LICENSE_SERVER_TOKEN:-}"
+      LICENSE_STORE_PATH: /var/lib/migration/license.json
+      LICENSE_INSTALLATION_ID_PATH: /var/lib/migration/installation-id
       JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private.pem
       JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public.pem
     volumes:
       - ./secrets:/run/secrets:ro
+      - license-data:/var/lib/migration
     ports: ["8080:8080", "9464:9464"]
     depends_on:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       temporal: { condition: service_healthy }
       minio-setup: { condition: service_completed_successfully }
+      installation-id: { condition: service_completed_successfully }
     networks: [migration]
 
   orchestrator:
@@ -246,6 +263,7 @@ services:
       METRICS_BIND: 0.0.0.0:9464
       BRIDGE_ADDR: ":7070"
       BRIDGE_TOKEN: "dev-bridge-token-change-me"
+      API_INTERNAL_URL: http://api:8080
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: minio
       MINIO_SECRET_KEY: minio123

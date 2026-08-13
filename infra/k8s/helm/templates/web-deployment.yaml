@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: {{ include "mp.image" .Values.web.image }}
+          image: {{ tpl .Values.web.image . | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http

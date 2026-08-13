@@ -1,6 +1,22 @@
 # Customer install (commercial / trial)
 
-Self-hosted Migration Platform is distributed as **versioned container images** (GHCR)
+## Quick start (Docker Hub demo — no git)
+
+Share **`dist/migration-demo-pack.zip`** (built with `make demo-pack`). Recipients
+do **not** need this repository:
+
+```bash
+unzip migration-demo-pack.zip
+cd demo-pack
+./up.sh
+open http://localhost:3000   # admin@example.com / admin123
+```
+
+Images pull from `rajivravindran/migration-*:demo`. The zip only has Compose + scripts.
+
+---
+
+Self-hosted Migration Platform is a **conditional-release MVP** distributed as versioned container images (GHCR)
 plus a compose/Helm pack. Images alone do not limit use — release installs must set
 `LICENSE_ENFORCE=true` and either mount a commercial license or reach the vendor
 license service for a **10-day phone-home trial**.
@@ -26,7 +42,9 @@ Only `infra/license/license_public_key.pem` (already baked into the API) is used
 ```bash
 LICENSE_ENFORCE=true
 LICENSE_SERVER_URL=https://license.example.com   # vendor trial endpoint
+LICENSE_SERVER_TOKEN=<vendor-issued-32+-character-token>
 LICENSE_STORE_PATH=/var/lib/migration/license.json
+LICENSE_INSTALLATION_ID_PATH=/run/installation/installation-id
 ```
 
 5. Mount the license volume on the API container, e.g. `license_data:/var/lib/migration`.
@@ -44,17 +62,19 @@ LICENSE_STORE_PATH=/var/lib/migration/license.json
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `LICENSE_ENFORCE` | prod | `true` blocks job/schedule **create** when unlicensed/expired |
+| `LICENSE_ENFORCE` | prod | `true` blocks all work creation/resume/retry and automatic schedule execution when unlicensed/expired |
 | `LICENSE_SERVER_URL` | trial | Base URL of the phone-home service (no trailing path) |
+| `LICENSE_SERVER_TOKEN` | trial | Bearer credential for trial activation |
 | `LICENSE_STORE_PATH` | optional | Durable path for auto-issued trial (default `/var/lib/migration/license.json`) |
+| `LICENSE_INSTALLATION_ID_PATH` | prod | Mounted durable installation UUID shared by all API replicas |
 | `LICENSE_FILE` | commercial | Path to a mounted vendor-signed license |
 | `LICENSE_PUBLIC_KEY_PATH` | rare | Override embedded verify key (rotation only) |
 
 ## Install fingerprint
 
-The API hashes `/etc/machine-id` (or hostname fallback) with SHA-256. Only the
-hex digest leaves the host — no cleartext hostname/machine-id in license traffic.
-Wiping containers but keeping the same machine keeps the same trial end date.
+The API hashes an operator-provisioned durable installation UUID. Compose stores
+it in `license-data`; Helm stores it in a retained Secret shared by all replicas.
+Hostnames and container machine IDs are not used.
 Wiping the license volume alone does **not** reset the clock (server remembers the fingerprint).
 
 ## Local smoke (developers)
@@ -92,6 +112,14 @@ Re-run the API after deleting `./data/license.json` — the same fingerprint sho
 - [ ] Confirm `dev_license_signing_key.pem` / any `*signing_key*.pem` is **not** in the image
 - [ ] License service deployed with offline-held signing key + durable `trials` DB
 - [ ] Install pack sets `LICENSE_ENFORCE=true` and a durable license volume
+- [ ] Helm storage class supports `ReadWriteMany` for multi-replica license storage
+
+## License server boundaries
+
+`migration-license-server` is a vendor-operated, authenticated MVP. The image
+contains no signing key; mount `LICENSE_SIGNING_KEY_PATH` at runtime. SQLite must
+be on durable storage. The service is not HA and does not integrate with KMS;
+run one replica and include its database in backups.
 
 ## Out of scope (later)
 

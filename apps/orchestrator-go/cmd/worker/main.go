@@ -80,9 +80,12 @@ func main() {
 		DB:               pg,
 		Redis:            rds,
 		HTTP:             security.NewEgressHTTPClient(30*time.Second, cfg.AllowPrivateDestinations),
+		LicenseHTTP:      &http.Client{Timeout: 10 * time.Second},
 		SecretsMasterKey: cfg.SecretsMasterKey,
 		RateLimiter:      security.NewHostLimiter(cfg.DestinationRPS, cfg.DestinationBurst),
 		MaxResponseBytes: cfg.MaxResponseBytes,
+		LicenseCheckURL:  cfg.APIInternalURL + "/internal/license/authorize",
+		BridgeToken:      cfg.BridgeToken,
 	}
 	acts := activities.NewActivities(deps)
 	if cfg.AllowPrivateDestinations {
@@ -102,6 +105,7 @@ func main() {
 	w.RegisterWorkflow(workflows.BatchWorkflow)
 
 	w.RegisterActivityWithOptions(acts.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
+	w.RegisterActivityWithOptions(acts.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	w.RegisterActivityWithOptions(acts.Ingest, activities.RegisterOptions("Ingest"))
 	w.RegisterActivityWithOptions(acts.BootstrapScheduledJob, activities.RegisterOptions("BootstrapScheduledJob"))
 	w.RegisterActivityWithOptions(acts.LoadConnector, activities.RegisterOptions("LoadConnector"))
@@ -126,11 +130,14 @@ func main() {
 	w.RegisterActivityWithOptions(acts.ListFailedRows, activities.RegisterOptions("ListFailedRows"))
 	w.RegisterActivityWithOptions(acts.PublishProgress, activities.RegisterOptions("PublishProgress"))
 	w.RegisterActivityWithOptions(acts.FinalizeJob, activities.RegisterOptions("FinalizeJob"))
+	w.RegisterActivityWithOptions(acts.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
 
 	// Internal Temporal bridge for the Rust API (start/signal/cancel/schedules).
 	bridgeSrv := &http.Server{
-		Addr:              cfg.BridgeAddr,
-		Handler:           bridge.NewServer(c, cfg.BridgeToken, logger).Handler(),
+		Addr: cfg.BridgeAddr,
+		Handler: bridge.NewServer(c, cfg.BridgeToken, logger, func(ctx context.Context, orgID, connectorID int64) error {
+			return acts.TestSFTPConnector(ctx, orgID, connectorID)
+		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

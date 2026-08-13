@@ -3,7 +3,7 @@
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 
-import { Badge, Button, Card, EmptyState } from "@/components/ui";
+import { Button, EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, formatDateTime } from "@/components/ui";
 import { apiFetch } from "@/lib/api";
 
 type Batch = {
@@ -17,44 +17,27 @@ type Batch = {
   error_message?: string | null;
 };
 
-function tone(s: string) {
-  switch (s) {
-    case "succeeded": return "ok";
-    case "failed":
-    case "quarantined": return "fail";
-    case "partial": return "warn";
-    case "running": return "neutral";
-    default: return "neutral";
-  }
-}
-
 export default function BatchesPage() {
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["batches"],
     queryFn: () => apiFetch<{ items: Batch[] }>("/batches"),
     refetchInterval: 5000
   });
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Batches</h1>
-          <p className="text-sm text-slate-500">
-            Archive packages with ordered stages (manifest.json inside tar.gz / zip).
-          </p>
-        </div>
-        <Link href="/jobs"><Button variant="ghost">Jobs</Button></Link>
-      </div>
-      {isLoading ? <Card>Loading&hellip;</Card> : null}
+    <div className="space-y-6">
+      <PageHeader title="Batches" description="Archive packages (.tar.gz / .zip) appear here—not under Jobs—until each stage starts its own job." actions={<Link href="/jobs"><Button variant="secondary">View jobs</Button></Link>} />
+      {isLoading ? <LoadingState label="Loading batches" /> : null}
+      {error ? <ErrorState error={error} retry={() => refetch()} /> : null}
       {data && data.items?.length === 0 ? (
         <EmptyState
           title="No batches yet"
           hint="Upload a .tar.gz or .zip with root manifest.json to a watched prefix, or POST /batches."
         />
       ) : null}
-      <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
-        <table className="w-full text-sm">
+      {data?.items.length ? <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+        <table className="min-w-[700px] w-full text-sm">
+          <caption className="sr-only">Migration batches</caption>
           <thead className="bg-slate-50 text-slate-600">
             <tr>
               <th className="px-3 py-2 text-left">Batch</th>
@@ -74,13 +57,13 @@ export default function BatchesPage() {
                 <td className="px-3 py-2 font-mono text-xs text-slate-600">
                   {b.source_ref?.key ?? "—"}
                 </td>
-                <td className="px-3 py-2"><Badge tone={tone(b.status) as any}>{b.status}</Badge></td>
-                <td className="px-3 py-2 text-slate-500">{b.started_at ?? "—"}</td>
+                <td className="px-3 py-2"><StatusBadge status={b.status} /></td>
+                <td className="px-3 py-2 text-slate-500">{formatDateTime(b.started_at)}</td>
               </tr>
             ))}
           </tbody>
         </table>
-      </div>
+      </div> : null}
     </div>
   );
 }

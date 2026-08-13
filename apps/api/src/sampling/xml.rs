@@ -6,6 +6,7 @@
 //!   * Element children appear under their tag name.
 //!   * Attributes appear under `@name`.
 //!   * Text content of leaf elements is hoisted to the element's value.
+//!
 //! Repeated children collapse into the *first* occurrence for the preview --
 //! we still flag the column type as `string` so the user is never surprised by
 //! losing nested structure in the dry-run.
@@ -28,7 +29,11 @@ pub fn sample(
     if bytes.is_empty() {
         return Err(SampleError::Empty);
     }
-    let tag = if record_tag.is_empty() { "record" } else { record_tag };
+    let tag = if record_tag.is_empty() {
+        "record"
+    } else {
+        record_tag
+    };
 
     let mut reader = Reader::from_reader(std::io::Cursor::new(bytes));
     reader.config_mut().trim_text(true);
@@ -171,7 +176,10 @@ fn decode_record<R: BufRead>(
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match reader.read_event_into(&mut buf).map_err(|e| e.to_string())? {
+        match reader
+            .read_event_into(&mut buf)
+            .map_err(|e| e.to_string())?
+        {
             Event::Eof => return Ok(()),
             Event::End(_) => return Ok(()),
             Event::Start(start) => {
@@ -267,8 +275,11 @@ mod tests {
         </root>"#;
         let r = sample(body, 25, "record", false).unwrap();
         assert_eq!(r.row_count, 2);
-        let by_name: std::collections::HashMap<_, _> =
-            r.columns.iter().map(|c| (c.name.as_str(), c.r#type)).collect();
+        let by_name: std::collections::HashMap<_, _> = r
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.r#type))
+            .collect();
         assert_eq!(by_name["id"], "integer");
         assert_eq!(by_name["name"], "string");
         assert_eq!(by_name["active"], "boolean");

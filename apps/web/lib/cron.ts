@@ -10,6 +10,7 @@ function parseField(raw: string, min: number, max: number): Field {
   raw.split(",").forEach((part) => {
     const [range, stepStr] = part.split("/");
     const step = stepStr ? Number(stepStr) : 1;
+    if (!Number.isInteger(step) || step < 1) throw new Error("invalid step");
     let lo = min;
     let hi = max;
     if (range && range !== "*") {
@@ -21,8 +22,12 @@ function parseField(raw: string, min: number, max: number): Field {
         lo = hi = Number(range);
       }
     }
+    if (!Number.isInteger(lo) || !Number.isInteger(hi) || lo < min || hi > max || lo > hi) {
+      throw new Error("field out of range");
+    }
     for (let v = lo; v <= hi; v += step) values.add(v);
   });
+  if (values.size === 0) throw new Error("empty field");
   return { values };
 }
 
@@ -39,21 +44,36 @@ export function previewCron(expr: string, timezone = "UTC", count = 5): string[]
   } catch {
     return [];
   }
+  let formatter: Intl.DateTimeFormat;
+  try {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      minute: "numeric",
+      hour: "numeric",
+      day: "numeric",
+      month: "numeric",
+      weekday: "short",
+      hourCycle: "h23"
+    });
+    formatter.format(new Date());
+  } catch {
+    return [];
+  }
   const now = new Date();
   const out: string[] = [];
+  const weekdays: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
   for (let i = 0; i < 24 * 60 * 366 && out.length < count; i++) {
     const d = new Date(now.getTime() + i * 60_000);
     d.setSeconds(0, 0);
+    const parts = Object.fromEntries(formatter.formatToParts(d).map((part) => [part.type, part.value]));
     if (
-      minute.values.has(d.getUTCMinutes()) &&
-      hour.values.has(d.getUTCHours()) &&
-      dom.values.has(d.getUTCDate()) &&
-      month.values.has(d.getUTCMonth() + 1) &&
-      dow.values.has(d.getUTCDay())
+      minute.values.has(Number(parts.minute)) &&
+      hour.values.has(Number(parts.hour)) &&
+      dom.values.has(Number(parts.day)) &&
+      month.values.has(Number(parts.month)) &&
+      dow.values.has(weekdays[parts.weekday])
     ) {
-      out.push(
-        d.toLocaleString(undefined, { timeZone: timezone, hour12: false })
-      );
+      out.push(d.toLocaleString(undefined, { timeZone: timezone, dateStyle: "medium", timeStyle: "short" }));
     }
   }
   return out;

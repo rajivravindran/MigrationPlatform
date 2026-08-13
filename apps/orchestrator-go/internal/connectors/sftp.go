@@ -13,8 +13,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	orchestratorsecurity "github.com/migration-platform/orchestrator/internal/security"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
@@ -72,17 +74,21 @@ func SftpFingerprint(modTime time.Time, size int64) string {
 
 // SftpConfig is the non-secret portion of a watched_sftp connector.
 type SftpConfig struct {
-	Host                   string
-	Port                   int
-	Username               string
-	Path                   string // remote directory / prefix
-	Glob                   string
-	Sort                   string
-	StagingBucket          string
-	StagingPrefix          string
-	InsecureIgnoreHostKey  bool
-	HostKey                string // optional authorized_keys / ssh wire public key
-	ConnectTimeout         time.Duration
+	Host                  string
+	Port                  int
+	Username              string
+	Path                  string // remote directory / prefix
+	Glob                  string
+	Sort                  string
+	StagingBucket         string
+	StagingPrefix         string
+	InsecureIgnoreHostKey bool
+	HostKey               string // optional authorized_keys / ssh wire public key
+	ConnectTimeout        time.Duration
+	MaxFileBytes          int64
+	MaxListEntries        int
+	SettleAge             time.Duration
+	AllowPrivateNetwork   bool
 }
 
 // ParseSftpConfig extracts SFTP settings from connector config_json.
@@ -94,6 +100,9 @@ func ParseSftpConfig(cfg map[string]any) (SftpConfig, error) {
 		StagingBucket:  "migration",
 		StagingPrefix:  "sftp-landing/",
 		ConnectTimeout: 30 * time.Second,
+		MaxFileBytes:   1 << 30,
+		MaxListEntries: 1000,
+		SettleAge:      30 * time.Second,
 	}
 	if cfg == nil {
 		return out, errors.New("watched_sftp config is required")
@@ -145,7 +154,28 @@ func ParseSftpConfig(cfg map[string]any) (SftpConfig, error) {
 	} else if v, ok := cfg["insecureIgnoreHostKey"].(bool); ok {
 		out.InsecureIgnoreHostKey = v
 	}
+	out.MaxFileBytes = int64Config(cfg, "max_file_bytes", out.MaxFileBytes)
+	out.MaxListEntries = int(int64Config(cfg, "max_list_entries", int64(out.MaxListEntries)))
+	out.SettleAge = time.Duration(int64Config(cfg, "settle_seconds", int64(out.SettleAge/time.Second))) * time.Second
+	if out.MaxFileBytes <= 0 || out.MaxListEntries <= 0 || out.MaxListEntries > 10000 || out.SettleAge < 0 {
+		return out, errors.New("invalid SFTP limits")
+	}
+	out.AllowPrivateNetwork = os.Getenv("ALLOW_PRIVATE_DESTINATIONS") == "true"
 	return out, nil
+}
+
+func int64Config(cfg map[string]any, key string, def int64) int64 {
+	switch v := cfg[key].(type) {
+	case float64:
+		return int64(v)
+	case int:
+		return int64(v)
+	case string:
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 // StagingObjectKey builds the MinIO key used after SFTP download.
@@ -227,10 +257,29 @@ func dialSFTP(cfg SftpConfig, auth SftpAuth) (*sftpSession, error) {
 		sshCfg.Auth = []ssh.AuthMethod{ssh.Password(auth.Password)}
 	}
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	sshClient, err := ssh.Dial("tcp", addr, sshCfg)
+	dialer := &net.Dialer{Timeout: cfg.ConnectTimeout, KeepAlive: 30 * time.Second}
+	if !cfg.AllowPrivateNetwork {
+		dialer.Control = func(_, address string, _ syscall.RawConn) error {
+			host, _, splitErr := net.SplitHostPort(address)
+			if splitErr != nil {
+				return splitErr
+			}
+			if orchestratorsecurity.IPBlocked(net.ParseIP(host)) {
+				return fmt.Errorf("SFTP destination %s is in a blocked private/internal range", host)
+			}
+			return nil
+		}
+	}
+	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("sftp dial %s: %w", addr, err)
 	}
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, sshCfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("sftp SSH handshake %s: %w", addr, err)
+	}
+	sshClient := ssh.NewClient(sshConn, chans, reqs)
 	sftpClient, err := sftp.NewClient(sshClient)
 	if err != nil {
 		_ = sshClient.Close()
@@ -302,6 +351,9 @@ func ListSftpObjects(ctx context.Context, cfg SftpConfig, auth SftpAuth) ([]Obje
 		if info == nil || info.IsDir() {
 			continue
 		}
+		if info.Size() > cfg.MaxFileBytes || time.Since(info.ModTime()) < cfg.SettleAge {
+			continue
+		}
 		key := walker.Path()
 		// Normalize to forward-slash relative-looking keys.
 		key = strings.ReplaceAll(key, "\\", "/")
@@ -312,12 +364,15 @@ func ListSftpObjects(ctx context.Context, cfg SftpConfig, auth SftpAuth) ([]Obje
 			Size:         info.Size(),
 			LastModified: mod.UTC(),
 		})
+		if len(raw) >= cfg.MaxListEntries {
+			break
+		}
 	}
 	return FilterAndSortObjects(raw, cfg.Glob, cfg.Sort)
 }
 
 // DownloadSftpFile writes a remote path to destPath (local), enforcing maxBytes (0 = no cap).
-func DownloadSftpFile(ctx context.Context, cfg SftpConfig, auth SftpAuth, remoteKey, destPath string, maxBytes int64) (int64, error) {
+func DownloadSftpFile(ctx context.Context, cfg SftpConfig, auth SftpAuth, remoteKey, destPath, expectedFingerprint string, expectedSize int64) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -326,6 +381,14 @@ func DownloadSftpFile(ctx context.Context, cfg SftpConfig, auth SftpAuth, remote
 		return 0, err
 	}
 	defer sess.Close()
+	before, err := sess.sftpClient.Stat(remoteKey)
+	if err != nil {
+		return 0, fmt.Errorf("sftp pre-download stat %s: %w", remoteKey, err)
+	}
+	if before.IsDir() || before.Size() > cfg.MaxFileBytes || (expectedSize > 0 && before.Size() != expectedSize) ||
+		(expectedFingerprint != "" && SftpFingerprint(before.ModTime(), before.Size()) != expectedFingerprint) {
+		return 0, fmt.Errorf("remote file changed or exceeds configured size limit before download")
+	}
 
 	src, err := sess.sftpClient.Open(remoteKey)
 	if err != nil {
@@ -343,16 +406,19 @@ func DownloadSftpFile(ctx context.Context, cfg SftpConfig, auth SftpAuth, remote
 	defer dst.Close()
 
 	var r io.Reader = src
-	if maxBytes > 0 {
-		r = io.LimitReader(src, maxBytes+1)
-	}
+	r = io.LimitReader(src, cfg.MaxFileBytes+1)
 	n, err := io.Copy(dst, r)
 	if err != nil {
 		return n, err
 	}
-	if maxBytes > 0 && n > maxBytes {
+	if n > cfg.MaxFileBytes {
 		_ = os.Remove(destPath)
-		return n, fmt.Errorf("remote file size exceeds limit %d", maxBytes)
+		return n, fmt.Errorf("remote file size exceeds limit %d", cfg.MaxFileBytes)
+	}
+	after, err := sess.sftpClient.Stat(remoteKey)
+	if err != nil || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) || n != before.Size() {
+		_ = os.Remove(destPath)
+		return n, fmt.Errorf("remote file changed during download")
 	}
 	return n, nil
 }

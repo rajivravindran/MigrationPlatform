@@ -135,12 +135,16 @@ mod tests {
 
     #[test]
     fn samples_basic_csv_with_inferred_types() {
-        let csv = "id,name,age,active,joined\n1,Ada,37,true,2024-01-01\n2,Bob,42,false,2024-02-15\n";
+        let csv =
+            "id,name,age,active,joined\n1,Ada,37,true,2024-01-01\n2,Bob,42,false,2024-02-15\n";
         let r = sample(csv.as_bytes(), 25, false).unwrap();
         assert_eq!(r.row_count, 2);
         assert!(!r.truncated);
-        let by_name: std::collections::HashMap<_, _> =
-            r.columns.iter().map(|c| (c.name.as_str(), c.r#type)).collect();
+        let by_name: std::collections::HashMap<_, _> = r
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.r#type))
+            .collect();
         assert_eq!(by_name["id"], "integer");
         assert_eq!(by_name["name"], "string");
         assert_eq!(by_name["age"], "integer");

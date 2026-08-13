@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { toast } from "sonner";
 
-import { Badge, Button, Card, EmptyState } from "@/components/ui";
+import { Button, EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, formatDateTime } from "@/components/ui";
 import { apiFetch } from "@/lib/api";
 
 type Schedule = {
@@ -22,7 +22,7 @@ type Schedule = {
 
 export default function SchedulesPage() {
   const client = useQueryClient();
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["schedules"],
     queryFn: () => apiFetch<{ items: Schedule[] }>("/schedules"),
     refetchInterval: 10000
@@ -42,15 +42,10 @@ export default function SchedulesPage() {
   });
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Schedules</h1>
-          <p className="text-sm text-slate-500">Temporal-backed recurring migrations with catch-up and overlap policies.</p>
-        </div>
-        <Link href="/schedules/new"><Button>New schedule</Button></Link>
-      </div>
-      {isLoading ? <Card>Loading&hellip;</Card> : null}
+    <div className="space-y-6">
+      <PageHeader title="Schedules" description="Automate recurring migrations and control how missed or overlapping runs are handled." actions={<Link href="/schedules/new"><Button>New schedule</Button></Link>} />
+      {isLoading ? <LoadingState label="Loading schedules" /> : null}
+      {error ? <ErrorState error={error} retry={() => refetch()} /> : null}
       {data && data.items?.length === 0 ? (
         <EmptyState
           title="No schedules yet"
@@ -58,8 +53,9 @@ export default function SchedulesPage() {
           action={<Link href="/schedules/new"><Button>New schedule</Button></Link>}
         />
       ) : null}
-      <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
-        <table className="w-full text-sm">
+      {data?.items.length ? <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+        <table className="min-w-[1000px] w-full text-sm">
+          <caption className="sr-only">Recurring migration schedules</caption>
           <thead className="bg-slate-50 text-slate-600">
             <tr>
               <th className="px-3 py-2 text-left">Name</th>
@@ -81,9 +77,9 @@ export default function SchedulesPage() {
                 <td className="px-3 py-2 font-mono text-xs">{s.spec_json?.cron}</td>
                 <td className="px-3 py-2">{s.timezone}</td>
                 <td className="px-3 py-2">{s.overlap_policy}</td>
-                <td className="px-3 py-2"><Badge tone={s.enabled ? "ok" : "neutral"}>{s.enabled ? "enabled" : "paused"}</Badge></td>
-                <td className="px-3 py-2 text-slate-500">{s.next_run_at ?? "—"}</td>
-                <td className="px-3 py-2 text-slate-500">{s.last_run_at ?? "—"}</td>
+                <td className="px-3 py-2"><StatusBadge status={s.enabled ? "enabled" : "paused"} /></td>
+                <td className="px-3 py-2 text-slate-500">{formatDateTime(s.next_run_at)}</td>
+                <td className="px-3 py-2 text-slate-500">{formatDateTime(s.last_run_at)}</td>
                 <td className="px-3 py-2 text-right">
                   <div className="inline-flex gap-2">
                     {s.enabled ? (
@@ -91,14 +87,14 @@ export default function SchedulesPage() {
                     ) : (
                       <Button variant="ghost" onClick={() => resume.mutate(s.id)}>Resume</Button>
                     )}
-                    <Button onClick={() => triggerNow.mutate(s.id)}>Trigger now</Button>
+                    <Button size="sm" onClick={() => triggerNow.mutate(s.id)}>Run now</Button>
                   </div>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
-      </div>
+      </div> : null}
     </div>
   );
 }

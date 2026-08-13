@@ -5,14 +5,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migration-platform/orchestrator/internal/connectors"
+	"github.com/migration-platform/orchestrator/internal/metrics"
 	"github.com/migration-platform/orchestrator/internal/security"
 )
 
@@ -69,6 +73,7 @@ func (a *Activities) ListPrefixObjects(ctx context.Context, in ListPrefixObjects
 	if err != nil {
 		return ListPrefixObjectsOutput{}, err
 	}
+	observeWatchLag("object_store", objs)
 	return ListPrefixObjectsOutput{Objects: objs}, nil
 }
 
@@ -88,17 +93,39 @@ type ListSftpObjectsOutput struct {
 // ListSftpObjects loads connector config + decrypted secret, then lists remote files.
 // Credentials never enter workflow history — only this activity sees them.
 func (a *Activities) ListSftpObjects(ctx context.Context, in ListSftpObjectsInput) (ListSftpObjectsOutput, error) {
+	release, err := a.acquireSFTP(ctx)
+	if err != nil {
+		return ListSftpObjectsOutput{}, err
+	}
+	defer release()
 	cfg, auth, err := a.loadSftpConnector(ctx, in.OrgID, in.ConnectorID)
 	if err != nil {
 		return ListSftpObjectsOutput{}, err
 	}
 	objs, err := connectors.ListSftpObjects(ctx, cfg, auth)
 	if err != nil {
+		metrics.SFTPFailures.WithLabelValues("list").Inc()
 		return ListSftpObjectsOutput{}, err
 	}
+	observeWatchLag("sftp", objs)
 	return ListSftpObjectsOutput{
 		Objects: objs, StagingBucket: cfg.StagingBucket, StagingPrefix: cfg.StagingPrefix,
 	}, nil
+}
+
+func observeWatchLag(kind string, objs []connectors.ObjectInfo) {
+	if len(objs) == 0 {
+		return
+	}
+	oldest := objs[0].LastModified
+	for _, obj := range objs[1:] {
+		if obj.LastModified.Before(oldest) {
+			oldest = obj.LastModified
+		}
+	}
+	if lag := time.Since(oldest).Seconds(); lag >= 0 {
+		metrics.WatchLag.WithLabelValues(kind).Observe(lag)
+	}
 }
 
 // ---------------- StageSftpObject ----------------
@@ -121,6 +148,11 @@ type StageSftpObjectOutput struct {
 // StageSftpObject downloads one remote file into the MinIO staging bucket so
 // MigrationWorkflow / BatchWorkflow can reuse the existing minio source_ref path.
 func (a *Activities) StageSftpObject(ctx context.Context, in StageSftpObjectInput) (StageSftpObjectOutput, error) {
+	release, err := a.acquireSFTP(ctx)
+	if err != nil {
+		return StageSftpObjectOutput{}, err
+	}
+	defer release()
 	cfg, auth, err := a.loadSftpConnector(ctx, in.OrgID, in.ConnectorID)
 	if err != nil {
 		return StageSftpObjectOutput{}, err
@@ -133,8 +165,9 @@ func (a *Activities) StageSftpObject(ctx context.Context, in StageSftpObjectInpu
 	defer os.RemoveAll(tmp)
 
 	local := filepath.Join(tmp, path.Base(in.RemoteKey))
-	n, err := connectors.DownloadSftpFile(ctx, cfg, auth, in.RemoteKey, local, 0)
+	n, err := connectors.DownloadSftpFile(ctx, cfg, auth, in.RemoteKey, local, in.ETag, in.Size)
 	if err != nil {
+		metrics.SFTPFailures.WithLabelValues("download").Inc()
 		return StageSftpObjectOutput{}, err
 	}
 	size := in.Size
@@ -200,6 +233,26 @@ func (a *Activities) loadSftpConnector(ctx context.Context, orgID, connectorID i
 	return cfg, auth, nil
 }
 
+// TestSFTPConnector performs a real authenticated handshake and bounded remote
+// listing using the same host-key and egress controls as scheduled execution.
+func (a *Activities) TestSFTPConnector(ctx context.Context, orgID, connectorID int64) error {
+	release, err := a.acquireSFTP(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	cfg, auth, err := a.loadSftpConnector(ctx, orgID, connectorID)
+	if err != nil {
+		return err
+	}
+	_, err = connectors.ListSftpObjects(ctx, cfg, auth)
+	if err != nil {
+		metrics.SFTPFailures.WithLabelValues("test").Inc()
+		return fmt.Errorf("SFTP validation failed: %w", err)
+	}
+	return nil
+}
+
 // ---------------- AdvanceConnectorCursor ----------------
 
 type AdvanceConnectorCursorInput struct {
@@ -243,6 +296,17 @@ func (a *Activities) AdvanceConnectorCursor(ctx context.Context, in AdvanceConne
 	}
 	for k, etag := range in.Seen {
 		seen[k] = etag
+	}
+	const maxCursorEntries = 10_000
+	if len(seen) > maxCursorEntries {
+		keys := make([]string, 0, len(seen))
+		for k := range seen {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys[:len(keys)-maxCursorEntries] {
+			delete(seen, k)
+		}
 	}
 	cursor["seen"] = seen
 	cursor["updatedAt"] = time.Now().UTC().Format(time.RFC3339)
@@ -313,21 +377,22 @@ func (a *Activities) StartWatchObjectJob(ctx context.Context, in StartWatchObjec
 	defer tx.Rollback(ctx)
 
 	var jobID int64
-	var existed bool
+	existed := false
 	err = tx.QueryRow(ctx, `
-		SELECT id FROM jobs WHERE temporal_workflow_id = $1`, workflowID).Scan(&jobID)
-	if err == nil {
-		existed = true
-	} else {
-		err = tx.QueryRow(ctx, `
 			INSERT INTO jobs (org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status, temporal_workflow_id, started_at)
 			VALUES ($1, $2, $3, $4, $5, 'pending'::job_status, $6, now())
+			ON CONFLICT (temporal_workflow_id) DO NOTHING
 			RETURNING id`,
-			in.OrgID, in.RuleTemplateID, in.RuleTemplateVersion, in.ScheduleID, srcJSON, workflowID,
-		).Scan(&jobID)
-		if err != nil {
-			return StartWatchObjectJobOutput{}, fmt.Errorf("insert job: %w", err)
-		}
+		in.OrgID, in.RuleTemplateID, in.RuleTemplateVersion, in.ScheduleID, srcJSON, workflowID,
+	).Scan(&jobID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existed = true
+		err = tx.QueryRow(ctx, `SELECT id FROM jobs WHERE temporal_workflow_id = $1`, workflowID).Scan(&jobID)
+	}
+	if err != nil {
+		return StartWatchObjectJobOutput{}, fmt.Errorf("insert job: %w", err)
+	}
+	if !existed {
 		if _, err = tx.Exec(ctx, `
 			INSERT INTO schedule_runs (schedule_id, job_id, scheduled_time, actual_start_time, status)
 			VALUES ($1, $2, $3, now(), 'running'::job_status)`,

@@ -6,6 +6,7 @@ use crate::error::ApiResult;
 /// Record an audit log entry. Should be called from every mutating handler,
 /// inside the same transaction when possible. Callers never block UI on audit
 /// write failures - errors are logged and propagated so ops can investigate.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_audit(
     db: &PgPool,
     org_id: i64,

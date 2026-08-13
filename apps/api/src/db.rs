@@ -61,6 +61,9 @@ pub struct JobRow {
     pub created_by: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub batch_id: Option<i64>,
+    pub batch_stage_id: Option<i64>,
+    pub results_ref: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]

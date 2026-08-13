@@ -64,7 +64,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = { version = "0.12", features = ["tls"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "util", "set-header"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "util", "set-header", "timeout"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.25"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

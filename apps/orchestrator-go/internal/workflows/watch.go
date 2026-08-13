@@ -44,6 +44,9 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 
 	ao := defaultActivityOptions(nil)
 	ctx = workflow.WithActivityOptions(ctx, ao)
+	if err := requireLicensed(ctx); err != nil {
+		return nil, err
+	}
 
 	result := &WatchPrefixWorkflowResult{}
 	scheduled := in.ScheduledTime
@@ -128,6 +131,11 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 	var newObjs []workItem
 	var newArchives []workItem
 	for _, obj := range listedObjs {
+		// Quarantine copies live under .../failed/yyyy/mm/dd/ — never re-ingest them.
+		if strings.Contains(obj.Key, "/failed/") || strings.HasPrefix(obj.Key, "failed/") {
+			result.Skipped++
+			continue
+		}
 		if etag, ok := seen[obj.Key]; ok && etag == obj.ETag {
 			result.Skipped++
 			continue
@@ -180,7 +188,10 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 			TaskQueue:                "migration",
 			WorkflowExecutionTimeout: 48 * time.Hour,
 			WorkflowIDReusePolicy:    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
-			RetryPolicy:              &temporal.RetryPolicy{MaximumAttempts: 1},
+			// WatchPrefix only waits for child *start*, then completes. Default
+			// ParentClosePolicy TERMINATE would kill BatchWorkflow mid-unpack.
+			ParentClosePolicy: enums.PARENT_CLOSE_POLICY_ABANDON,
+			RetryPolicy:       &temporal.RetryPolicy{MaximumAttempts: 1},
 		}
 		childCtx := workflow.WithChildOptions(ctx, cwo)
 		child := workflow.ExecuteChildWorkflow(childCtx, BatchWorkflow, BatchWorkflowInput{
@@ -201,9 +212,11 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 			result.Failed++
 			continue
 		}
-		_ = workflow.ExecuteActivity(ctx, "MarkBatchRunning", activities.MarkBatchRunningInput{
+		if err := workflow.ExecuteActivity(ctx, "MarkBatchRunning", activities.MarkBatchRunningInput{
 			BatchID: started.BatchID, RunID: exec.RunID,
-		}).Get(ctx, nil)
+		}).Get(ctx, nil); err != nil {
+			return result, fmt.Errorf("mark batch running: %w", err)
+		}
 		result.Started++
 		advanced[obj.remoteKey] = obj.etag
 	}
@@ -227,6 +240,8 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 			TaskQueue:                "migration",
 			WorkflowExecutionTimeout: 24 * time.Hour,
 			WorkflowIDReusePolicy:    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+			// Same as batch children: parent returns after start; must not terminate.
+			ParentClosePolicy: enums.PARENT_CLOSE_POLICY_ABANDON,
 			RetryPolicy: &temporal.RetryPolicy{
 				MaximumAttempts: 1,
 			},
@@ -268,9 +283,11 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 			result.Failed++
 			continue
 		}
-		_ = workflow.ExecuteActivity(ctx, "MarkJobRunning", activities.MarkJobRunningInput{
+		if err := workflow.ExecuteActivity(ctx, "MarkJobRunning", activities.MarkJobRunningInput{
 			JobID: started.JobID, RunID: exec.RunID,
-		}).Get(ctx, nil)
+		}).Get(ctx, nil); err != nil {
+			return result, fmt.Errorf("mark watch job running: %w", err)
+		}
 
 		result.Started++
 		advanced[obj.remoteKey] = obj.etag

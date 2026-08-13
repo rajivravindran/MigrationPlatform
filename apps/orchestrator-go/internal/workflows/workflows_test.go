@@ -36,7 +36,11 @@ func (s *stubActivities) LoadRowState(_ any, _ activities.LoadRowStateInput) (ac
 	return s.rowState, nil
 }
 func (s *stubActivities) PublishProgress(_ any, _ activities.PublishProgressInput) error { return nil }
-func (s *stubActivities) FinalizeJob(_ any, _ activities.FinalizeJobInput) error       { return nil }
+func (s *stubActivities) FinalizeJob(_ any, _ activities.FinalizeJobInput) error         { return nil }
+func (s *stubActivities) ExportJobResults(_ any, _ activities.ExportJobResultsInput) error {
+	return nil
+}
+func (s *stubActivities) RequireLicensed(_ any) error { return nil }
 
 func registerStub(env *testsuite.TestWorkflowEnvironment, stub interface {
 	LoadTemplate(any, activities.LoadTemplateInput) (activities.LoadTemplateOutput, error)
@@ -46,14 +50,20 @@ func registerStub(env *testsuite.TestWorkflowEnvironment, stub interface {
 	PersistStepOutcome(any, activities.PersistStepOutcomeInput) error
 	LoadRowState(any, activities.LoadRowStateInput) (activities.LoadRowStateOutput, error)
 	PublishProgress(any, activities.PublishProgressInput) error
+	RequireLicensed(any) error
+	FinalizeJob(any, activities.FinalizeJobInput) error
+	ExportJobResults(any, activities.ExportJobResultsInput) error
 }) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	env.RegisterActivityWithOptions(stub.CallEndpoint, activities.RegisterOptions("CallEndpoint"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
+	env.RegisterActivityWithOptions(stub.FinalizeJob, activities.RegisterOptions("FinalizeJob"))
+	env.RegisterActivityWithOptions(stub.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
 }
 
 type stubActivitiesFailing struct{ stubActivities }
@@ -105,6 +115,7 @@ func TestRetryRowWorkflowUsesPersistedRowData(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	env.RegisterActivityWithOptions(capture, activities.RegisterOptions("CallEndpoint"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
@@ -191,6 +202,7 @@ func TestMigrationWorkflowRendersTemplatedDestinationPerRow(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	env.RegisterActivityWithOptions(captureCallEndpoint, activities.RegisterOptions("CallEndpoint"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
 
@@ -226,6 +238,7 @@ func TestMigrationWorkflowFailsRowOnUnresolvedPathParam(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	env.RegisterActivityWithOptions(stub.CallEndpoint, activities.RegisterOptions("CallEndpoint"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
 
@@ -299,6 +312,7 @@ func TestMigrationWorkflowExecutesChainPerRow(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	env.RegisterActivityWithOptions(callEndpoint, activities.RegisterOptions("CallEndpoint"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(persistStep, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
@@ -356,6 +370,7 @@ func TestMigrationWorkflowChainStopsAtFailedStep(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	env.RegisterActivityWithOptions(callEndpoint, activities.RegisterOptions("CallEndpoint"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(persistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
@@ -425,11 +440,13 @@ func TestMigrationWorkflowChainContinuesOnFailure(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	env.RegisterActivityWithOptions(callEndpoint, activities.RegisterOptions("CallEndpoint"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(persistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
-  env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
+	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
 	env.RegisterActivityWithOptions(stub.FinalizeJob, activities.RegisterOptions("FinalizeJob"))
+	env.RegisterActivityWithOptions(stub.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
 
 	env.ExecuteWorkflow(MigrationWorkflow, MigrationWorkflowInput{
 		OrgID: 1, JobID: 2, RuleTemplateID: 3, RuleTemplateVersion: 1,
@@ -469,6 +486,7 @@ func TestRetryRowResumesAtFailedStep(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	env.RegisterActivityWithOptions(callEndpoint, activities.RegisterOptions("CallEndpoint"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
@@ -539,6 +557,7 @@ func TestMigrationWorkflowHappyPath(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	env.RegisterActivityWithOptions(stub.CallEndpoint, activities.RegisterOptions("CallEndpoint"))
+	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
 

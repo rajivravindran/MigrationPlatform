@@ -5,8 +5,11 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { Badge, Button, Card } from "@/components/ui";
-import { apiFetch, eventStream } from "@/lib/api";
+import Link from "next/link";
+
+import { Badge, Breadcrumbs, Button, Card, ErrorState, LoadingState, PageHeader, StatusBadge, formatDateTime } from "@/components/ui";
+import { apiDownload, apiFetch, eventStream } from "@/lib/api";
+import { formatBytes, sourceSummary, type JobSource } from "@/lib/job-source";
 
 type Job = {
   id: number;
@@ -15,13 +18,19 @@ type Job = {
   rule_template_id: number;
   started_at?: string;
   finished_at?: string;
+  batch_id?: number | null;
+  source?: JobSource;
+  source_ref?: JobSource;
+  results_ref?: { key?: string; failed_key?: string; rows?: number; failed_rows?: number } | null;
 };
 
 type JobRow = {
   row_index: number;
   status: "pending" | "running" | "succeeded" | "failed" | "skipped";
   attempts: number;
-  last_error?: string;
+  last_error?: string | null;
+  payload_json?: unknown;
+  response_json?: unknown;
 };
 
 type JobRowStep = {
@@ -44,24 +53,88 @@ function tone(s: string) {
   return "neutral";
 }
 
-/** Per-step trail for one row of a multi-step (chained) template. */
-function RowStepTrail({ jobId, rowIndex }: { jobId: string; rowIndex: number }) {
+/** HTTP status from CallEndpoint last_error ("status 404: …" / "retryable 503: …"). */
+function httpStatusFromError(error?: string | null): number | undefined {
+  if (!error) return undefined;
+  const match = error.match(/\b(?:status|retryable|HTTP)\s+(\d{3})\b/i);
+  if (!match) return undefined;
+  const code = Number(match[1]);
+  return code >= 100 && code <= 599 ? code : undefined;
+}
+
+function JsonPanel({ label, value }: { label: string; value: unknown }) {
+  return (
+    <div>
+      <div className="mb-1 text-[11px] font-medium uppercase text-slate-400">{label}</div>
+      <pre className="max-h-40 overflow-auto rounded bg-slate-900 p-2 text-[11px] leading-4 text-slate-100">
+        {JSON.stringify(value ?? null, null, 2)}
+      </pre>
+    </div>
+  );
+}
+
+function CallPanels({
+  request,
+  response,
+  error
+}: {
+  request: unknown;
+  response: unknown;
+  error?: string | null;
+}) {
+  return (
+    <>
+      {error ? (
+        <div className="whitespace-pre-wrap break-words border-b border-slate-100 px-3 py-1.5 text-xs text-rose-700" data-testid="row-error">
+          {error}
+        </div>
+      ) : null}
+      <div className="grid grid-cols-1 gap-2 p-2 md:grid-cols-2">
+        <JsonPanel label="Request" value={request} />
+        <JsonPanel label="Response" value={response} />
+      </div>
+    </>
+  );
+}
+
+function SingleCallDetail({ row }: { row: JobRow }) {
+  const http = httpStatusFromError(row.last_error);
+  const pending = row.status === "pending" || row.status === "running";
+  const empty = row.payload_json == null && row.response_json == null && !row.last_error;
+  if (pending && empty) {
+    return <div className="p-3 text-sm text-slate-500">This row has not been sent yet.</div>;
+  }
+  return (
+    <div className="rounded border border-slate-200" data-testid="single-call-detail">
+      <div className="flex items-center gap-2 border-b border-slate-100 bg-slate-50 px-3 py-1.5 text-sm">
+        <span className="font-medium">Destination call</span>
+        <Badge tone={tone(row.status) as "ok" | "fail" | "warn" | "neutral"}>{row.status}</Badge>
+        {http ? <span className="text-xs text-slate-500" data-testid="row-http-status">HTTP {http}</span> : null}
+        <span className="text-xs text-slate-500">attempts: {row.attempts}</span>
+      </div>
+      <CallPanels request={row.payload_json} response={row.response_json} error={row.last_error} />
+    </div>
+  );
+}
+
+/** Multi-step trail, or the single-call request/response already on the row. */
+function RowOutcome({ jobId, row }: { jobId: string; row: JobRow }) {
   const stepsQ = useQuery({
-    queryKey: ["job-row-steps", jobId, rowIndex],
-    queryFn: () => apiFetch<{ items: JobRowStep[] }>(`/jobs/${jobId}/rows/${rowIndex}/steps`)
+    queryKey: ["job-row-steps", jobId, row.row_index],
+    queryFn: () => apiFetch<{ items: JobRowStep[] }>(`/jobs/${jobId}/rows/${row.row_index}/steps`)
   });
 
-  if (stepsQ.isLoading) return <div className="p-3 text-sm text-slate-500">Loading step trail…</div>;
+  if (stepsQ.isLoading) return <div className="p-3 text-sm text-slate-500">Loading request / response…</div>;
   const steps = stepsQ.data?.items ?? [];
   if (steps.length === 0) {
     return (
-      <div className="p-3 text-sm text-slate-500">
-        No per-step records — this row ran a single-call template.
+      <div className="p-3">
+        <SingleCallDetail row={row} />
       </div>
     );
   }
   return (
-    <div className="space-y-2 p-3">
+    <div className="space-y-2 p-3" data-testid="step-trail">
       {steps.map((s) => (
         <div key={s.step_index} className="rounded border border-slate-200">
           <div className="flex items-center gap-2 border-b border-slate-100 bg-slate-50 px-3 py-1.5 text-sm">
@@ -77,23 +150,7 @@ function RowStepTrail({ jobId, rowIndex }: { jobId: string; rowIndex: number }) 
               </span>
             ) : null}
           </div>
-          {s.last_error ? (
-            <div className="border-b border-slate-100 px-3 py-1.5 text-xs text-rose-700">{s.last_error}</div>
-          ) : null}
-          <div className="grid grid-cols-1 gap-2 p-2 md:grid-cols-2">
-            <div>
-              <div className="mb-1 text-[11px] font-medium uppercase text-slate-400">Request</div>
-              <pre className="max-h-40 overflow-auto rounded bg-slate-900 p-2 text-[11px] leading-4 text-slate-100">
-                {JSON.stringify(s.request_json ?? null, null, 2)}
-              </pre>
-            </div>
-            <div>
-              <div className="mb-1 text-[11px] font-medium uppercase text-slate-400">Response</div>
-              <pre className="max-h-40 overflow-auto rounded bg-slate-900 p-2 text-[11px] leading-4 text-slate-100">
-                {JSON.stringify(s.response_json ?? null, null, 2)}
-              </pre>
-            </div>
-          </div>
+          <CallPanels request={s.request_json} response={s.response_json} error={s.last_error} />
         </div>
       ))}
     </div>
@@ -169,7 +226,8 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
     onError: (err) => toast.error(err instanceof Error ? err.message : String(err))
   });
 
-  if (jobQ.isLoading) return <Card>Loading&hellip;</Card>;
+  if (jobQ.isLoading) return <LoadingState label="Loading job" />;
+  if (jobQ.error) return <ErrorState error={jobQ.error} retry={() => jobQ.refetch()} />;
   if (!jobQ.data) return null;
   const job = jobQ.data;
 
@@ -177,30 +235,107 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
   const failed = live?.failed ?? job.totals_json.failed ?? 0;
   const total = job.totals_json.total ?? processed + failed;
   const pct = total ? Math.min(100, Math.round(((processed + failed) / total) * 100)) : 0;
+  const selected = selectedRow !== null ? items.find((r) => r.row_index === selectedRow) : undefined;
+  const source = sourceSummary(job);
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Job #{job.id}</h1>
-          <p className="text-sm text-slate-500">Template #{job.rule_template_id} &middot; started {job.started_at ?? "—"}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <span data-testid="job-status"><Badge tone={tone(job.status) as "ok" | "fail" | "warn" | "neutral"}>{job.status}</Badge></span>
+      <PageHeader
+        title={`Job #${job.id}`}
+        description={`Template #${job.rule_template_id} · Started ${formatDateTime(job.started_at)}`}
+        eyebrow={<Breadcrumbs items={[{ label: "Jobs", href: "/jobs" }, { label: `Job #${job.id}` }]} />}
+        actions={<>}
+          <span data-testid="job-status"><StatusBadge status={job.status} /></span>
           <Button variant="ghost" onClick={() => pause.mutate()} disabled={job.status !== "running"}>Pause</Button>
           <Button variant="ghost" onClick={() => resume.mutate()} disabled={job.status !== "paused"}>Resume</Button>
-          <Button variant="danger" onClick={() => cancel.mutate()} disabled={!["running", "paused"].includes(job.status)}>Cancel</Button>
+          <Button variant="danger" onClick={() => window.confirm("Cancel this job? In-flight work may finish, but no new rows will start.") && cancel.mutate()} disabled={!["running", "paused"].includes(job.status)}>Cancel job</Button>
           <Button onClick={() => retryAll.mutate()} disabled={failed === 0}>Retry failed</Button>
-        </div>
-      </div>
+          {["succeeded", "failed", "cancelled"].includes(job.status) ? (
+            <>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  apiDownload(`/jobs/${job.id}/results`, `job-${job.id}-results.csv`).catch((err) =>
+                    toast.error(err instanceof Error ? err.message : String(err))
+                  );
+                }}
+              >
+                Download results
+              </Button>
+              {failed > 0 ? (
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    apiDownload(`/jobs/${job.id}/results?failed=true`, `job-${job.id}-results-failed.csv`).catch((err) =>
+                      toast.error(err instanceof Error ? err.message : String(err))
+                    );
+                  }}
+                >
+                  Download failures
+                </Button>
+              ) : null}
+            </>
+          ) : null}
+        </>}
+      />
+
+      <Card className="text-sm" data-testid="job-source">
+        <dl className="grid gap-2 sm:grid-cols-2">
+          {source.batch_id ? (
+            <>
+              <div>
+                <dt className="text-xs uppercase tracking-wide text-slate-400">Package</dt>
+                <dd className="font-medium text-slate-800">
+                  {source.package_filename || source.package_key || "—"}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-xs uppercase tracking-wide text-slate-400">Stage file</dt>
+                <dd className="font-medium text-slate-800">
+                  {source.batch_stage_file || source.filename || source.key || "—"}
+                  {source.batch_stage_key ? (
+                    <span className="ml-2 text-xs font-normal text-slate-500">key {source.batch_stage_key}</span>
+                  ) : null}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-xs uppercase tracking-wide text-slate-400">Batch</dt>
+                <dd>
+                  <Link className="text-brand-700 hover:underline" href={`/batches/${source.batch_id}`}>
+                    Batch #{source.batch_id}
+                  </Link>
+                </dd>
+              </div>
+            </>
+          ) : (
+            <div>
+              <dt className="text-xs uppercase tracking-wide text-slate-400">Source</dt>
+              <dd className="font-medium text-slate-800">{source.filename || source.key || "—"}</dd>
+            </div>
+          )}
+          {source.bucket && source.key ? (
+            <div className="sm:col-span-2">
+              <dt className="text-xs uppercase tracking-wide text-slate-400">Object</dt>
+              <dd className="truncate font-mono text-xs text-slate-600" title={`${source.bucket}/${source.key}`}>
+                {source.bucket}/{source.key}
+              </dd>
+            </div>
+          ) : null}
+          <div className="flex flex-wrap gap-4 text-slate-500 sm:col-span-2">
+            {source.kind ? <span>type {source.kind}</span> : null}
+            {formatBytes(source.size) ? <span>{formatBytes(source.size)}</span> : null}
+            {source.etag ? <span title={source.etag}>etag {source.etag}</span> : null}
+          </div>
+        </dl>
+      </Card>
 
       <Card>
         <div className="mb-2 flex items-center justify-between text-sm">
           <span>{processed} processed · {failed} failed · {total} total</span>
           <span>{pct}%</span>
         </div>
-        <div className="h-2 w-full rounded bg-slate-200">
-          <div className="h-2 rounded bg-brand-600" style={{ width: `${pct}%` }} />
+        <div className="h-2 w-full rounded bg-slate-200" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-label="Job progress">
+          <div className={`h-2 rounded ${failed ? "bg-rose-500" : "bg-brand-600"}`} style={{ width: `${pct}%` }} />
         </div>
       </Card>
 
@@ -208,7 +343,7 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
         <div className="mb-2 flex items-center justify-between">
           <h2 className="text-lg font-medium">Rows</h2>
           <span className="text-xs text-slate-500">
-            {items.length.toLocaleString()} loaded · click a row for its step-by-step trail
+            {items.length.toLocaleString()} loaded · click a row for request / response
           </span>
         </div>
         <div ref={parent} className="max-h-[420px] overflow-auto rounded border border-slate-200">
@@ -216,20 +351,35 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
             {virt.getVirtualItems().map((vi) => {
               const r = items[vi.index];
               const selected = selectedRow === r.row_index;
+              const http = httpStatusFromError(r.last_error);
               return (
                 <div
                   key={vi.key}
+                  role="button"
+                  tabIndex={0}
+                  aria-expanded={selected}
                   className={
                     "flex cursor-pointer items-center gap-2 border-b border-slate-100 px-3 py-1 text-sm " +
                     (selected ? "bg-brand-50" : "hover:bg-slate-50")
                   }
                   style={{ position: "absolute", top: 0, left: 0, right: 0, transform: `translateY(${vi.start}px)`, height: vi.size }}
                   onClick={() => setSelectedRow(selected ? null : r.row_index)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedRow(selected ? null : r.row_index);
+                    }
+                  }}
                 >
                   <span className="w-16 text-slate-500">#{r.row_index}</span>
                   <Badge tone={tone(r.status) as "ok" | "fail" | "warn" | "neutral"}>{r.status}</Badge>
                   <span className="text-xs text-slate-500">attempts: {r.attempts}</span>
-                  {r.last_error ? <span className="truncate text-xs text-rose-600" title={r.last_error}>· {r.last_error}</span> : null}
+                  {http ? <span className="text-xs text-slate-500">HTTP {http}</span> : null}
+                  {r.last_error ? (
+                    <span className="min-w-0 flex-1 truncate text-xs text-rose-600" title={r.last_error}>
+                      · {r.last_error}
+                    </span>
+                  ) : null}
                   <div className="ml-auto flex gap-2">
                     {r.status === "failed" ? (
                       <Button
@@ -253,9 +403,9 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
       {selectedRow !== null ? (
         <Card>
           <div className="mb-1 flex items-center justify-between">
-            <h2 className="text-lg font-medium">Row #{selectedRow} — step trail</h2>
+            <h2 className="text-lg font-medium">Row #{selectedRow} — request / response</h2>
             <div className="flex gap-2">
-              {items.find((r) => r.row_index === selectedRow)?.status === "failed" ? (
+              {selected?.status === "failed" ? (
                 <>
                   <Button variant="ghost" onClick={() => retryOne.mutate({ rowIndex: selectedRow })}>
                     Retry (resume at failed step)
@@ -263,7 +413,7 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
                   <Button
                     variant="ghost"
                     title="Re-runs every step, including ones that already succeeded. Only safe if earlier calls are idempotent."
-                    onClick={() => retryOne.mutate({ rowIndex: selectedRow, fromStart: true })}
+                    onClick={() => window.confirm("Retry from the first step? Previously successful destination calls will run again and must be idempotent.") && retryOne.mutate({ rowIndex: selectedRow, fromStart: true })}
                   >
                     Retry from start
                   </Button>
@@ -272,7 +422,11 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
               <Button variant="ghost" onClick={() => setSelectedRow(null)}>Close</Button>
             </div>
           </div>
-          <RowStepTrail jobId={params.id} rowIndex={selectedRow} />
+          {selected ? (
+            <RowOutcome jobId={params.id} row={selected} />
+          ) : (
+            <div className="p-3 text-sm text-slate-500">Row not in the loaded page.</div>
+          )}
         </Card>
       ) : null}
     </div>

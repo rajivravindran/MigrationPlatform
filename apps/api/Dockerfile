@@ -11,6 +11,7 @@ RUN mkdir -p apps/api/src apps/api/src/bin \
     && echo "fn main() {}" > apps/api/src/main.rs \
     && echo "pub fn stub() {}" > apps/api/src/lib.rs \
     && echo "fn main() {}" > apps/api/src/bin/admin.rs \
+    && echo "fn main() {}" > apps/api/src/bin/license_server.rs \
     && cargo build --release --locked --manifest-path apps/api/Cargo.toml \
     && rm -rf apps/api/src
 
@@ -22,7 +23,7 @@ COPY infra/license/license_public_key.pem ./infra/license/license_public_key.pem
 # real sources (BuildKit COPY can preserve mtimes, defeating cargo's
 # incremental fingerprint check).
 RUN find target/release/.fingerprint -maxdepth 1 -name 'migration-api-*' -exec rm -rf {} + 2>/dev/null || true; \
-    rm -f target/release/migration-api target/release/migration-admin \
+    rm -f target/release/migration-api target/release/migration-admin target/release/migration-license-server \
           target/release/deps/migration_api-* \
           target/release/deps/migration_api.* \
           target/release/deps/migration_admin-* 2>/dev/null || true; \
@@ -59,3 +60,18 @@ EXPOSE 8080 9464
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 ENTRYPOINT ["/app/migration-api"]
+
+# Vendor-operated trial service. The signing key is never copied into this
+# image; operators must mount it at runtime from a secret manager.
+FROM debian:bookworm-slim AS license-server
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 10001 app
+USER app
+WORKDIR /app
+COPY --from=builder /src/target/release/migration-license-server /app/migration-license-server
+EXPOSE 8090
+ENTRYPOINT ["/app/migration-license-server"]
+
+# Preserve the historical default target for API builds.
+FROM runtime AS final

@@ -74,7 +74,17 @@ async fn create_spec(
     .fetch_one(&state.db)
     .await?;
 
-    record_audit(&state.db, claims.org, &claims.sub, "openapi_spec", Some(row.0.to_string()), "import", None, None).await?;
+    record_audit(
+        &state.db,
+        claims.org,
+        &claims.sub,
+        "openapi_spec",
+        Some(row.0.to_string()),
+        "import",
+        None,
+        None,
+    )
+    .await?;
 
     let ops = parse_operations(&spec, source_url.as_deref());
     Ok(Json(json!({
@@ -117,7 +127,9 @@ async fn get_spec(
     let Some((name, source_url, spec)) = row else {
         return Err(ApiError::NotFound);
     };
-    Ok(Json(json!({"id": id, "name": name, "source_url": source_url, "spec": spec})))
+    Ok(Json(
+        json!({"id": id, "name": name, "source_url": source_url, "spec": spec}),
+    ))
 }
 
 async fn delete_spec(
@@ -135,7 +147,17 @@ async fn delete_spec(
     if n == 0 {
         return Err(ApiError::NotFound);
     }
-    record_audit(&state.db, claims.org, &claims.sub, "openapi_spec", Some(id.to_string()), "delete", None, None).await?;
+    record_audit(
+        &state.db,
+        claims.org,
+        &claims.sub,
+        "openapi_spec",
+        Some(id.to_string()),
+        "delete",
+        None,
+        None,
+    )
+    .await?;
     Ok(Json(json!({"deleted": true})))
 }
 
@@ -151,8 +173,12 @@ async fn list_operations(
     .bind(claims.org)
     .fetch_optional(&state.db)
     .await?;
-    let Some((spec, source_url)) = row else { return Err(ApiError::NotFound) };
-    Ok(Json(json!({"items": parse_operations(&spec, source_url.as_deref())})))
+    let Some((spec, source_url)) = row else {
+        return Err(ApiError::NotFound);
+    };
+    Ok(Json(
+        json!({"items": parse_operations(&spec, source_url.as_deref())}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -173,7 +199,8 @@ async fn parse_preview(
 // ---------------- fetch + validation ----------------
 
 async fn fetch_spec(url: &str) -> ApiResult<Value> {
-    let parsed = url::Url::parse(url).map_err(|e| ApiError::BadRequest(format!("invalid url: {e}")))?;
+    let parsed =
+        url::Url::parse(url).map_err(|e| ApiError::BadRequest(format!("invalid url: {e}")))?;
     if parsed.scheme() != "https" && parsed.scheme() != "http" {
         return Err(ApiError::BadRequest("url must be http(s)".into()));
     }
@@ -181,7 +208,9 @@ async fn fetch_spec(url: &str) -> ApiResult<Value> {
     // explicitly allowed (dev compose networks).
     let allow_private = std::env::var("ALLOW_PRIVATE_DESTINATIONS").ok().as_deref() == Some("true");
     if !allow_private {
-        let host = parsed.host_str().ok_or_else(|| ApiError::BadRequest("url missing host".into()))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| ApiError::BadRequest("url missing host".into()))?;
         let addrs = tokio::net::lookup_host((host, parsed.port_or_known_default().unwrap_or(443)))
             .await
             .map_err(|e| ApiError::BadRequest(format!("cannot resolve {host}: {e}")))?;
@@ -204,7 +233,10 @@ async fn fetch_spec(url: &str) -> ApiResult<Value> {
         .await
         .map_err(|e| ApiError::External(format!("fetch spec: {e}")))?;
     if !resp.status().is_success() {
-        return Err(ApiError::External(format!("fetch spec: status {}", resp.status())));
+        return Err(ApiError::External(format!(
+            "fetch spec: status {}",
+            resp.status()
+        )));
     }
     let bytes = resp
         .bytes()
@@ -213,8 +245,11 @@ async fn fetch_spec(url: &str) -> ApiResult<Value> {
     if bytes.len() > MAX_SPEC_BYTES {
         return Err(ApiError::BadRequest("spec too large".into()));
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|e| ApiError::BadRequest(format!("spec is not valid JSON: {e} (YAML specs must be converted to JSON)")))
+    serde_json::from_slice(&bytes).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "spec is not valid JSON: {e} (YAML specs must be converted to JSON)"
+        ))
+    })
 }
 
 pub fn ip_is_private(ip: std::net::IpAddr) -> bool {
@@ -224,7 +259,8 @@ pub fn ip_is_private(ip: std::net::IpAddr) -> bool {
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
-                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])) // CGNAT
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+            // CGNAT
         }
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -239,14 +275,18 @@ fn validate_openapi(spec: &Value) -> ApiResult<()> {
     let version = spec
         .get("openapi")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| ApiError::ValidationFailed("missing `openapi` version field (3.x required)".into()))?;
+        .ok_or_else(|| {
+            ApiError::ValidationFailed("missing `openapi` version field (3.x required)".into())
+        })?;
     if !version.starts_with('3') {
         return Err(ApiError::ValidationFailed(format!(
             "unsupported OpenAPI version {version}; 3.x required"
         )));
     }
     if !spec.get("paths").map(|p| p.is_object()).unwrap_or(false) {
-        return Err(ApiError::ValidationFailed("spec has no `paths` object".into()));
+        return Err(ApiError::ValidationFailed(
+            "spec has no `paths` object".into(),
+        ));
     }
     Ok(())
 }
@@ -264,7 +304,10 @@ const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
 pub fn parse_operations(spec: &Value, source_url: Option<&str>) -> Vec<Value> {
     let mut out = Vec::new();
     let empty = Map::new();
-    let paths = spec.get("paths").and_then(|p| p.as_object()).unwrap_or(&empty);
+    let paths = spec
+        .get("paths")
+        .and_then(|p| p.as_object())
+        .unwrap_or(&empty);
     let base_url = spec
         .get("servers")
         .and_then(|s| s.as_array())
@@ -274,15 +317,22 @@ pub fn parse_operations(spec: &Value, source_url: Option<&str>) -> Vec<Value> {
         .unwrap_or("");
 
     for (path, item) in paths {
-        let Some(item) = item.as_object() else { continue };
-        let shared_params = item.get("parameters").cloned().unwrap_or(Value::Array(vec![]));
+        let Some(item) = item.as_object() else {
+            continue;
+        };
+        let shared_params = item
+            .get("parameters")
+            .cloned()
+            .unwrap_or(Value::Array(vec![]));
         for method in METHODS {
             let Some(op) = item.get(method) else { continue };
             let op_id = op
                 .get("operationId")
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("{}_{}", method, path.trim_matches('/').replace('/', "_")));
+                .unwrap_or_else(|| {
+                    format!("{}_{}", method, path.trim_matches('/').replace('/', "_"))
+                });
 
             let mut params: Vec<Value> = Vec::new();
             for src in [&shared_params, op.get("parameters").unwrap_or(&Value::Null)] {
@@ -313,11 +363,7 @@ pub fn parse_operations(spec: &Value, source_url: Option<&str>) -> Vec<Value> {
             let response_schema = op
                 .get("responses")
                 .and_then(|r| r.as_object())
-                .and_then(|r| {
-                    ["200", "201", "202"]
-                        .iter()
-                        .find_map(|code| r.get(*code))
-                })
+                .and_then(|r| ["200", "201", "202"].iter().find_map(|code| r.get(*code)))
                 .map(|resp| resolve_ref(spec, resp, 0))
                 .and_then(|resp| {
                     resp.get("content")
@@ -407,9 +453,12 @@ fn resolve_schema(spec: &Value, node: &Value, depth: u8) -> Value {
             }
             Value::Object(out)
         }
-        Value::Array(items) => {
-            Value::Array(items.iter().map(|v| resolve_schema(spec, v, depth + 1)).collect())
-        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| resolve_schema(spec, v, depth + 1))
+                .collect(),
+        ),
         _ => node.clone(),
     }
 }
@@ -468,12 +517,24 @@ mod tests {
     fn parses_operations_with_refs() {
         let ops = parse_operations(&petstore(), None);
         assert_eq!(ops.len(), 2);
-        let create = ops.iter().find(|o| o["operation_id"] == "createPet").unwrap();
+        let create = ops
+            .iter()
+            .find(|o| o["operation_id"] == "createPet")
+            .unwrap();
         assert_eq!(create["method"], "POST");
         assert_eq!(create["url"], "https://api.pets.example/v1/pets");
-        assert_eq!(create["request_schema"]["properties"]["name"]["type"], "string");
-        assert_eq!(create["request_schema"]["properties"]["tag"]["type"], "string", "nested $ref must resolve");
-        assert_eq!(create["response_schema"]["properties"]["id"]["type"], "string");
+        assert_eq!(
+            create["request_schema"]["properties"]["name"]["type"],
+            "string"
+        );
+        assert_eq!(
+            create["request_schema"]["properties"]["tag"]["type"], "string",
+            "nested $ref must resolve"
+        );
+        assert_eq!(
+            create["response_schema"]["properties"]["id"]["type"],
+            "string"
+        );
 
         let toy = ops.iter().find(|o| o["operation_id"] == "addToy").unwrap();
         assert_eq!(toy["parameters"][0]["name"], "petId");
@@ -489,7 +550,16 @@ mod tests {
     #[test]
     fn private_ip_detection() {
         use std::net::IpAddr;
-        for s in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "172.16.9.9", "169.254.169.254", "100.64.1.1", "::1", "fc00::1"] {
+        for s in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.9.9",
+            "169.254.169.254",
+            "100.64.1.1",
+            "::1",
+            "fc00::1",
+        ] {
             assert!(ip_is_private(s.parse::<IpAddr>().unwrap()), "{s}");
         }
         for s in ["8.8.8.8", "93.184.216.34"] {

@@ -51,16 +51,17 @@ and `destination.headers` fields support per-row templating — see
 
 | Method | Path                                       | Role     | Purpose |
 | ------ | ------------------------------------------ | -------- | ------- |
-| GET    | `/jobs`                                    | viewer+  | List with filters: `status`, `template_id`, `schedule_id`. |
+| GET    | `/jobs`                                    | viewer+  | List with filters: `status`, `template_id`, `schedule_id`. Each item includes `batch_id` and a `source` summary (filename, package vs stage file, size, etag). |
 | POST   | `/jobs`                                    | operator | Start a job. Body: `{ rule_template_id, source_ref }`. |
-| GET    | `/jobs/{id}`                               | viewer+  | Fetch + counters. |
+| GET    | `/jobs/{id}`                               | viewer+  | Fetch + counters + `source` summary and `batch_id`. |
 | POST   | `/jobs/{id}/pause`                         | operator | Signal Temporal to pause. |
 | POST   | `/jobs/{id}/resume`                        | operator | Resume a paused job. |
 | POST   | `/jobs/{id}/cancel`                        | operator | Cancel; rows in-flight finish. |
-| GET    | `/jobs/{id}/rows`                          | viewer+  | Paginated; `?status=failed&cursor=...`. |
+| GET    | `/jobs/{id}/rows`                          | viewer+  | Paginated; `?status=failed&cursor=...`. Includes `payload_json`, `response_json`, `last_error` (single-call request/response). |
 | GET    | `/jobs/{id}/rows/{row_index}/steps`        | viewer+  | Per-step trail for multi-step templates: request/response JSON, HTTP status, error. |
 | POST   | `/jobs/{id}/rows/{row_index}/retry`        | operator | Retry a single row. Body `{ "from_start": true }` re-runs succeeded steps too. |
 | POST   | `/jobs/{id}/retry-failed`                  | operator | Enqueue retries for all failed rows. |
+| GET    | `/jobs/{id}/results`                       | viewer+  | Download results CSV (`?failed=true` for failed rows only). Prefers the MinIO object written at finalize; falls back to a live DB export of ops columns. |
 | GET    | `/jobs/{id}/stream`                        | viewer+  | SSE: live counters + row events. |
 
 ### `source_ref`

@@ -17,7 +17,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: migrate
-          image: {{ include "mp.image" .Values.migrations.image }}
+          image: {{ tpl .Values.migrations.image . | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           command: ["/app/migration-admin", "migrate"]
           envFrom:

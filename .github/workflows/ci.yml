@@ -16,6 +16,7 @@ jobs:
       - run: cargo fmt --manifest-path apps/api/Cargo.toml --all -- --check
       - run: cargo clippy --manifest-path apps/api/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path apps/api/Cargo.toml
+      - run: cargo test --manifest-path apps/api/Cargo.toml --test integration_db -- --ignored
 
   go:
     runs-on: ubuntu-latest
@@ -26,6 +27,7 @@ jobs:
         with: { go-version: "1.22" }
       - run: go vet ./...
       - run: go test ./...
+      - run: go test -race ./...
       - uses: golangci/golangci-lint-action@v6
         with:
           version: v1.61
@@ -58,6 +60,10 @@ jobs:
     needs: [rust, go, python, web]
     steps:
       - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm dependency build infra/k8s/helm
+      - run: helm lint infra/k8s/helm --set secrets.bridgeToken=ci-bridge-token-at-least-32-characters --set secrets.masterKey=ci-master-key-change-me-32-bytes
+      - run: docker compose -f infra/docker-compose.yml config --quiet
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build + start stack

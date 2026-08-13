@@ -65,7 +65,10 @@ pub fn infer_column_type<'a, I: IntoIterator<Item = &'a str>>(values: I) -> &'st
 }
 
 fn is_bool(v: &str) -> bool {
-    matches!(v.to_ascii_lowercase().as_str(), "true" | "false" | "0" | "1")
+    matches!(
+        v.to_ascii_lowercase().as_str(),
+        "true" | "false" | "0" | "1"
+    )
 }
 
 fn is_datetime(v: &str) -> bool {

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -13,8 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migration-platform/orchestrator/internal/batch"
 	"github.com/migration-platform/orchestrator/internal/connectors"
+	"github.com/migration-platform/orchestrator/internal/metrics"
 )
 
 // ---------------- StartBatch ----------------
@@ -66,19 +69,21 @@ func (a *Activities) StartBatch(ctx context.Context, in StartBatchInput) (StartB
 
 	var batchID int64
 	existed := false
-	err = tx.QueryRow(ctx, `SELECT id FROM batches WHERE temporal_workflow_id = $1`, workflowID).Scan(&batchID)
-	if err == nil {
+	err = tx.QueryRow(ctx, `
+		INSERT INTO batches (org_id, schedule_id, connector_id, source_ref, status, temporal_workflow_id, started_at)
+		VALUES ($1, $2, $3, $4, 'pending'::batch_status, $5, now())
+		ON CONFLICT (temporal_workflow_id) DO NOTHING
+		RETURNING id`,
+		in.OrgID, nullIfZero(in.ScheduleID), nullIfZero(in.ConnectorID), srcJSON, workflowID,
+	).Scan(&batchID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		existed = true
-	} else {
-		err = tx.QueryRow(ctx, `
-			INSERT INTO batches (org_id, schedule_id, connector_id, source_ref, status, temporal_workflow_id, started_at)
-			VALUES ($1, $2, $3, $4, 'pending'::batch_status, $5, now())
-			RETURNING id`,
-			in.OrgID, nullIfZero(in.ScheduleID), nullIfZero(in.ConnectorID), srcJSON, workflowID,
-		).Scan(&batchID)
-		if err != nil {
-			return StartBatchOutput{}, fmt.Errorf("insert batch: %w", err)
-		}
+		err = tx.QueryRow(ctx, `SELECT id FROM batches WHERE temporal_workflow_id = $1`, workflowID).Scan(&batchID)
+	}
+	if err != nil {
+		return StartBatchOutput{}, fmt.Errorf("insert batch: %w", err)
+	}
+	if !existed {
 		if in.ScheduleID > 0 {
 			if _, err = tx.Exec(ctx, `
 				UPDATE schedules SET last_run_at = $1, updated_at = now() WHERE id = $2`,
@@ -235,12 +240,14 @@ func (a *Activities) UnpackAndStageArchive(ctx context.Context, in UnpackAndStag
 		})
 	}
 
-	_, _ = a.d.DB.Exec(ctx, `
+	if _, err := a.d.DB.Exec(ctx, `
 		UPDATE batches SET batch_key = COALESCE(NULLIF($1, ''), batch_key),
 			manifest_json = $2, on_stage_failure = $3, updated_at = now()
 		WHERE id = $4`,
 		manifest.BatchID, raw, manifest.OnStageFailure, in.BatchID,
-	)
+	); err != nil {
+		return UnpackAndStageArchiveOutput{}, fmt.Errorf("persist manifest: %w", err)
+	}
 	return out, nil
 }
 
@@ -281,11 +288,14 @@ func (a *Activities) QuarantineArchive(ctx context.Context, in QuarantineArchive
 	if err != nil {
 		return QuarantineArchiveOutput{}, err
 	}
-	_, _ = a.d.DB.Exec(ctx, `
+	if _, err := a.d.DB.Exec(ctx, `
 		INSERT INTO audit_log (org_id, actor, entity, entity_id, action, after_json)
 		VALUES ($1, 'system', 'batch', $2, 'quarantine', $3)`,
 		in.OrgID, fmt.Sprintf("%d", in.BatchID), qRef,
-	)
+	); err != nil {
+		return QuarantineArchiveOutput{}, fmt.Errorf("persist quarantine audit: %w", err)
+	}
+	metrics.QuarantinedBatches.Inc()
 	return QuarantineArchiveOutput{QuarantineKey: qKey}, nil
 }
 
@@ -327,6 +337,7 @@ type MaterializeBatchStagesOutput struct {
 // MaterializeBatchStages resolves templateKey → published template and inserts batch_stages rows.
 func (a *Activities) MaterializeBatchStages(ctx context.Context, in MaterializeBatchStagesInput) (MaterializeBatchStagesOutput, error) {
 	out := MaterializeBatchStagesOutput{Stages: make([]ResolvedStage, 0, len(in.Stages))}
+	hasDependencies := false
 	tx, err := a.d.DB.Begin(ctx)
 	if err != nil {
 		return out, err
@@ -334,6 +345,7 @@ func (a *Activities) MaterializeBatchStages(ctx context.Context, in MaterializeB
 	defer tx.Rollback(ctx)
 
 	for i, st := range in.Stages {
+		hasDependencies = hasDependencies || len(st.DependsOn) > 0
 		var tplID int64
 		var tplVer int32
 		err := tx.QueryRow(ctx, `
@@ -352,12 +364,16 @@ func (a *Activities) MaterializeBatchStages(ctx context.Context, in MaterializeB
 		if onFail == "" {
 			onFail = "stop"
 		}
+		deps := st.DependsOn
+		if deps == nil {
+			deps = []string{}
+		}
 		var stageRowID int64
 		err = tx.QueryRow(ctx, `
 			INSERT INTO batch_stages (
 				batch_id, stage_index, stage_key, file_path, template_key,
-				rule_template_id, rule_template_version, status, on_stage_failure
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending'::batch_status, $8)
+				rule_template_id, rule_template_version, status, on_stage_failure, depends_on
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending'::batch_status, $8, $9)
 			ON CONFLICT (batch_id, stage_index) DO UPDATE SET
 				stage_key = EXCLUDED.stage_key,
 				file_path = EXCLUDED.file_path,
@@ -365,9 +381,10 @@ func (a *Activities) MaterializeBatchStages(ctx context.Context, in MaterializeB
 				rule_template_id = EXCLUDED.rule_template_id,
 				rule_template_version = EXCLUDED.rule_template_version,
 				on_stage_failure = EXCLUDED.on_stage_failure,
+				depends_on = EXCLUDED.depends_on,
 				updated_at = now()
 			RETURNING id`,
-			in.BatchID, i, st.StageKey, st.File, st.TemplateKey, tplID, tplVer, onFail,
+			in.BatchID, i, st.StageKey, st.File, st.TemplateKey, tplID, tplVer, onFail, deps,
 		).Scan(&stageRowID)
 		if err != nil {
 			return out, fmt.Errorf("insert batch_stage: %w", err)
@@ -381,6 +398,9 @@ func (a *Activities) MaterializeBatchStages(ctx context.Context, in MaterializeB
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return out, err
+	}
+	if hasDependencies {
+		metrics.DAGBatches.Inc()
 	}
 	return out, nil
 }
@@ -438,22 +458,24 @@ func (a *Activities) StartBatchStageJob(ctx context.Context, in StartBatchStageJ
 
 	var jobID int64
 	existed := false
-	err = tx.QueryRow(ctx, `SELECT id FROM jobs WHERE temporal_workflow_id = $1`, workflowID).Scan(&jobID)
-	if err == nil {
+	err = tx.QueryRow(ctx, `
+		INSERT INTO jobs (
+			org_id, rule_template_id, rule_template_version, schedule_id,
+			source_ref, status, temporal_workflow_id, started_at, batch_id, batch_stage_id
+		) VALUES ($1, $2, $3, $4, $5, 'pending'::job_status, $6, now(), $7, $8)
+		ON CONFLICT (temporal_workflow_id) DO NOTHING
+		RETURNING id`,
+		in.OrgID, in.RuleTemplateID, in.RuleTemplateVersion, nullIfZero(in.ScheduleID),
+		srcJSON, workflowID, in.BatchID, in.StageRowID,
+	).Scan(&jobID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		existed = true
-	} else {
-		err = tx.QueryRow(ctx, `
-			INSERT INTO jobs (
-				org_id, rule_template_id, rule_template_version, schedule_id,
-				source_ref, status, temporal_workflow_id, started_at, batch_id, batch_stage_id
-			) VALUES ($1, $2, $3, $4, $5, 'pending'::job_status, $6, now(), $7, $8)
-			RETURNING id`,
-			in.OrgID, in.RuleTemplateID, in.RuleTemplateVersion, nullIfZero(in.ScheduleID),
-			srcJSON, workflowID, in.BatchID, in.StageRowID,
-		).Scan(&jobID)
-		if err != nil {
-			return StartBatchStageJobOutput{}, fmt.Errorf("insert stage job: %w", err)
-		}
+		err = tx.QueryRow(ctx, `SELECT id FROM jobs WHERE temporal_workflow_id = $1`, workflowID).Scan(&jobID)
+	}
+	if err != nil {
+		return StartBatchStageJobOutput{}, fmt.Errorf("insert stage job: %w", err)
+	}
+	if !existed {
 		if _, err = tx.Exec(ctx, `
 			UPDATE batch_stages SET job_id = $1, status = 'running'::batch_status, updated_at = now()
 			WHERE id = $2`, jobID, in.StageRowID,

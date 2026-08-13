@@ -67,7 +67,8 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let key = MasterKey::from_env_value("dev-master-key-change-me-000000000000000000000000").unwrap();
+        let key =
+            MasterKey::from_env_value("dev-master-key-change-me-000000000000000000000000").unwrap();
         let (ct, nonce) = key.encrypt(b"hello world").unwrap();
         assert_ne!(ct, b"hello world");
         let plain = key.decrypt(&ct, &nonce).unwrap();

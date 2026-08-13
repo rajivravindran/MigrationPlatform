@@ -4,7 +4,9 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -17,6 +19,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::db::{JobRow, JobRowDetail, JobRowStepDetail};
 use crate::error::{ApiError, ApiResult};
+use crate::job_source::job_json_with_source;
 use crate::middleware::auth::{require_role, AuthUser};
 use crate::security::audit::record_audit;
 use crate::state::AppState;
@@ -32,7 +35,33 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id/rows/:row_index/steps", get(list_row_steps))
         .route("/jobs/:id/rows/:row_index/retry", post(retry_row))
         .route("/jobs/:id/retry-failed", post(retry_all_failed))
+        .route("/jobs/:id/results", get(download_results))
         .route("/jobs/:id/stream", get(stream_updates))
+}
+
+/// Columns on `jobs` that map to [`JobRow`], including batch provenance.
+const JOB_COLS: &str = "id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at, batch_id, batch_stage_id, results_ref";
+
+const JOB_JOIN_COLS: &str = "j.id, j.org_id, j.rule_template_id, j.rule_template_version, j.schedule_id, j.source_ref, j.status::text AS status, j.totals_json, j.temporal_workflow_id, j.temporal_run_id, j.started_at, j.paused_at, j.finished_at, j.created_by, j.created_at, j.updated_at, j.batch_id, j.batch_stage_id, j.results_ref, b.source_ref AS batch_source_ref, s.stage_key AS batch_stage_key, s.file_path AS batch_stage_file";
+
+#[derive(sqlx::FromRow)]
+struct JobJoinRow {
+    #[sqlx(flatten)]
+    job: JobRow,
+    batch_source_ref: Option<Value>,
+    batch_stage_key: Option<String>,
+    batch_stage_file: Option<String>,
+}
+
+impl JobJoinRow {
+    fn into_json(self) -> Value {
+        job_json_with_source(
+            &self.job,
+            self.batch_source_ref.as_ref(),
+            self.batch_stage_key.as_deref(),
+            self.batch_stage_file.as_deref(),
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -63,11 +92,11 @@ async fn create_job(
 
     // Insert the job first so the workflow input can carry the real job id
     // (row/step outcomes are keyed by it).
-    let mut row: JobRow = sqlx::query_as(
+    let mut row: JobRow = sqlx::query_as(&format!(
         "INSERT INTO jobs (org_id, rule_template_id, rule_template_version, source_ref, status, temporal_workflow_id, created_by)
          VALUES ($1, $2, $3, $4, 'pending'::job_status, $5, $6)
-         RETURNING id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at",
-    )
+         RETURNING {JOB_COLS}"
+    ))
     .bind(claims.org)
     .bind(req.rule_template_id)
     .bind(tpl_version)
@@ -102,11 +131,11 @@ async fn create_job(
         }
     };
 
-    row = sqlx::query_as(
+    row = sqlx::query_as(&format!(
         "UPDATE jobs SET status = 'running'::job_status, temporal_run_id = $1, started_at = now(), updated_at = now()
          WHERE id = $2
-         RETURNING id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at",
-    )
+         RETURNING {JOB_COLS}"
+    ))
     .bind(&run_id)
     .bind(row.id)
     .fetch_one(&state.db)
@@ -142,11 +171,15 @@ async fn list_jobs(
 ) -> ApiResult<Json<Value>> {
     let limit = q.limit.unwrap_or(50).min(200);
     let cursor = q.cursor.unwrap_or(i64::MAX);
-    let rows: Vec<JobRow> = if let Some(status) = q.status {
-        sqlx::query_as(
-            "SELECT id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at
-             FROM jobs WHERE org_id = $1 AND id < $2 AND status = $3::job_status ORDER BY id DESC LIMIT $4",
-        )
+    let rows: Vec<JobJoinRow> = if let Some(status) = q.status {
+        sqlx::query_as(&format!(
+            "SELECT {JOB_JOIN_COLS}
+             FROM jobs j
+             LEFT JOIN batches b ON b.id = j.batch_id
+             LEFT JOIN batch_stages s ON s.id = j.batch_stage_id
+             WHERE j.org_id = $1 AND j.id < $2 AND j.status = $3::job_status
+             ORDER BY j.id DESC LIMIT $4"
+        ))
         .bind(claims.org)
         .bind(cursor)
         .bind(status)
@@ -154,34 +187,159 @@ async fn list_jobs(
         .fetch_all(&state.db)
         .await?
     } else {
-        sqlx::query_as(
-            "SELECT id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at
-             FROM jobs WHERE org_id = $1 AND id < $2 ORDER BY id DESC LIMIT $3",
-        )
+        sqlx::query_as(&format!(
+            "SELECT {JOB_JOIN_COLS}
+             FROM jobs j
+             LEFT JOIN batches b ON b.id = j.batch_id
+             LEFT JOIN batch_stages s ON s.id = j.batch_stage_id
+             WHERE j.org_id = $1 AND j.id < $2
+             ORDER BY j.id DESC LIMIT $3"
+        ))
         .bind(claims.org)
         .bind(cursor)
         .bind(limit)
         .fetch_all(&state.db)
         .await?
     };
-    let next = rows.last().map(|r| r.id);
-    Ok(Json(json!({"items": rows, "next_cursor": next})))
+    let next = rows.last().map(|r| r.job.id);
+    let items: Vec<Value> = rows.into_iter().map(JobJoinRow::into_json).collect();
+    Ok(Json(json!({"items": items, "next_cursor": next})))
 }
 
 async fn get_job(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<i64>,
-) -> ApiResult<Json<JobRow>> {
-    let row: Option<JobRow> = sqlx::query_as(
-        "SELECT id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at
-         FROM jobs WHERE id = $1 AND org_id = $2",
+) -> ApiResult<Json<Value>> {
+    let row: Option<JobJoinRow> = sqlx::query_as(&format!(
+        "SELECT {JOB_JOIN_COLS}
+         FROM jobs j
+         LEFT JOIN batches b ON b.id = j.batch_id
+         LEFT JOIN batch_stages s ON s.id = j.batch_stage_id
+         WHERE j.id = $1 AND j.org_id = $2"
+    ))
+    .bind(id)
+    .bind(claims.org)
+    .fetch_optional(&state.db)
+    .await?;
+    row.map(|r| Json(r.into_json())).ok_or(ApiError::NotFound)
+}
+
+#[derive(Deserialize, Default)]
+pub struct ResultsQuery {
+    #[serde(default)]
+    pub failed: bool,
+}
+
+async fn download_results(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<i64>,
+    Query(q): Query<ResultsQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let row: Option<(Option<Value>,)> = sqlx::query_as(
+        "SELECT results_ref FROM jobs WHERE id = $1 AND org_id = $2",
     )
     .bind(id)
     .bind(claims.org)
     .fetch_optional(&state.db)
     .await?;
-    row.map(Json).ok_or(ApiError::NotFound)
+    let Some((results_ref,)) = row else {
+        return Err(ApiError::NotFound);
+    };
+
+    let filename = if q.failed {
+        format!("job-{id}-results-failed.csv")
+    } else {
+        format!("job-{id}-results.csv")
+    };
+
+    if let Some(ref_val) = results_ref.as_ref() {
+        let bucket = ref_val
+            .get("bucket")
+            .and_then(Value::as_str)
+            .unwrap_or(&state.cfg.minio_bucket);
+        let key = if q.failed {
+            ref_val
+                .get("failed_key")
+                .and_then(Value::as_str)
+                .or_else(|| ref_val.get("key").and_then(Value::as_str))
+        } else {
+            ref_val.get("key").and_then(Value::as_str)
+        };
+        if let Some(key) = key {
+            let obj = state
+                .s3
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|e| ApiError::External(format!("s3 get: {e}")))?;
+            let bytes = obj
+                .body
+                .collect()
+                .await
+                .map_err(|e| ApiError::External(format!("s3 read: {e}")))?
+                .into_bytes();
+            return csv_attachment(filename, bytes.to_vec());
+        }
+    }
+
+    let bytes = stream_results_from_db(&state, id, q.failed).await?;
+    csv_attachment(filename, bytes)
+}
+
+fn csv_attachment(filename: String, bytes: Vec<u8>) -> ApiResult<impl IntoResponse> {
+    let disp = format!("attachment; filename=\"{filename}\"");
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/csv; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&disp)
+                    .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+            ),
+        ],
+        Body::from(bytes),
+    ))
+}
+
+async fn stream_results_from_db(state: &AppState, job_id: i64, failed_only: bool) -> ApiResult<Vec<u8>> {
+    let rows: Vec<(i64, String, Option<String>)> = if failed_only {
+        sqlx::query_as(
+            "SELECT row_index, status::text, last_error FROM job_rows
+             WHERE job_id = $1 AND status = 'failed'::row_status ORDER BY row_index",
+        )
+        .bind(job_id)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT row_index, status::text, last_error FROM job_rows
+             WHERE job_id = $1 ORDER BY row_index",
+        )
+        .bind(job_id)
+        .fetch_all(&state.db)
+        .await?
+    };
+    let mut wtr = csv::Writer::from_writer(Vec::new());
+    wtr.write_record(["row_index", "status", "error"])
+        .map_err(|e| ApiError::External(e.to_string()))?;
+    for (idx, status, err) in rows {
+        wtr.write_record([
+            idx.to_string(),
+            status,
+            err.unwrap_or_default(),
+        ])
+        .map_err(|e| ApiError::External(e.to_string()))?;
+    }
+    wtr.into_inner()
+        .map_err(|e| ApiError::External(e.to_string()))
 }
 
 async fn signal_and_record(
@@ -192,14 +350,13 @@ async fn signal_and_record(
     new_status: &str,
     action: &str,
 ) -> ApiResult<JobRow> {
-    let workflow_id: Option<String> = sqlx::query_scalar(
-        "SELECT temporal_workflow_id FROM jobs WHERE id = $1 AND org_id = $2",
-    )
-    .bind(id)
-    .bind(claims.org)
-    .fetch_optional(&state.db)
-    .await?
-    .flatten();
+    let workflow_id: Option<String> =
+        sqlx::query_scalar("SELECT temporal_workflow_id FROM jobs WHERE id = $1 AND org_id = $2")
+            .bind(id)
+            .bind(claims.org)
+            .fetch_optional(&state.db)
+            .await?
+            .flatten();
 
     let Some(workflow_id) = workflow_id else {
         return Err(ApiError::NotFound);
@@ -211,12 +368,12 @@ async fn signal_and_record(
         .await
         .map_err(|e| ApiError::External(format!("temporal: {e}")))?;
 
-    let row: JobRow = sqlx::query_as(
+    let row: JobRow = sqlx::query_as(&format!(
         "UPDATE jobs SET status = $1::job_status, updated_at = now(),
            paused_at = CASE WHEN $1 = 'paused' THEN now() ELSE paused_at END
          WHERE id = $2 AND org_id = $3
-         RETURNING id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at",
-    )
+         RETURNING {JOB_COLS}"
+    ))
     .bind(new_status)
     .bind(id)
     .bind(claims.org)
@@ -237,42 +394,68 @@ async fn signal_and_record(
     Ok(row)
 }
 
-async fn pause_job(State(s): State<AppState>, AuthUser(c): AuthUser, Path(id): Path<i64>) -> ApiResult<Json<JobRow>> {
+async fn pause_job(
+    State(s): State<AppState>,
+    AuthUser(c): AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<JobRow>> {
     require_role(&c, &["admin", "editor", "operator"])?;
-    Ok(Json(signal_and_record(&s, &c, id, "pause", "paused", "pause").await?))
+    Ok(Json(
+        signal_and_record(&s, &c, id, "pause", "paused", "pause").await?,
+    ))
 }
 
-async fn resume_job(State(s): State<AppState>, AuthUser(c): AuthUser, Path(id): Path<i64>) -> ApiResult<Json<JobRow>> {
+async fn resume_job(
+    State(s): State<AppState>,
+    AuthUser(c): AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<JobRow>> {
     require_role(&c, &["admin", "editor", "operator"])?;
-    Ok(Json(signal_and_record(&s, &c, id, "resume", "running", "resume").await?))
+    crate::security::license::require_licensed()?;
+    Ok(Json(
+        signal_and_record(&s, &c, id, "resume", "running", "resume").await?,
+    ))
 }
 
-async fn cancel_job(State(s): State<AppState>, AuthUser(c): AuthUser, Path(id): Path<i64>) -> ApiResult<Json<JobRow>> {
+async fn cancel_job(
+    State(s): State<AppState>,
+    AuthUser(c): AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<JobRow>> {
     require_role(&c, &["admin", "editor", "operator"])?;
-    let workflow_id: Option<String> = sqlx::query_scalar(
-        "SELECT temporal_workflow_id FROM jobs WHERE id = $1 AND org_id = $2",
-    )
-    .bind(id)
-    .bind(c.org)
-    .fetch_optional(&s.db)
-    .await?
-    .flatten();
+    let workflow_id: Option<String> =
+        sqlx::query_scalar("SELECT temporal_workflow_id FROM jobs WHERE id = $1 AND org_id = $2")
+            .bind(id)
+            .bind(c.org)
+            .fetch_optional(&s.db)
+            .await?
+            .flatten();
     if let Some(wid) = workflow_id {
         s.temporal
             .cancel_workflow(&wid)
             .await
             .map_err(|e| ApiError::External(format!("temporal: {e}")))?;
     }
-    let row: JobRow = sqlx::query_as(
+    let row: JobRow = sqlx::query_as(&format!(
         "UPDATE jobs SET status = 'cancelled'::job_status, finished_at = now(), updated_at = now()
          WHERE id = $1 AND org_id = $2
-         RETURNING id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at",
-    )
+         RETURNING {JOB_COLS}"
+    ))
     .bind(id)
     .bind(c.org)
     .fetch_one(&s.db)
     .await?;
-    record_audit(&s.db, c.org, &c.sub, "job", Some(id.to_string()), "cancel", None, Some(&serde_json::to_value(&row)?)).await?;
+    record_audit(
+        &s.db,
+        c.org,
+        &c.sub,
+        "job",
+        Some(id.to_string()),
+        "cancel",
+        None,
+        Some(&serde_json::to_value(&row)?),
+    )
+    .await?;
     Ok(Json(row))
 }
 
@@ -296,11 +479,12 @@ async fn list_rows(
     Query(q): Query<RowsQuery>,
 ) -> ApiResult<Json<RowsResponse>> {
     // Confirm job belongs to caller's org before returning rows.
-    let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND org_id = $2)")
-        .bind(id)
-        .bind(claims.org)
-        .fetch_one(&state.db)
-        .await?;
+    let owned: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND org_id = $2)")
+            .bind(id)
+            .bind(claims.org)
+            .fetch_one(&state.db)
+            .await?;
     if !owned {
         return Err(ApiError::NotFound);
     }
@@ -329,7 +513,10 @@ async fn list_rows(
         .await?
     };
     let next = items.last().map(|r| r.row_index);
-    Ok(Json(RowsResponse { items, next_cursor: next }))
+    Ok(Json(RowsResponse {
+        items,
+        next_cursor: next,
+    }))
 }
 
 /// Per-step outcomes for one row of a multi-step (chained) template: which
@@ -339,11 +526,12 @@ async fn list_row_steps(
     AuthUser(claims): AuthUser,
     Path((id, row_index)): Path<(i64, i64)>,
 ) -> ApiResult<Json<Value>> {
-    let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND org_id = $2)")
-        .bind(id)
-        .bind(claims.org)
-        .fetch_one(&state.db)
-        .await?;
+    let owned: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND org_id = $2)")
+            .bind(id)
+            .bind(claims.org)
+            .fetch_one(&state.db)
+            .await?;
     if !owned {
         return Err(ApiError::NotFound);
     }
@@ -366,11 +554,7 @@ pub struct RetryOptions {
 }
 
 /// Fetch (workflow_id, rule_template_id, rule_template_version) for an owned job.
-async fn job_dispatch_info(
-    state: &AppState,
-    org: i64,
-    id: i64,
-) -> ApiResult<(String, i64, i32)> {
+async fn job_dispatch_info(state: &AppState, org: i64, id: i64) -> ApiResult<(String, i64, i32)> {
     let row: Option<(Option<String>, i64, i32)> = sqlx::query_as(
         "SELECT temporal_workflow_id, rule_template_id, rule_template_version FROM jobs WHERE id = $1 AND org_id = $2",
     )
@@ -391,10 +575,16 @@ async fn retry_row(
     body: Option<Json<RetryOptions>>,
 ) -> ApiResult<impl IntoResponse> {
     require_role(&claims, &["admin", "editor", "operator"])?;
+    crate::security::license::require_licensed()?;
     let opts = body.map(|Json(b)| b).unwrap_or_default();
     let (workflow_id, tpl_id, tpl_version) = job_dispatch_info(&state, claims.org, id).await?;
 
-    let retry_id = format!("{}-retry-{}-{}", workflow_id, row_index, uuid::Uuid::new_v4().simple());
+    let retry_id = format!(
+        "{}-retry-{}-{}",
+        workflow_id,
+        row_index,
+        uuid::Uuid::new_v4().simple()
+    );
     state
         .temporal
         .start_workflow(
@@ -434,7 +624,9 @@ async fn retry_row(
         None,
     )
     .await?;
-    Ok(Json(json!({"job_id": id, "row_index": row_index, "queued": true, "from_start": opts.from_start})))
+    Ok(Json(
+        json!({"job_id": id, "row_index": row_index, "queued": true, "from_start": opts.from_start}),
+    ))
 }
 
 async fn retry_all_failed(
@@ -444,6 +636,7 @@ async fn retry_all_failed(
     body: Option<Json<RetryOptions>>,
 ) -> ApiResult<impl IntoResponse> {
     require_role(&claims, &["admin", "editor", "operator"])?;
+    crate::security::license::require_licensed()?;
     let opts = body.map(|Json(b)| b).unwrap_or_default();
     let (workflow_id, tpl_id, tpl_version) = job_dispatch_info(&state, claims.org, id).await?;
 
@@ -459,7 +652,11 @@ async fn retry_all_failed(
 
     // The retry workflow enumerates failed rows itself (paged) and re-runs
     // each from persisted state, resuming at the first failed step.
-    let retry_wf_id = format!("{}-retryfailed-{}", workflow_id, uuid::Uuid::new_v4().simple());
+    let retry_wf_id = format!(
+        "{}-retryfailed-{}",
+        workflow_id,
+        uuid::Uuid::new_v4().simple()
+    );
     state
         .temporal
         .start_workflow(
@@ -476,7 +673,17 @@ async fn retry_all_failed(
         .await
         .map_err(|e| ApiError::External(format!("temporal: {e}")))?;
 
-    record_audit(&state.db, claims.org, &claims.sub, "job", Some(id.to_string()), "retry_all_failed", None, None).await?;
+    record_audit(
+        &state.db,
+        claims.org,
+        &claims.sub,
+        "job",
+        Some(id.to_string()),
+        "retry_all_failed",
+        None,
+        None,
+    )
+    .await?;
     Ok(Json(json!({"job_id": id, "retried": n})))
 }
 
@@ -485,11 +692,12 @@ async fn stream_updates(
     AuthUser(claims): AuthUser,
     Path(id): Path<i64>,
 ) -> ApiResult<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>> {
-    let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND org_id = $2)")
-        .bind(id)
-        .bind(claims.org)
-        .fetch_one(&state.db)
-        .await?;
+    let owned: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND org_id = $2)")
+            .bind(id)
+            .bind(claims.org)
+            .fetch_one(&state.db)
+            .await?;
     if !owned {
         return Err(ApiError::NotFound);
     }
@@ -499,14 +707,13 @@ async fn stream_updates(
 
     let redis_client = state.redis.clone();
     tokio::spawn(async move {
-        let conn = match redis_client.get_async_connection().await {
+        let mut pubsub = match redis_client.get_async_pubsub().await {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!(error=%err, "redis connect for SSE failed");
                 return;
             }
         };
-        let mut pubsub = conn.into_pubsub();
         if let Err(err) = pubsub.subscribe(&channel).await {
             tracing::warn!(error=%err, channel=%channel, "redis subscribe failed");
             return;
@@ -534,9 +741,16 @@ async fn stream_updates(
 /// orchestrator via the HTTP callback endpoint in real deployments).
 #[allow(dead_code)]
 pub async fn publish_progress(state: &AppState, job_id: i64, payload: &Value) -> ApiResult<()> {
-    let mut conn = state.redis.get_async_connection().await.map_err(|e| ApiError::External(format!("redis: {e}")))?;
+    let mut conn = state
+        .redis
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| ApiError::External(format!("redis: {e}")))?;
     let _: () = conn
-        .publish(format!("job:{job_id}:progress"), serde_json::to_string(payload)?)
+        .publish(
+            format!("job:{job_id}:progress"),
+            serde_json::to_string(payload)?,
+        )
         .await
         .map_err(|e| ApiError::External(format!("redis publish: {e}")))?;
     Ok(())
