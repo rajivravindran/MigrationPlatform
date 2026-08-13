@@ -3,9 +3,8 @@
 ## Quick start (Docker Hub demo — no git)
 
 Share **`infra/migration-demo-pack.zip`** (rebuilt with `make demo-pack`). Recipients
-do **not** need this repository. Direct download:
-
-`https://github.com/rajivravindran/MigrationPlatform/raw/main/infra/migration-demo-pack.zip`
+do **not** need this repository. The repo is private — send them the zip file
+rather than a raw GitHub URL.
 
 ```bash
 unzip migration-demo-pack.zip
