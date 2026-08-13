@@ -1,75 +1,160 @@
 # Migration Platform
 
-A production-grade data migration platform that ingests data from files
-(CSV/JSON/XML) or CRM sources (Salesforce, watched S3/MinIO prefixes),
-applies configurable preprocess + payload mapping transforms, and calls
-downstream API endpoints with fault tolerance, resumability, and
-observability to 10M-row scale.
+Self-hosted tool for **file and CRM → HTTP API** migrations.
 
-## Components
+You design a mapping (CSV/JSON/XML, Salesforce, or a watched bucket), the platform
+runs the job on Temporal, retries failed rows, and lets you inspect results.
 
-| Path                       | Stack                           | Purpose                                                                 |
-| -------------------------- | ------------------------------- | ----------------------------------------------------------------------- |
-| `apps/api`                 | Rust (axum, sqlx, tokio)        | REST API: auth, templates, jobs, connectors, schedules, SSE, OpenAPI.   |
-| `apps/orchestrator-go`     | Go (Temporal Go SDK)            | Temporal workflows/activities, connectors, schedule bootstrap.          |
-| `apps/transform-worker`    | Python 3.12 (Temporal, RestrictedPython) | Preprocess + payload mapping, sandboxed `$py` evaluation.      |
-| `apps/web`                 | Next.js 14 + Tailwind + shadcn  | Designer (React Flow), job console, schedules, connectors.             |
-| `packages/rule-schema`     | JSON Schema + Zod/Pydantic/Rust/Go types | Single source of truth for RuleTemplate.                        |
-| `infra/`                   | Docker Compose, Prometheus, Grafana, Loki, Tempo, OTEL Collector | Local + production-parity observability.        |
-| `infra/helm`               | Helm                            | Kubernetes deployment + HPA + NetworkPolicy + pg_dump CronJob.         |
+---
 
-## Documentation
+## Install (recommended): Docker Hub, no source build
 
-- [`docs/architecture.md`](docs/architecture.md) — components, data flow, workflow topology.
-- [`docs/operations.md`](docs/operations.md) — deploy, upgrade, backups, runbooks.
-- [`docs/api.md`](docs/api.md) — REST API reference (auth, templates, jobs, SSE).
-- [`docs/connectors.md`](docs/connectors.md) — CSV/JSON/XML/Salesforce/watched-prefix.
-- [`docs/scheduling.md`](docs/scheduling.md) — cron, timezones, overlap policies, incremental mode.
-- [`docs/security.md`](docs/security.md) — AuthN/Z, secret handling, sandboxing, hardening.
-- [`docs/observability.md`](docs/observability.md) — metrics, logs, traces, dashboards, alerts.
-- [`docs/development.md`](docs/development.md) — laptop setup, Makefile, tests, CI.
-- [`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md) — what recent agents shipped (P0a/P0b) and what remains.
-
-## Laptop quickstart
-
-Prerequisites: Docker 24+, Docker Compose v2, GNU Make, Python 3 (for the seed
-helper), k6 (optional, for the smoke test).
+You need **Docker Desktop** (or Docker Engine 24+ with Compose v2), plus
+`openssl`, `curl`, and `python3`.
 
 ```bash
-make dev-up          # builds images and starts the stack
-make seed            # creates a demo org, admin user, sample template
-open http://localhost:3000       # sign in as admin@example.com / admin123
+git clone https://github.com/rajivravindran/MigrationPlatform.git
+cd MigrationPlatform/infra/demo-pack
+chmod +x *.sh
+./up.sh
 ```
 
-What's running:
+That pulls published images, starts the stack, and seeds a demo user.
 
-| Service         | URL                    | Notes                                                    |
-| --------------- | ---------------------- | -------------------------------------------------------- |
-| Web UI          | http://localhost:3000  | Next.js dev/prod build depending on compose override.    |
-| API             | http://localhost:8080  | OpenAPI at `/openapi.json`, docs at `/swagger-ui`.       |
-| Temporal UI     | http://localhost:8088  | Workflow + Schedule browser.                             |
-| Grafana         | http://localhost:3001  | Preloaded dashboards + alerts (admin/admin).             |
-| Prometheus      | http://localhost:9090  | Scraping API/orchestrator/worker + cAdvisor.             |
-| MinIO console   | http://localhost:9001  | S3-compatible storage (minioadmin/minioadmin).           |
-| PostgreSQL      | localhost:5432         | Database `migration`, user `migration/migration`.        |
-| Redis           | localhost:6379         | Pub/sub for SSE + distributed locks.                     |
+Open **http://localhost:3000**
 
-Run `make help` for the full command list.
+| | |
+|---|---|
+| Email | `admin@example.com` |
+| Password | `admin123` |
 
-## Smoke test
+First start takes several minutes (image pulls). Later starts are faster.
+
+### Stop
 
 ```bash
-python3 tests/load/generate_csv.py --rows 10000 --out /tmp/smoke.csv
-TOKEN=$(./scripts/login.sh) \
-  SOURCE_CSV=/tmp/smoke.csv \
-  RULE_TEMPLATE_ID=1 \
-  k6 run tests/load/smoke_laptop.js
+cd infra/demo-pack
+docker compose down          # keep data
+docker compose down -v       # wipe database and MinIO
 ```
 
-Target on a laptop: 10k rows in under 90 seconds with zero failures.
-See [`tests/load/README.md`](tests/load/README.md) for the 10M-row
-Kubernetes load test.
+### Without git
+
+Ask for `migration-demo-pack.zip`, then:
+
+```bash
+unzip migration-demo-pack.zip
+cd demo-pack
+chmod +x *.sh
+./up.sh
+```
+
+Images used: `rajivravindran/migration-{api,web,orchestrator,transform-worker}:demo`.
+
+---
+
+## Install from source (developers)
+
+Use this when you want to change code and rebuild.
+
+**Extra tools:** Docker, Make, `openssl`. A full language toolchain is only
+needed if you run tests outside Docker (Rust 1.80+, Go 1.22+, Python 3.12, Node 20).
+
+```bash
+git clone https://github.com/rajivravindran/MigrationPlatform.git
+cd MigrationPlatform
+make up          # generates JWT keys, builds images, starts Compose
+make seed        # demo org + admin user + sample template
+```
+
+Same UI: **http://localhost:3000** — `admin@example.com` / `admin123`
+
+```bash
+make down        # stop, keep volumes
+make nuke        # stop and delete volumes
+make logs s=api  # tail one service
+make help
+```
+
+To run the same Compose file but **pull Hub images instead of building**:
+
+```bash
+make hub-up
+make seed
+```
+
+---
+
+## URLs after install
+
+| What | URL | Login |
+|------|-----|--------|
+| Web UI | http://localhost:3000 | `admin@example.com` / `admin123` |
+| API | http://localhost:8080 | JWT from UI or `POST /auth/login` |
+| OpenAPI | http://localhost:8080/openapi.json | — |
+| Swagger | http://localhost:8080/swagger-ui | — |
+| Temporal UI | http://localhost:8233 | — |
+| MinIO console | http://localhost:9001 | `minio` / `minio123` |
+| Grafana | http://localhost:3001 | `admin` / `admin` (full stack only) |
+
+The demo pack starts Web, API, workers, Postgres, Redis, MinIO, and Temporal.
+Grafana/Prometheus are on the full `make up` stack, not the slim demo pack.
+
+---
+
+## First job (2 minutes)
+
+1. Sign in at http://localhost:3000
+2. Open **Templates** — a demo template is already published after `./up.sh` or `make seed`
+3. **Jobs → Start a job**, upload a small CSV (`email,country,amount`), start
+4. Open the job: row list, request/response, **Download results** (CSV)
+
+---
+
+## What you just installed
+
+```
+Browser  →  Next.js UI (:3000)
+                ↓
+           Rust API (:8080)  →  Postgres, Redis, MinIO
+                ↓
+           Temporal  →  Go orchestrator  →  Python transform worker
+```
+
+| Path | Role |
+|------|------|
+| `apps/web` | Mapping designer and job console |
+| `apps/api` | Auth, templates, jobs, files, licenses |
+| `apps/orchestrator-go` | Temporal workflows (ingest, HTTP calls, batches) |
+| `apps/transform-worker` | Sandboxed preprocess / `$py` mapping |
+| `infra/demo-pack` | Hub-only install (this is what `./up.sh` uses) |
+| `infra/docker-compose.yml` | Full local stack including observability |
+
+---
+
+## Docs
+
+| Doc | Contents |
+|-----|----------|
+| [docs/install.md](docs/install.md) | Commercial/trial license install |
+| [docs/architecture.md](docs/architecture.md) | Components and job data flow |
+| [docs/api.md](docs/api.md) | REST API |
+| [docs/connectors.md](docs/connectors.md) | CSV, JSON, XML, Salesforce, watched prefix, SFTP |
+| [docs/operations.md](docs/operations.md) | Upgrades, backups, runbooks |
+| [docs/security.md](docs/security.md) | Auth, secrets, sandboxing |
+| [docs/development.md](docs/development.md) | Tests and local toolchain |
+
+---
+
+## Requirements and limits
+
+- **RAM:** plan on 8 GB+ for the full Compose stack; 4 GB can work for the demo pack.
+- **Ports:** 3000, 8080, 8233, 9000, 9001 must be free (Grafana 3001 on the full stack).
+- Demo credentials are for **local/demo only**. Change them before any shared or production host.
+- Do not commit or ship `infra/license/*signing_key*.pem` or `infra/secrets/jwt_private.pem`.
+
+---
 
 ## License
 
-Internal — see LICENSE.
+Internal — see [LICENSE](LICENSE).

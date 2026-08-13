@@ -1,0 +1,3 @@
+# Keep generated JWT material out of shared zips if you re-pack locally.
+secrets/
+*.pem

@@ -1,0 +1,195 @@
+# Migration Platform — demo pack (Docker Hub only)
+#
+# No source repo required. App images pull from Docker Hub.
+# Prerequisites: Docker 24+, Docker Compose v2, openssl, curl, python3.
+
+name: migration-demo
+
+networks:
+  migration:
+    driver: bridge
+
+volumes:
+  pgdata: {}
+  miniodata: {}
+  license-data: {}
+
+services:
+  installation-id:
+    image: alpine:3.20
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'test -s /var/lib/migration/installation-id || (umask 077; cat /proc/sys/kernel/random/uuid > /var/lib/migration/installation-id); chown -R 10001:10001 /var/lib/migration; chmod 0444 /var/lib/migration/installation-id'
+    volumes:
+      - license-data:/var/lib/migration
+    restart: "no"
+    networks: [migration]
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: migration
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [migration]
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [migration]
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    volumes:
+      - miniodata:/data
+    ports: ["9000:9000", "9001:9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    networks: [migration]
+
+  minio-setup:
+    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    depends_on:
+      minio: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until mc alias set local http://minio:9000 minio minio123; do sleep 1; done
+        mc mb --ignore-existing local/migration
+        mc mb --ignore-existing local/migration-results
+        mc mb --ignore-existing local/migration-backups
+        echo "minio buckets ready"
+    networks: [migration]
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    environment:
+      DB: postgres12_pgx
+      DB_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PWD: postgres
+      POSTGRES_SEEDS: postgres
+      BIND_ON_IP: 0.0.0.0
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["7233:7233"]
+    healthcheck:
+      test: ["CMD-SHELL", "temporal operator cluster health --address 127.0.0.1:7233 >/dev/null 2>&1 || bash -c '</dev/tcp/127.0.0.1/7233'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    networks: [migration]
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports: ["8233:8080"]
+    depends_on: [temporal]
+    networks: [migration]
+
+  migrate:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-api:${IMAGE_TAG:-demo}
+    entrypoint: ["/app/migration-admin", "migrate"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/migration
+      MASTER_KEY: "dev-master-key-change-me-000000000000000000000000"
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+    networks: [migration]
+
+  api:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-api:${IMAGE_TAG:-demo}
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/migration
+      REDIS_URL: redis://redis:6379/0
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      API_BIND: 0.0.0.0:8080
+      METRICS_BIND: 0.0.0.0:9464
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      MINIO_BUCKET: migration
+      MASTER_KEY: "dev-master-key-change-me-000000000000000000000000"
+      ORCHESTRATOR_BRIDGE_URL: http://orchestrator:7070
+      BRIDGE_TOKEN: "dev-bridge-token-change-me"
+      LICENSE_ENFORCE: "false"
+      LICENSE_STORE_PATH: /var/lib/migration/license.json
+      LICENSE_INSTALLATION_ID_PATH: /var/lib/migration/installation-id
+      JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private.pem
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public.pem
+    volumes:
+      - ./secrets:/run/secrets:ro
+      - license-data:/var/lib/migration
+    ports: ["8080:8080"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      temporal: { condition: service_healthy }
+      minio-setup: { condition: service_completed_successfully }
+      installation-id: { condition: service_completed_successfully }
+    networks: [migration]
+
+  orchestrator:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-orchestrator:${IMAGE_TAG:-demo}
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/migration
+      REDIS_URL: redis://redis:6379/0
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      ACTIVITY_CONCURRENCY: "64"
+      MASTER_KEY: "dev-master-key-change-me-000000000000000000000000"
+      METRICS_BIND: 0.0.0.0:9464
+      BRIDGE_ADDR: ":7070"
+      BRIDGE_TOKEN: "dev-bridge-token-change-me"
+      API_INTERNAL_URL: http://api:8080
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio123
+      MINIO_BUCKET: migration
+      ALLOW_PRIVATE_DESTINATIONS: "true"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      temporal: { condition: service_healthy }
+    networks: [migration]
+
+  transform-worker:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-transform-worker:${IMAGE_TAG:-demo}
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      METRICS_ADDR: ":9464"
+    depends_on:
+      temporal: { condition: service_healthy }
+    networks: [migration]
+
+  web:
+    image: ${HUB_IMAGE_PREFIX:-rajivravindran}/migration-web:${IMAGE_TAG:-demo}
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+      API_INTERNAL_URL: http://api:8080
+    ports: ["3000:3000"]
+    depends_on: [api]
+    networks: [migration]
