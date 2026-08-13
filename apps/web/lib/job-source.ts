@@ -1,4 +1,5 @@
 export type JobSource = {
+  type?: string;
   kind?: string;
   bucket?: string | null;
   key?: string | null;
