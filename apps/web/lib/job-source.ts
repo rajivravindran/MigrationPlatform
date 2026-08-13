@@ -16,7 +16,7 @@ export type JobSource = {
 export type JobSourceFields = {
   batch_id?: number | null;
   source?: JobSource | null;
-  source_ref?: { type?: string; kind?: string; bucket?: string; key?: string; filename?: string; size?: number; etag?: string } | null;
+  source_ref?: JobSource | null;
 };
 
 export function basename(path?: string | null): string | undefined {
