@@ -244,7 +244,8 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
         title={`Job #${job.id}`}
         description={`Template #${job.rule_template_id} · Started ${formatDateTime(job.started_at)}`}
         eyebrow={<Breadcrumbs items={[{ label: "Jobs", href: "/jobs" }, { label: `Job #${job.id}` }]} />}
-        actions={<>}
+        actions={
+          <>
           <span data-testid="job-status"><StatusBadge status={job.status} /></span>
           <Button variant="ghost" onClick={() => pause.mutate()} disabled={job.status !== "running"}>Pause</Button>
           <Button variant="ghost" onClick={() => resume.mutate()} disabled={job.status !== "paused"}>Resume</Button>
@@ -276,7 +277,8 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
               ) : null}
             </>
           ) : null}
-        </>}
+          </>
+        }
       />
 
       <Card className="text-sm" data-testid="job-source">
