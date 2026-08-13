@@ -61,12 +61,14 @@ hub-up: keys hub-pull
 	@echo "Next: make seed   # admin@example.com / admin123"
 
 # Shareable zip: compose + scripts only. Recipients need Docker, not git.
+# Tracked copy lives at infra/migration-demo-pack.zip (dist/ is gitignored).
 demo-pack:
 	@mkdir -p dist
-	@rm -f dist/migration-demo-pack.zip
+	@rm -f dist/migration-demo-pack.zip infra/migration-demo-pack.zip
 	@cd infra && zip -r ../dist/migration-demo-pack.zip demo-pack \
 	  -x 'demo-pack/secrets/*' 'demo-pack/**/*.pem' 'demo-pack/**/.DS_Store'
-	@echo "Wrote dist/migration-demo-pack.zip — share this file (no git access required)."
+	@cp dist/migration-demo-pack.zip infra/migration-demo-pack.zip
+	@echo "Wrote infra/migration-demo-pack.zip (and dist/ copy)."
 	@echo "Recipient: unzip && cd demo-pack && ./up.sh"
 
 down:

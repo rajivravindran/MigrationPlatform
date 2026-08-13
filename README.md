@@ -40,9 +40,11 @@ docker compose down -v       # wipe database and MinIO
 
 ### Without git
 
-Ask for `migration-demo-pack.zip`, then:
+Download the pack (Compose + scripts; images still pull from Docker Hub):
 
 ```bash
+curl -fsSL -o migration-demo-pack.zip \
+  https://github.com/rajivravindran/MigrationPlatform/raw/main/infra/migration-demo-pack.zip
 unzip migration-demo-pack.zip
 cd demo-pack
 chmod +x *.sh
