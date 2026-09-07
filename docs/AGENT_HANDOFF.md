@@ -342,6 +342,28 @@ heartbeat 200/403/401/wrong-key/conn-refused) and `license_server::tests`
 per-fingerprint rate limit, expired trial, heartbeat refresh + counters,
 forged / mismatched / expired presentations, revoke + unrevoke + wildcard).
 
+**Full-stack verification (2026-09-07, compose, `LICENSE_ENFORCE=true`,
+`LICENSE_HEARTBEAT_INTERVAL_SECS=120`, license server as a container on the
+compose network)** — all passed after the fixes in `e6ef0a4`: unlicensed →
+`POST /jobs` 402 → `POST /license/trial` → job succeeds 4/4 rows (orchestrator
+`RequireLicensed` activity included) → heartbeat re-attests and slides
+`grace_until` → `revoke` → next tick `mode=revoked`, 402 → `unrevoke` +
+restart → recovered → server stopped → `heartbeat.status=degraded`, still
+licensed, jobs allowed → wrong-fingerprint commercial file rejected with log →
+correct commercial file adopted in <60s and re-attested → Settings UI shows
+trial/commercial/unlicensed states and the Start-trial form works. Prometheus
+`migration-api` target UP, `license_*` series scraped. Bugs found and fixed
+in that commit: post-success heartbeat back-off (no second heartbeat ever
+sent with a short interval), no probing while revoked, `LICENSE_ENFORCE=1`
+silently off, `/metrics` on the public port with `METRICS_BIND` unbound,
+stale seed preprocess fn name.
+
+Running the stack on a **plain Linux Docker engine** (not Desktop): mode-600
+secrets in `infra/secrets` are unreadable by the uid-10001 container (Desktop
+masks this) — `chmod 644` the local dev key; the host firewall may drop
+bridge→host traffic, so run the license server as a container
+(`docker build --target license-server`) rather than on the host.
+
 ---
 
 ## Not done (follow-ups)
@@ -353,6 +375,8 @@ forged / mismatched / expired presentations, revoke + unrevoke + wildcard).
 | **P5.2** | Stripe / payment portal; per-SKU feature-flag gating. |
 | — | Local-folder source connector. |
 | — | Remote connector test for non-SFTP kinds (`watched_prefix`, Salesforce, custom) — API still rejects; UI messaging is accurate. |
+| — | `POST /jobs` accepts `source_ref` as a JSON *string*; the Go workflow then fails to decode it and the job row stays `running` forever (no failure propagated back). Validate the shape at the API and mark the job `failed` when the workflow fails before its first activity. Found during the 2026-09-07 full-stack run. |
+| — | `heartbeat_due_schedule_and_retry_backoff` reads `LICENSE_HEARTBEAT_INTERVAL_SECS` from the process env; it fails if a developer's shell exports it. Inject the interval instead of reading env inside `heartbeat_due`. |
 | — | Recreate pre-P1 schedules that still target `MigrationWorkflow` directly in Temporal (recreate after deploy). |
 
 **Note:** Existing schedules created before P1 still target `MigrationWorkflow`
