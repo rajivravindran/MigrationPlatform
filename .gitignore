@@ -41,9 +41,14 @@ id_rsa*
 id_ed25519*
 *license*signing*key*
 *signing*private*key*
+# The license *verification* key is public by design: it is include_str!'d into
+# the API binary and must be in the repo for the crate to build. The paired
+# signing key stays covered by the rules above.
+!infra/license/license_public_key.pem
 
-# Go build and test outputs
-bin/
+# Go build and test outputs (scoped: apps/api/src/bin/ holds Rust binary sources)
+/bin/
+apps/orchestrator-go/bin/
 *.test
 *.out
 vendor/
