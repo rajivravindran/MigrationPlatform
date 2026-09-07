@@ -233,6 +233,8 @@ services:
       LICENSE_SERVER_URL: "${LICENSE_SERVER_URL:-}"
       LICENSE_SERVER_TOKEN: "${LICENSE_SERVER_TOKEN:-}"
       LICENSE_TRIAL_EMAIL: "${LICENSE_TRIAL_EMAIL:-}"
+      # Dev/test only: shorten the 24h heartbeat so refresh/revoke can be observed.
+      LICENSE_HEARTBEAT_INTERVAL_SECS: "${LICENSE_HEARTBEAT_INTERVAL_SECS:-}"
       LICENSE_STORE_PATH: /var/lib/migration/license.json
       LICENSE_INSTALLATION_ID_PATH: /var/lib/migration/installation-id
       JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private.pem
