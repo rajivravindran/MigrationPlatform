@@ -104,16 +104,13 @@ pub fn status_json(state: &LicenseState) -> Value {
     let enforce = enforce_enabled();
     let now = Utc::now();
     let server_configured = LicenseServer::from_env().is_some();
-    let problem = state
-        .doc
-        .as_ref()
-        .and_then(|doc| {
-            if state.revoked_reason.is_some() {
-                Some(LicenseProblem::Revoked)
-            } else {
-                license::validity(doc, fp, now).err()
-            }
-        });
+    let problem = state.doc.as_ref().and_then(|doc| {
+        if state.revoked_reason.is_some() {
+            Some(LicenseProblem::Revoked)
+        } else {
+            license::validity(doc, fp, now).err()
+        }
+    });
 
     let heartbeat = state.doc.as_ref().map(|doc| {
         let status = if !doc.requires_heartbeat {

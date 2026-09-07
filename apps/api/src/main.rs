@@ -83,7 +83,8 @@ async fn main() -> anyhow::Result<()> {
         .context("binding metrics port")?;
     info!(addr = %metrics_addr, "metrics listening");
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(metrics_listener, routes::metrics::router(metrics_handle)).await {
+        if let Err(e) = axum::serve(metrics_listener, routes::metrics::router(metrics_handle)).await
+        {
             tracing::error!(error = %e, "metrics server exited");
         }
     });

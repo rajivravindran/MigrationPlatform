@@ -212,12 +212,19 @@ fn problem_for(state: &LicenseState, local_fp: &str, now: DateTime<Utc>) -> Opti
     if state.revoked_reason.is_some() {
         return Some(LicenseProblem::Revoked);
     }
-    state.doc.as_ref().and_then(|doc| validity(doc, local_fp, now).err())
+    state
+        .doc
+        .as_ref()
+        .and_then(|doc| validity(doc, local_fp, now).err())
 }
 
 /// Pure validity check for a verified document at instant `now`.
 /// `local_fp` empty ⇒ fingerprint binding is not checked (unavailable).
-pub fn validity(doc: &LicenseDoc, local_fp: &str, now: DateTime<Utc>) -> Result<(), LicenseProblem> {
+pub fn validity(
+    doc: &LicenseDoc,
+    local_fp: &str,
+    now: DateTime<Utc>,
+) -> Result<(), LicenseProblem> {
     if doc.expires_at <= now {
         return Err(LicenseProblem::Expired);
     }
@@ -408,7 +415,8 @@ fn activate(loaded: LoadedLicense) {
 
 fn publish_gauges() {
     let state = snapshot();
-    let licensed = state.doc.is_some() && problem_for(&state, process_fingerprint(), Utc::now()).is_none();
+    let licensed =
+        state.doc.is_some() && problem_for(&state, process_fingerprint(), Utc::now()).is_none();
     metrics::gauge!("license_valid").set(if licensed { 1.0 } else { 0.0 });
     let grace_secs = state
         .doc
@@ -519,9 +527,8 @@ pub async fn start_trial(email: &str) -> Result<LicenseDoc> {
 
 async fn activate_trial_phone_home(fp: &str, email: &str) -> Result<LoadedLicense> {
     let email = validate_trial_email(email)?;
-    let server = LicenseServer::from_env().context(
-        "LICENSE_SERVER_URL and LICENSE_SERVER_TOKEN are required to start a trial",
-    )?;
+    let server = LicenseServer::from_env()
+        .context("LICENSE_SERVER_URL and LICENSE_SERVER_TOKEN are required to start a trial")?;
 
     let url = format!("{}/v1/trial/start", server.base_url);
     let body = serde_json::json!({
@@ -636,7 +643,9 @@ pub async fn heartbeat_once(
                 Ok(_) => HeartbeatOutcome::Unavailable(
                     "heartbeat response is bound to a different install".into(),
                 ),
-                Err(e) => HeartbeatOutcome::Unavailable(format!("heartbeat response rejected: {e}")),
+                Err(e) => {
+                    HeartbeatOutcome::Unavailable(format!("heartbeat response rejected: {e}"))
+                }
             }
         }
         // Only explicit business refusals are authoritative. 401/5xx and
@@ -679,7 +688,8 @@ pub async fn heartbeat_tick() {
     with_state(|s| s.last_heartbeat_attempt = Some(now));
 
     let Some(server) = LicenseServer::from_env() else {
-        let msg = "license requires heartbeat but LICENSE_SERVER_URL/LICENSE_SERVER_TOKEN are unset";
+        let msg =
+            "license requires heartbeat but LICENSE_SERVER_URL/LICENSE_SERVER_TOKEN are unset";
         tracing::warn!(msg);
         with_state(|s| s.last_heartbeat_error = Some(msg.into()));
         metrics::counter!("license_heartbeat_total", "result" => "unconfigured").increment(1);
@@ -908,7 +918,10 @@ pub fn require_licensed() -> Result<(), crate::error::ApiError> {
     if matches!(problem, Some(LicenseProblem::Expired)) {
         metrics::counter!("license_expired_denied_total").increment(1);
     }
-    tracing::warn!(reason, "work-producing operation denied by runtime license gate");
+    tracing::warn!(
+        reason,
+        "work-producing operation denied by runtime license gate"
+    );
     let hint = match problem {
         Some(LicenseProblem::HeartbeatGraceExpired) => {
             "The license could not be re-attested with the license server for more than 72 hours. \
@@ -1080,7 +1093,10 @@ mod tests {
             validity(&d, "", now),
             Err(LicenseProblem::HeartbeatGraceExpired)
         );
-        assert_eq!(grace_until(&d), Some(now - Duration::hours(73) + HEARTBEAT_GRACE));
+        assert_eq!(
+            grace_until(&d),
+            Some(now - Duration::hours(73) + HEARTBEAT_GRACE)
+        );
 
         d.issued_at = None;
         assert_eq!(validity(&d, "", now), Err(LicenseProblem::MissingIssuedAt));
@@ -1124,20 +1140,35 @@ mod tests {
         // A recent *successful* attempt (no error recorded) must not back off:
         // the schedule is driven by `issued_at` alone.
         state.last_heartbeat_attempt = Some(now - Duration::minutes(10));
-        assert!(heartbeat_due(&state, now), "recent successful attempt: still due");
+        assert!(
+            heartbeat_due(&state, now),
+            "recent successful attempt: still due"
+        );
 
         state.last_heartbeat_error = Some("license server unavailable".into());
-        assert!(!heartbeat_due(&state, now), "recent failed attempt: back off");
+        assert!(
+            !heartbeat_due(&state, now),
+            "recent failed attempt: back off"
+        );
 
         state.last_heartbeat_attempt = Some(now - Duration::hours(2));
-        assert!(heartbeat_due(&state, now), "retry window elapsed: due again");
+        assert!(
+            heartbeat_due(&state, now),
+            "retry window elapsed: due again"
+        );
 
         // Revoked: keep probing at the retry cadence so `unrevoke` self-heals.
         state.revoked_reason = Some("revoked".into());
         state.last_heartbeat_attempt = Some(now - Duration::minutes(10));
-        assert!(!heartbeat_due(&state, now), "revoked + recent probe: back off");
+        assert!(
+            !heartbeat_due(&state, now),
+            "revoked + recent probe: back off"
+        );
         state.last_heartbeat_attempt = Some(now - Duration::hours(2));
-        assert!(heartbeat_due(&state, now), "revoked + retry window elapsed: probe again");
+        assert!(
+            heartbeat_due(&state, now),
+            "revoked + retry window elapsed: probe again"
+        );
     }
 
     #[test]
@@ -1162,7 +1193,10 @@ mod tests {
         trial.licensee = "trial@example.com".into();
 
         let none = LicenseState::default();
-        assert!(should_adopt(&none, &trial, "", now), "nothing active: adopt");
+        assert!(
+            should_adopt(&none, &trial, "", now),
+            "nothing active: adopt"
+        );
 
         let cur_commercial = LicenseState {
             doc: Some(commercial.clone()),
@@ -1201,7 +1235,10 @@ mod tests {
 
         let mut expired_cand = commercial.clone();
         expired_cand.expires_at = now - Duration::seconds(1);
-        assert!(!should_adopt(&cur_trial, &expired_cand, "", now), "unusable candidate ignored");
+        assert!(
+            !should_adopt(&cur_trial, &expired_cand, "", now),
+            "unusable candidate ignored"
+        );
 
         let revoked_current = LicenseState {
             doc: Some(commercial.clone()),
@@ -1234,7 +1271,10 @@ mod tests {
             "ops@example..com",
             "a@@example.com",
         ] {
-            assert!(validate_trial_email(bad).is_err(), "{bad:?} should be rejected");
+            assert!(
+                validate_trial_email(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 
@@ -1355,7 +1395,9 @@ mod tests {
         let server = MockServer::start().await;
         let val: Value = serde_json::from_str(&raw).unwrap();
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"license_file": val})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"license_file": val})),
+            )
             .mount(&server)
             .await;
         let ls = LicenseServer {

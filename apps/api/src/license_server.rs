@@ -89,7 +89,10 @@ impl AppState {
 
 /// Open (creating if needed) the SQLite store and apply idempotent schema changes.
 pub fn open_db(path: &str) -> Result<Connection> {
-    if let Some(parent) = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
+    if let Some(parent) = Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path).with_context(|| format!("opening sqlite {path}"))?;
@@ -117,7 +120,12 @@ pub fn open_db(path: &str) -> Result<Connection> {
         "#,
     )?;
     ensure_column(&conn, "trials", "last_heartbeat_at", "TEXT")?;
-    ensure_column(&conn, "trials", "heartbeat_count", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(
+        &conn,
+        "trials",
+        "heartbeat_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(&conn, "trials", "revoked_at", "TEXT")?;
     ensure_column(&conn, "trials", "revoked_reason", "TEXT")?;
     Ok(conn)
@@ -174,7 +182,10 @@ pub fn unrevoke(conn: &Connection, fingerprint: &str, licensee: Option<&str>) ->
             "DELETE FROM revocations WHERE fingerprint = ?1 AND licensee = ?2",
             params![&fp, l],
         )?,
-        None => conn.execute("DELETE FROM revocations WHERE fingerprint = ?1", params![&fp])?,
+        None => conn.execute(
+            "DELETE FROM revocations WHERE fingerprint = ?1",
+            params![&fp],
+        )?,
     };
     conn.execute(
         "UPDATE trials SET revoked_at = NULL, revoked_reason = NULL WHERE fingerprint = ?1",
@@ -347,7 +358,8 @@ fn parse_stored_ts(s: &str) -> Result<DateTime<Utc>> {
 }
 
 fn sign(state: &AppState, doc: &LicenseDoc) -> Result<Value, ServerError> {
-    let signed = license::sign_license(doc, &state.cfg.signing_key_pem).map_err(ServerError::internal)?;
+    let signed =
+        license::sign_license(doc, &state.cfg.signing_key_pem).map_err(ServerError::internal)?;
     serde_json::from_str(&signed).map_err(ServerError::internal)
 }
 
@@ -372,7 +384,12 @@ async fn trial_start(
         .map_err(|e| ServerError::new(StatusCode::BAD_REQUEST, "bad_request", e.to_string()))?;
     // Cheap syntactic checks run before the limiter so a typo does not cost
     // the operator a 5s wait; the limiter still guards every DB touch.
-    let email = match req.email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+    let email = match req
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
         Some(e) => validate_trial_email(e).map_err(|e| {
             ServerError::new(StatusCode::BAD_REQUEST, "invalid_email", e.to_string())
         })?,
@@ -431,13 +448,19 @@ async fn trial_start(
                 return Err(ServerError::new(
                     StatusCode::PAYMENT_REQUIRED,
                     "trial_expired",
-                    format!("trial for this install already expired at {}", row.expires_at),
+                    format!(
+                        "trial for this install already expired at {}",
+                        row.expires_at
+                    ),
                 ));
             }
             // Keep the original lead e-mail; a different one on re-activation
             // is informational only.
             if row.email.as_deref().is_some_and(|e| e != email) {
-                info!(fingerprint = short(&fp), "trial re-activated with a different email; keeping original");
+                info!(
+                    fingerprint = short(&fp),
+                    "trial re-activated with a different email; keeping original"
+                );
             }
             if row.email.is_none() {
                 db.execute(
@@ -447,7 +470,11 @@ async fn trial_start(
                 .map_err(ServerError::internal)?;
             }
             info!(fingerprint = short(&fp), expires_at = %row.expires_at, "reusing trial");
-            (row.expires_at, true, row.email.unwrap_or_else(|| email.clone()))
+            (
+                row.expires_at,
+                true,
+                row.email.unwrap_or_else(|| email.clone()),
+            )
         }
         None => {
             let expires_at = now + ChronoDuration::days(state.cfg.trial_days);
@@ -594,7 +621,10 @@ async fn heartbeat(
             None => {
                 // Signature proves vendor issuance; the row may have been lost
                 // to a restore. Accept but make the gap visible.
-                warn!(fingerprint = short(&fp), "heartbeat for trial with no server record; accepting signed document");
+                warn!(
+                    fingerprint = short(&fp),
+                    "heartbeat for trial with no server record; accepting signed document"
+                );
             }
         }
     }
@@ -662,7 +692,12 @@ mod tests {
         }
     }
 
-    async fn post(app: &Router, path: &str, token: Option<&str>, body: Value) -> (StatusCode, Value) {
+    async fn post(
+        app: &Router,
+        path: &str,
+        token: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let mut req = Request::builder()
             .method("POST")
             .uri(path)
@@ -709,7 +744,12 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        for c in ["last_heartbeat_at", "heartbeat_count", "revoked_at", "revoked_reason"] {
+        for c in [
+            "last_heartbeat_at",
+            "heartbeat_count",
+            "revoked_at",
+            "revoked_reason",
+        ] {
             assert!(cols.iter().any(|x| x == c), "missing column {c}");
         }
         drop(conn);
@@ -893,7 +933,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let refreshed = license::verify_license(&body["license_file"].to_string(), &h.pub_key).unwrap();
+        let refreshed =
+            license::verify_license(&body["license_file"].to_string(), &h.pub_key).unwrap();
         assert!(refreshed.issued_at.unwrap() > issued.issued_at.unwrap());
         assert_eq!(refreshed.expires_at, issued.expires_at);
         assert_eq!(refreshed.licensee, issued.licensee);
@@ -928,7 +969,8 @@ mod tests {
             fingerprint: Some(fp.clone()),
             requires_heartbeat: true,
         };
-        let forged: Value = serde_json::from_str(&license::sign_license(&doc, &other_pem).unwrap()).unwrap();
+        let forged: Value =
+            serde_json::from_str(&license::sign_license(&doc, &other_pem).unwrap()).unwrap();
         let (status, body) = post(
             &h.app,
             "/v1/heartbeat",
@@ -943,9 +985,10 @@ mod tests {
         let other_fp = fresh_fp();
         let mut bound_elsewhere = doc.clone();
         bound_elsewhere.fingerprint = Some(other_fp);
-        let genuine: Value =
-            serde_json::from_str(&license::sign_license(&bound_elsewhere, &h.state.cfg.signing_key_pem).unwrap())
-                .unwrap();
+        let genuine: Value = serde_json::from_str(
+            &license::sign_license(&bound_elsewhere, &h.state.cfg.signing_key_pem).unwrap(),
+        )
+        .unwrap();
         h.state.per_fingerprint.lock().unwrap().clear();
         let (status, body) = post(
             &h.app,
@@ -960,8 +1003,10 @@ mod tests {
         // Genuine but expired → 402.
         let mut expired = doc.clone();
         expired.expires_at = Utc::now() - ChronoDuration::seconds(5);
-        let expired_file: Value =
-            serde_json::from_str(&license::sign_license(&expired, &h.state.cfg.signing_key_pem).unwrap()).unwrap();
+        let expired_file: Value = serde_json::from_str(
+            &license::sign_license(&expired, &h.state.cfg.signing_key_pem).unwrap(),
+        )
+        .unwrap();
         h.state.per_fingerprint.lock().unwrap().clear();
         let (status, body) = post(
             &h.app,
@@ -988,8 +1033,10 @@ mod tests {
             fingerprint: Some(fp.clone()),
             requires_heartbeat: true,
         };
-        let file: Value =
-            serde_json::from_str(&license::sign_license(&doc, &h.state.cfg.signing_key_pem).unwrap()).unwrap();
+        let file: Value = serde_json::from_str(
+            &license::sign_license(&doc, &h.state.cfg.signing_key_pem).unwrap(),
+        )
+        .unwrap();
 
         let (status, _) = post(
             &h.app,
@@ -1011,7 +1058,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["code"], "revoked");
-        assert!(body["error"]["message"].as_str().unwrap().contains("chargeback"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("chargeback"));
 
         unrevoke(&h.state.db.lock().unwrap(), &fp, None).unwrap();
         h.state.per_fingerprint.lock().unwrap().clear();

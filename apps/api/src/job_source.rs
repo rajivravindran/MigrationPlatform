@@ -98,7 +98,11 @@ struct ParsedRef {
 
 fn parse_ref(source_ref: &Value) -> ParsedRef {
     if let Some(s) = source_ref.as_str() {
-        let filename = s.rsplit(':').next().map(str::to_string).filter(|p| !p.is_empty());
+        let filename = s
+            .rsplit(':')
+            .next()
+            .map(str::to_string)
+            .filter(|p| !p.is_empty());
         return ParsedRef {
             kind: "upload".to_string(),
             bucket: None,
@@ -137,7 +141,9 @@ fn string_field(v: &Value, name: &str) -> Option<String> {
 }
 
 fn nonempty(s: Option<&str>) -> Option<String> {
-    s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn basename(key: &str) -> String {
@@ -184,7 +190,13 @@ mod tests {
             "bucket": "migration",
             "key": "incoming/demo_batch.tar.gz"
         });
-        let out = summarize_source(&stage, Some(8), Some(&package), Some("contacts"), Some("contacts.csv"));
+        let out = summarize_source(
+            &stage,
+            Some(8),
+            Some(&package),
+            Some("contacts"),
+            Some("contacts.csv"),
+        );
         assert_eq!(out.batch_id, Some(8));
         assert_eq!(out.package_filename.as_deref(), Some("demo_batch.tar.gz"));
         assert_eq!(out.batch_stage_file.as_deref(), Some("contacts.csv"));

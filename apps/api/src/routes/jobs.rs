@@ -237,13 +237,12 @@ async fn download_results(
     Path(id): Path<i64>,
     Query(q): Query<ResultsQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    let row: Option<(Option<Value>,)> = sqlx::query_as(
-        "SELECT results_ref FROM jobs WHERE id = $1 AND org_id = $2",
-    )
-    .bind(id)
-    .bind(claims.org)
-    .fetch_optional(&state.db)
-    .await?;
+    let row: Option<(Option<Value>,)> =
+        sqlx::query_as("SELECT results_ref FROM jobs WHERE id = $1 AND org_id = $2")
+            .bind(id)
+            .bind(claims.org)
+            .fetch_optional(&state.db)
+            .await?;
     let Some((results_ref,)) = row else {
         return Err(ApiError::NotFound);
     };
@@ -309,7 +308,11 @@ fn csv_attachment(filename: String, bytes: Vec<u8>) -> ApiResult<impl IntoRespon
     ))
 }
 
-async fn stream_results_from_db(state: &AppState, job_id: i64, failed_only: bool) -> ApiResult<Vec<u8>> {
+async fn stream_results_from_db(
+    state: &AppState,
+    job_id: i64,
+    failed_only: bool,
+) -> ApiResult<Vec<u8>> {
     let rows: Vec<(i64, String, Option<String>)> = if failed_only {
         sqlx::query_as(
             "SELECT row_index, status::text, last_error FROM job_rows
@@ -331,12 +334,8 @@ async fn stream_results_from_db(state: &AppState, job_id: i64, failed_only: bool
     wtr.write_record(["row_index", "status", "error"])
         .map_err(|e| ApiError::External(e.to_string()))?;
     for (idx, status, err) in rows {
-        wtr.write_record([
-            idx.to_string(),
-            status,
-            err.unwrap_or_default(),
-        ])
-        .map_err(|e| ApiError::External(e.to_string()))?;
+        wtr.write_record([idx.to_string(), status, err.unwrap_or_default()])
+            .map_err(|e| ApiError::External(e.to_string()))?;
     }
     wtr.into_inner()
         .map_err(|e| ApiError::External(e.to_string()))
