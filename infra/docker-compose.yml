@@ -232,6 +232,7 @@ services:
       LICENSE_ENFORCE: "${LICENSE_ENFORCE:-false}"
       LICENSE_SERVER_URL: "${LICENSE_SERVER_URL:-}"
       LICENSE_SERVER_TOKEN: "${LICENSE_SERVER_TOKEN:-}"
+      LICENSE_TRIAL_EMAIL: "${LICENSE_TRIAL_EMAIL:-}"
       LICENSE_STORE_PATH: /var/lib/migration/license.json
       LICENSE_INSTALLATION_ID_PATH: /var/lib/migration/installation-id
       JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private.pem

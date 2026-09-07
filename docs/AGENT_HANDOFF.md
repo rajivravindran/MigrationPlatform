@@ -1,7 +1,7 @@
 # Agent handoff — what was accomplished
 
-**Last updated:** 2026-08-07  
-**Status:** Feature-complete MVP; web↔API contracts reconciled (SFTP test UX, license `enforce`, batch `depends_on`). Production release remains conditional on the gates below.
+**Last updated:** 2026-09-07  
+**Status:** Feature-complete MVP + P5.1 licensing hardening (email-gated trials, fingerprint-bound commercial, 24h heartbeat / 72h grace, revocation). Production release remains conditional on the gates below.
 **Plan file:** [`.cursor/plans/batch_arrival_features_a5363f5d.plan.md`](../.cursor/plans/batch_arrival_features_a5363f5d.plan.md)  
 **Commercial (P5) plan:** [`.cursor/plans/trial_and_distribution_fe014b2f.plan.md`](../.cursor/plans/trial_and_distribution_fe014b2f.plan.md)  
 **Per-phase changelog:** [`PHASE_CHANGELOG.md`](PHASE_CHANGELOG.md)
@@ -21,7 +21,10 @@ unconditional production-readiness claim.
   same parallel wave continue and cannot be retroactively stopped.
 - The bundled license server is an MVP single-instance SQLite service. It
   requires durable storage, bearer authentication, and a runtime-mounted
-  signing key; HA and KMS integration are not implemented.
+  signing key; HA and KMS integration are not implemented. Customers ride out a
+  72h outage on offline grace; longer outages close the work gate everywhere.
+- Heartbeat-required licenses depend on the customer host clock for the grace
+  check (`now - issued_at`). Clock roll-back is not detected (documented gap).
 
 ---
 
@@ -242,6 +245,103 @@ Re-run the API after deleting `./data/license.json` — the same fingerprint
 should **reuse** the original `expires_at` (not a fresh 10 days). Settings →
 License shows kind, days left, and the short install ID.
 
+## P5.1 — Email-gated trials, fingerprint binding, heartbeat + grace (done)
+
+**Goal:** make the trial a real lead-capture funnel, let vendors bind and
+revoke commercial licenses, and stop a wiped-and-restarted install from
+running unlicensed forever, without breaking legacy/air-gapped license files.
+
+**Done:**
+
+1. **`LicenseDoc.requires_heartbeat: bool`** [`security/license.rs`](../apps/api/src/security/license.rs)
+   — serde default `false`, omitted when false, so every existing signed
+   license verifies byte-for-byte and stays heartbeat-free. Server-issued
+   trials and `license-sign --require-heartbeat` set it.
+
+2. **Process license state is now mutable** — `static STATE: RwLock<LicenseState>`
+   replaces the `OnceLock`. `active_license()` returns a clone; `snapshot()`
+   exposes doc + raw file + heartbeat bookkeeping. Pure
+   `validity(doc, local_fp, now) -> Result<(), LicenseProblem>` drives both
+   `is_licensed()` and `require_licensed()`; problems are
+   `expired | fingerprint_mismatch | heartbeat_grace_expired | missing_issued_at | revoked`
+   and are surfaced in the `402` message and `license_denied_total{reason}`.
+
+3. **Heartbeat client** — `heartbeat_once(server, fp, raw, key) -> Refreshed | Denied | Unavailable`
+   (pure; wiremock-tested). `heartbeat_tick()` runs every 60s from a task in
+   `main.rs`: (a) re-reads `LICENSE_STORE_PATH` if its mtime/len changed and
+   adopts a valid newer document (multi-replica coherence, operator drop-in
+   without restart); (b) heartbeats when `now - issued_at ≥ 24h`
+   (`LICENSE_HEARTBEAT_INTERVAL_SECS` override), hourly retry after failure.
+   Grace = **72h from the signed `issued_at`** — the server re-signs the doc
+   with a fresh `issued_at` on every successful heartbeat, so there is no
+   editable "last seen" file. Only `402`/`403` are authoritative denials;
+   `401`, 5xx and transport errors keep the license inside grace.
+
+4. **Email-gated trial start** — `POST /v1/trial/start` requires `email`
+   (`validate_trial_email`, shared client/server); `licensee` = email; the
+   original lead email is kept on re-activation. Client: `LICENSE_TRIAL_EMAIL`
+   at boot, or admin-only **`POST /license/trial {email}`** (audited as
+   `license.trial_start`) + Settings → License form. `409` if a valid
+   commercial license is already active.
+
+5. **License server as a lib module** [`license_server.rs`](../apps/api/src/license_server.rs)
+   — `ServerConfig`, `AppState`, `open_db` (idempotent schema + `ensure_column`
+   migrations), `build_router`, `revoke` / `unrevoke`. New
+   `POST /v1/heartbeat`: verify signature with the public half of the signing
+   key, fingerprint binding, expiry (`402`), `revocations` table (`403`,
+   `licensee` or `*`), trial row authoritative for expiry, bump
+   `heartbeat_count` / `last_heartbeat_at`, re-sign with `issued_at = now`.
+   Errors use the API's `{error:{code,message}}` envelope. Bearer compare is
+   constant-time. The bin is thin and adds
+   `migration-license-server revoke|unrevoke --fingerprint …`.
+
+6. **Admin CLI** — `license-sign --require-heartbeat` (needs `--fingerprint`),
+   fingerprint hex validation, past-expiry rejection; `license-verify` prints
+   `requires_heartbeat`.
+
+7. **`GET /license`** — adds `heartbeat {required, status ∈ not_required|ok|degraded|grace_expired|revoked, last_attested_at, grace_until, last_error, server_configured}`,
+   `mode` values `revoked | grace_expired | fingerprint_mismatch`, `problem`,
+   `trial_available`, and `install_id_full` (admins only — vendors need it to
+   bind commercial licenses).
+
+8. **Settings UI** — heartbeat rows, red banners for revoked / grace expired,
+   admin "Start a 10-day trial" email form, full install ID with copy button.
+
+9. **Observability** — gauges `license_valid`,
+   `license_heartbeat_grace_seconds_remaining`; counter
+   `license_heartbeat_total{result=ok|denied|unavailable|unconfigured}`;
+   alerts `LicenseInvalid`, `LicenseHeartbeatFailing`,
+   `LicenseGraceExpiringSoon` in `infra/prometheus-alerts.yml`.
+
+10. **Infra/docs** — `LICENSE_TRIAL_EMAIL` in `.env.example`, compose, Helm
+    (`license.trialEmail`); `docs/install.md` (trial rules, heartbeat table,
+    commercial binding flow, revocation, smoke), `docs/api.md`.
+
+11. **Repo fix (pre-existing)** — `.gitignore` had a bare `bin/` rule that
+    swallowed `apps/api/src/bin/` (so `migration-admin` and
+    `migration-license-server` sources were never committed) and `*.pem`
+    hid `infra/license/license_public_key.pem`, which `license.rs`
+    `include_str!`s. A clean clone could not build the API crate. `bin/` is
+    now scoped to `/bin/` + `apps/orchestrator-go/bin/`, and only the public
+    verify key is un-ignored; `dev_license_signing_key.pem` stays ignored
+    (verified with `git check-ignore`). **Commit the three newly visible
+    files** with this change.
+
+**How to smoke-test P5.1** — see "Local smoke (developers)" in
+[`install.md`](install.md). Verified 2026-09-07 against the built binaries:
+401 wrong token → 400 `email_required` → trial issued with
+`requires_heartbeat` → `license-verify` OK → re-activation `reused=true` with
+original email → heartbeat advances `issued_at` → `revoke` → heartbeat `403`
+→ `unrevoke` → `200` → tampered file `400` → commercial
+`--require-heartbeat` heartbeat `200`.
+
+Unit tests: `security::license::tests` (validity/grace/fingerprint, due
+schedule + retry back-off, revocation precedence, email validation, wiremock
+heartbeat 200/403/401/wrong-key/conn-refused) and `license_server::tests`
+(schema migration idempotence, config validation, auth + email gate, reuse,
+per-fingerprint rate limit, expired trial, heartbeat refresh + counters,
+forged / mismatched / expired presentations, revoke + unrevoke + wildcard).
+
 ---
 
 ## Not done (follow-ups)
@@ -249,7 +349,7 @@ License shows kind, days left, and the short install ID.
 | Phase | Work |
 |-------|------|
 | **P4b** | S3 object-created events (push instead of poll) — explicitly deferred. Documented as the next arrival source after poll-based MinIO/S3 + SFTP. |
-| **P5.1** | Email-gated trials; commercial license bound to fingerprint; 24h heartbeat with 72h offline grace. |
+| **P5.1b** | E-mail verification of the trial contact (needs an outbound mail provider); clock roll-back detection for heartbeat grace; `heartbeat_tick()` integration test against a live store file (currently covered by pure-function + wiremock tests and the manual smoke). |
 | **P5.2** | Stripe / payment portal; per-SKU feature-flag gating. |
 | — | Local-folder source connector. |
 | — | Remote connector test for non-SFTP kinds (`watched_prefix`, Salesforce, custom) — API still rejects; UI messaging is accurate. |
@@ -271,3 +371,7 @@ cd apps/web && npx tsc --noEmit
 Integration pass (2026-08-07): `cargo check -p migration-api --all-targets`
 and `cd apps/web && npx tsc --noEmit` both clean. `go` is not installed here,
 so orchestrator build/tests were not re-run — run them before release.
+
+P5.1 pass (2026-09-07): `cargo test -p migration-api --lib --bins` 77 passed,
+`cargo clippy -p migration-api --all-targets` clean, `npx tsc --noEmit` clean,
+manual license-server smoke as described above. Go untouched by P5.1.

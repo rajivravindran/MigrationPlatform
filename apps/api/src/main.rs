@@ -21,6 +21,21 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics_handle = telemetry::init_metrics().context("initialising prometheus metrics")?;
 
+    // Heartbeat-required licenses are re-attested every 24h (72h offline
+    // grace); the same loop adopts a refreshed license store written by another
+    // replica or an operator. Runs on every replica; one small request per day.
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            security::license::HEARTBEAT_TICK_SECS,
+        ));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            // First tick completes immediately, so a stale store is re-attested at boot.
+            ticker.tick().await;
+            security::license::heartbeat_tick().await;
+        }
+    });
+
     let db_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(cfg.db_max_connections)
         .connect(&cfg.database_url)

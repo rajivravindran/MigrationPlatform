@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod job_source;
+pub mod license_server;
 pub mod middleware;
 pub mod routes;
 pub mod rule_template_types;

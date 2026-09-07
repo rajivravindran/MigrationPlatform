@@ -134,9 +134,17 @@ inference rules, and limits.
 
 ## License
 
-`GET /license` — status of the deployment license. The API validates
-`LICENSE_FILE` (RSA-signed JSON, see `migration-admin license-sign`) at
-startup; without one it runs in development mode unless `LICENSE_ENFORCE=true`.
+| Method | Path              | Role    | Notes |
+| ------ | ----------------- | ------- | ----- |
+| GET    | `/license`        | viewer+ | Status of the deployment license: `licensed`, `enforce`, `kind`, `licensee`, `expires_at`, `days_remaining`, short `fingerprint` (install ID), `mode` / `problem` when unlicensed (`expired`, `revoked`, `grace_expired`, `fingerprint_mismatch`, `unlicensed`, `development`), `trial_available`, and a `heartbeat` object (`required`, `status` ∈ `not_required|ok|degraded|grace_expired|revoked`, `last_attested_at`, `grace_until`, `last_error`). |
+| POST   | `/license/trial`  | admin   | `{ email }` → starts or resumes the 10-day phone-home trial for this install via `LICENSE_SERVER_URL` and activates it without a restart. Returns the same shape as `GET /license`. `400` bad email / server not configured, `409` when a valid commercial license is active, `502` when the license server refuses. Audited as `license.trial_start`. |
+
+The API validates `LICENSE_FILE` or the durable store (RSA-signed JSON, see
+`migration-admin license-sign`) at startup; without one it runs in development
+mode unless `LICENSE_ENFORCE=true`. Licenses with `requires_heartbeat` are
+re-attested with the license server every 24h and lapse 72h after the last
+signed attestation. Work-producing endpoints return `402 license_required`
+with the reason in the message when the gate closes.
 
 ## Dry-run
 

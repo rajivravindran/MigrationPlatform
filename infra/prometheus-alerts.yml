@@ -51,6 +51,32 @@ groups:
         annotations:
           summary: "Schedule missed runs detected"
 
+  - name: migration-platform-license
+    interval: 60s
+    rules:
+      - alert: LicenseInvalid
+        expr: min by (service) (license_valid) == 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Deployment license invalid on {{ $labels.service }}"
+          description: "Work-producing APIs return 402 under LICENSE_ENFORCE=true. Check Settings → License (expired / revoked / heartbeat grace exhausted)."
+
+      - alert: LicenseHeartbeatFailing
+        expr: increase(license_heartbeat_total{result!="ok"}[6h]) > 0 and increase(license_heartbeat_total{result="ok"}[6h]) == 0
+        for: 1h
+        labels: { severity: warn }
+        annotations:
+          summary: "License heartbeat has not succeeded for 6h"
+          description: "The API is running on offline grace (72h from the last attestation). Restore connectivity to LICENSE_SERVER_URL before license_heartbeat_grace_seconds_remaining reaches 0."
+
+      - alert: LicenseGraceExpiringSoon
+        expr: license_heartbeat_grace_seconds_remaining > 0 and license_heartbeat_grace_seconds_remaining < 12 * 3600
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "License offline grace ends in < 12h"
+
   - name: migration-platform-sandbox
     interval: 30s
     rules:

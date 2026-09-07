@@ -128,6 +128,9 @@ secrets:
 
 license:
   serverURL: ""
+  # Contact email used to auto-start the 10-day trial at boot when no license
+  # is present. Leave empty to require an admin to start it from Settings.
+  trialEmail: ""
   existingInstallationSecret: ""
   persistence:
     size: 1Gi

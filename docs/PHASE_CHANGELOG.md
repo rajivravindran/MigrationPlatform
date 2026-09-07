@@ -1,6 +1,6 @@
 # Phase changelog — Migration Platform roadmap
 
-**Last updated:** 2026-08-07
+**Last updated:** 2026-09-07
 
 Per-phase record of what changed, key files, how to test, what is NOT done, and
 locked product decisions. Companion to [`AGENT_HANDOFF.md`](AGENT_HANDOFF.md).
@@ -276,8 +276,7 @@ locked product decisions. Companion to [`AGENT_HANDOFF.md`](AGENT_HANDOFF.md).
   store and restart → same fingerprint reuses the original `expires_at`.
 
 **Not done / follow-ups**
-- **P5.1:** email-gated trials; commercial license bound to fingerprint; 24h
-  heartbeat with 72h offline grace.
+- **P5.1:** done — see below.
 - **P5.2:** Stripe / payment portal; per-SKU feature-flag gating.
 - Fully offline perpetual trial (intentionally out of scope — too easy to
   reset by wiping volumes).
@@ -290,3 +289,67 @@ locked product decisions. Companion to [`AGENT_HANDOFF.md`](AGENT_HANDOFF.md).
   images.
 - Enforcement blocks mutating APIs only (job/schedule create); the platform
   stays readable when unlicensed so operators can diagnose.
+
+---
+
+## P5.1 — Email-gated trials, fingerprint binding, heartbeat + offline grace
+
+**What changed**
+- `LicenseDoc.requires_heartbeat` (default `false`, omitted when false —
+  legacy and air-gapped licenses are byte-identical and unaffected).
+- Process license state moved from `OnceLock` to `RwLock<LicenseState>` so a
+  running API can adopt a trial, a refreshed heartbeat, or an operator's new
+  store file. Pure `validity()` yields a `LicenseProblem`
+  (`expired | fingerprint_mismatch | heartbeat_grace_expired | missing_issued_at | revoked`)
+  that drives the `402` message and `license_denied_total{reason}`.
+- Background task (60s tick): reload `LICENSE_STORE_PATH` when changed;
+  heartbeat every 24h (`LICENSE_HEARTBEAT_INTERVAL_SECS` override), hourly
+  retry. Grace is 72h from the **signed** `issued_at`; the server re-signs on
+  every heartbeat. Only `402`/`403` deny; `401`/5xx/transport keep grace.
+- Trials require a contact `email` (validated, stored as the lead record,
+  becomes `licensee`; original kept on re-activation). Started via
+  `LICENSE_TRIAL_EMAIL` at boot or admin `POST /license/trial` (audited).
+- License server extracted to `migration_api::license_server` (testable
+  router): `POST /v1/heartbeat`, `revocations` table, trial heartbeat
+  counters, idempotent SQLite migrations, constant-time token compare, JSON
+  error envelope. Bin gains `revoke` / `unrevoke` subcommands.
+- `migration-admin license-sign --require-heartbeat` (requires
+  `--fingerprint`); input validation for fingerprint hex and past expiry.
+- `GET /license` gains `heartbeat{…}`, new `mode`s, `problem`,
+  `trial_available`, and `install_id_full` (admins only). Settings UI shows
+  heartbeat state, revoked / grace banners, trial form, full install ID copy.
+- Metrics `license_valid`, `license_heartbeat_grace_seconds_remaining`,
+  `license_heartbeat_total{result}`; alerts `LicenseInvalid`,
+  `LicenseHeartbeatFailing`, `LicenseGraceExpiringSoon`.
+- `LICENSE_TRIAL_EMAIL` wired through `.env.example`, compose, Helm
+  (`license.trialEmail`).
+
+**Key files**
+- `apps/api/src/security/license.rs`, `apps/api/src/license_server.rs`,
+  `apps/api/src/bin/license_server.rs`, `apps/api/src/bin/admin.rs`,
+  `apps/api/src/routes/license.rs`, `apps/api/src/main.rs`,
+  `apps/web/app/settings/page.tsx`, `infra/prometheus-alerts.yml`,
+  `infra/docker-compose.yml`, `infra/k8s/helm/{values.yaml,templates/configmap.yaml}`,
+  `docs/install.md`, `docs/api.md`.
+
+**How to test**
+- `cargo test -p migration-api --lib` (license + license_server suites; the
+  heartbeat client is exercised against wiremock).
+- Manual: `docs/install.md` → "Local smoke (developers)" covers trial start,
+  heartbeat refresh, revoke → `403` → gate closes, unrevoke, and grace
+  behaviour with the license server stopped.
+
+**Not done / follow-ups**
+- E-mail verification of the trial contact (needs an outbound mail provider).
+- Clock roll-back detection on the customer host.
+- Integration test of `heartbeat_tick()` against a real store file.
+
+**Locked decisions**
+- Heartbeat is opt-in per license (`requires_heartbeat`); air-gapped
+  commercial files never phone home and therefore cannot be revoked remotely.
+- Grace baseline is the vendor-signed `issued_at`, never a local plain file.
+- Only explicit `402`/`403` from the license server deny; outages and
+  misconfiguration degrade, they do not revoke.
+- Trials are always heartbeat-required and always fingerprint-bound.
+- Enforcement remains customer-controlled (`LICENSE_ENFORCE`); P5.1 hardens
+  the licensed path, it does not attempt DRM.

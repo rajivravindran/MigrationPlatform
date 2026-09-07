@@ -14,5 +14,6 @@ data:
   LOG_LEVEL: {{ .Values.global.logLevel | quote }}
   DEPLOY_ENV: {{ .Values.global.environment | quote }}
   LICENSE_SERVER_URL: {{ .Values.license.serverURL | quote }}
+  LICENSE_TRIAL_EMAIL: {{ .Values.license.trialEmail | quote }}
   ORCHESTRATOR_BRIDGE_URL: "http://{{ include "mp.fullname" . }}-orchestrator:7070"
   API_INTERNAL_URL: "http://{{ include "mp.fullname" . }}-api:8080"
