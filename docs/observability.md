@@ -19,7 +19,8 @@ Collector config: `infra/otel-collector.yaml`. Prometheus scrape rules:
 
 ## Metrics
 
-Custom metrics exposed by every service on `/metrics`:
+Custom metrics exposed by every service on `/metrics` (port `9464` for all three
+services; the API keeps this off its public `8080` listener):
 
 | Service          | Metric                                                  | Type       |
 | ---------------- | ------------------------------------------------------- | ---------- |

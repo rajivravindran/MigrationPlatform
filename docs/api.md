@@ -156,7 +156,8 @@ UI designer's "Preview" pane.
 
 ## Observability
 
-- `GET /metrics` — Prometheus text format, includes custom metrics:
+- `GET /metrics` — served on the dedicated metrics listener (`METRICS_BIND`, default `:9464`),
+  not on the API port. Prometheus text format, includes custom metrics:
   - `migration_jobs_total{status}`
   - `migration_rows_processed_total{job_template}`
   - `migration_row_latency_seconds_bucket{phase}`

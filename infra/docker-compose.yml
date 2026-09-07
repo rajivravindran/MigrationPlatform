@@ -242,6 +242,10 @@ services:
     volumes:
       - ./secrets:/run/secrets:ro
       - license-data:/var/lib/migration
+    # Lets LICENSE_SERVER_URL=http://host.docker.internal:8090 reach a license
+    # server running on the host from a plain Linux engine (Desktop resolves it natively).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports: ["8080:8080", "9464:9464"]
     depends_on:
       migrate: { condition: service_completed_successfully }

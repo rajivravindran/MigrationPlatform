@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use migration_api::config::Config;
-use migration_api::{build_router, security, state, telemetry, temporal};
+use migration_api::{build_router, routes, security, state, telemetry, temporal};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -70,10 +70,23 @@ async fn main() -> anyhow::Result<()> {
         s3: minio,
         jwt: jwt_keys,
         master_key,
-        metrics_handle,
+        metrics_handle: metrics_handle.clone(),
     });
 
     let app = build_router(state);
+
+    // Prometheus scrape endpoint on its own port (compose, Prometheus and the
+    // Helm chart all target METRICS_BIND); kept off the public API listener.
+    let metrics_addr: SocketAddr = cfg.metrics_bind.parse().context("parsing METRICS_BIND")?;
+    let metrics_listener = TcpListener::bind(metrics_addr)
+        .await
+        .context("binding metrics port")?;
+    info!(addr = %metrics_addr, "metrics listening");
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(metrics_listener, routes::metrics::router(metrics_handle)).await {
+            tracing::error!(error = %e, "metrics server exited");
+        }
+    });
 
     let addr: SocketAddr = cfg.api_bind.parse().context("parsing API_BIND")?;
     let listener = TcpListener::bind(addr).await.context("binding api port")?;

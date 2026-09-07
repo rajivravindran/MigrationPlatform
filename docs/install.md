@@ -60,9 +60,14 @@ LICENSE_INSTALLATION_ID_PATH=/run/installation/installation-id
 
 - A contact email is required; the license server stores it as the lead
   record and it becomes the `licensee`. It is not verified by e-mail (follow-up).
-- The trial is keyed by the install fingerprint. Re-activating (new volume,
-  different email, reinstall) returns the **same** `expires_at`; an expired
-  fingerprint gets `402`.
+- The trial is keyed by the install fingerprint (`sha256` of the durable
+  `installation-id` file). Re-activating for the same install — different
+  email, deleted `license.json`, redeployed containers — returns the **same**
+  `expires_at`; an expired fingerprint gets `402`.
+- Limitation: wiping the license volume creates a new `installation-id`, hence a
+  new fingerprint and a fresh trial. Hostnames and machine IDs are deliberately
+  not mixed in (they change across replicas/restarts), so the deterrent for
+  serial trials is the email lead record on the vendor side, not the fingerprint.
 - Every trial carries `requires_heartbeat: true` (see below).
 
 ### Heartbeat and offline grace
@@ -75,7 +80,7 @@ background:
 | Interval | 24h (`LICENSE_HEARTBEAT_INTERVAL_SECS` overrides for tests only) |
 | Retry after failure | hourly |
 | Offline grace | 72h from the **signed** `issued_at` of the current license |
-| On `403 revoked` / `402 expired` from the server | work-producing APIs blocked immediately |
+| On `403 revoked` / `402 expired` from the server | work-producing APIs blocked immediately; the API keeps probing hourly so a vendor `unrevoke` self-heals without a restart |
 | On network error / 5xx / `401` | keep working inside grace; `heartbeat.status = degraded` |
 
 A successful heartbeat returns the same license re-signed with a fresh
@@ -126,8 +131,10 @@ migration-license-server unrevoke --fingerprint <hex>
 ```
 
 Without `--licensee` the revocation applies to every license for that install
-(`*`). Air-gapped licenses without `requires_heartbeat` cannot be revoked
-remotely — that is the trade-off of issuing them.
+(`*`). A revoked install is blocked at its next heartbeat and then keeps probing
+hourly, so after `unrevoke` it recovers on its own within an hour (or immediately
+on API restart). Air-gapped licenses without `requires_heartbeat` cannot be
+revoked remotely — that is the trade-off of issuing them.
 
 ## Environment reference
 

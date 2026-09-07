@@ -158,6 +158,20 @@ pub fn enforce_enabled() -> bool {
     *ENFORCE.get().unwrap_or(&false)
 }
 
+/// Boolean env flag accepting the usual spellings (`true`, `1`, `yes`, `on`,
+/// case-insensitive). Anything else — including unset — is `false`. A strict
+/// `== "true"` check would let `LICENSE_ENFORCE=1` silently disable enforcement.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Cloned snapshot of the current license state.
 pub fn snapshot() -> LicenseState {
     STATE.read().unwrap_or_else(|p| p.into_inner()).clone()
@@ -236,8 +250,16 @@ pub fn heartbeat_due(state: &LicenseState, now: DateTime<Utc>) -> bool {
     let Some(doc) = state.doc.as_ref() else {
         return false;
     };
-    if !doc.requires_heartbeat || state.revoked_reason.is_some() {
+    if !doc.requires_heartbeat {
         return false;
+    }
+    if state.revoked_reason.is_some() {
+        // Keep probing at the retry cadence so a vendor `unrevoke` self-heals
+        // without an API restart. The server's answer is authoritative either way.
+        return match state.last_heartbeat_attempt {
+            Some(last) => now - last >= HEARTBEAT_RETRY,
+            None => true,
+        };
     }
     let issued = match doc.issued_at {
         Some(t) => t,
@@ -245,10 +267,12 @@ pub fn heartbeat_due(state: &LicenseState, now: DateTime<Utc>) -> bool {
     };
     let interval = heartbeat_interval();
     if now - issued >= interval {
-        // Back off retries after a failure so a dead server is not hammered.
-        return match state.last_heartbeat_attempt {
-            Some(last) => now - last >= HEARTBEAT_RETRY,
-            None => true,
+        // Back off retries only after a *failed* attempt so a dead server is
+        // not hammered. A successful attempt refreshes `issued_at` and clears
+        // the error, so it must not delay the next regular heartbeat.
+        return match (state.last_heartbeat_attempt, &state.last_heartbeat_error) {
+            (Some(last), Some(_)) => now - last >= HEARTBEAT_RETRY,
+            _ => true,
         };
     }
     false
@@ -302,7 +326,7 @@ pub fn validate_trial_email(raw: &str) -> Result<String> {
 
 /// Validate / activate the deployment license. Call once from `main` before serving.
 pub async fn enforce_at_startup() -> Result<()> {
-    let enforce = std::env::var("LICENSE_ENFORCE").ok().as_deref() == Some("true");
+    let enforce = env_flag("LICENSE_ENFORCE");
     let _ = ENFORCE.set(enforce);
 
     let fp = install_fingerprint().context(
@@ -1097,14 +1121,23 @@ mod tests {
         state.doc = Some(d.clone());
         assert!(heartbeat_due(&state, now), "older than interval: due");
 
+        // A recent *successful* attempt (no error recorded) must not back off:
+        // the schedule is driven by `issued_at` alone.
         state.last_heartbeat_attempt = Some(now - Duration::minutes(10));
+        assert!(heartbeat_due(&state, now), "recent successful attempt: still due");
+
+        state.last_heartbeat_error = Some("license server unavailable".into());
         assert!(!heartbeat_due(&state, now), "recent failed attempt: back off");
 
         state.last_heartbeat_attempt = Some(now - Duration::hours(2));
         assert!(heartbeat_due(&state, now), "retry window elapsed: due again");
 
+        // Revoked: keep probing at the retry cadence so `unrevoke` self-heals.
         state.revoked_reason = Some("revoked".into());
-        assert!(!heartbeat_due(&state, now), "revoked: stop heartbeating");
+        state.last_heartbeat_attempt = Some(now - Duration::minutes(10));
+        assert!(!heartbeat_due(&state, now), "revoked + recent probe: back off");
+        state.last_heartbeat_attempt = Some(now - Duration::hours(2));
+        assert!(heartbeat_due(&state, now), "revoked + retry window elapsed: probe again");
     }
 
     #[test]

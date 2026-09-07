@@ -65,7 +65,7 @@ TID=$(curl -fsS -X POST "$API/rule-templates" \
       "options": {"header": true, "delimiter": ","}
     },
     "preprocess": [
-      {"id": "lc_country", "field": "country", "fn": "lowercase"}
+      {"id": "lc_country", "field": "country", "fn": "builtin.lowercase"}
     ],
     "mapping": {
       "payload": {

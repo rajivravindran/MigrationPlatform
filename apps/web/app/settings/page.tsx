@@ -329,8 +329,9 @@ export default function SettingsPage() {
             <div className="text-sm font-medium text-slate-800">Start a 10-day trial</div>
             <p className="mt-1 text-xs leading-5 text-slate-600">
               Admins only. The contact email is sent to the vendor license service together with this install ID; the
-              trial is bound to the install ID, so re-installing does not restart the clock. The API re-attests the
-              trial every 24 hours and keeps working for up to 72 hours if the license service is unreachable.
+              trial is bound to the install ID, so redeploying or re-activating does not restart the clock. The API
+              re-attests the trial every 24 hours and keeps working for up to 72 hours if the license service is
+              unreachable.
             </p>
             <div className="mt-3 flex flex-wrap items-end gap-3">
               <div className="min-w-[16rem] flex-1">

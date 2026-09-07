@@ -21,7 +21,6 @@ pub fn build_router(state: state::AppState) -> axum::Router {
 
     Router::new()
         .merge(routes::health::router())
-        .merge(routes::metrics::router())
         .merge(routes::auth::router())
         .merge(routes::templates::router())
         .merge(routes::files::router())

@@ -152,7 +152,7 @@ pub fn status_json(state: &LicenseState) -> Value {
             "fingerprint": short_fp,
             "heartbeat": heartbeat,
             "trial_available": server_configured && doc.kind != LicenseKind::Commercial,
-            "activation_hint": activation_hint(enforce, true, None, server_configured),
+            "activation_hint": activation_hint(enforce, Some(doc.kind), None, server_configured),
         }),
         Some(doc) => {
             let mode = match problem {
@@ -180,7 +180,7 @@ pub fn status_json(state: &LicenseState) -> Value {
                 "fingerprint": short_fp,
                 "heartbeat": heartbeat,
                 "trial_available": server_configured,
-                "activation_hint": activation_hint(enforce, false, problem, server_configured),
+                "activation_hint": activation_hint(enforce, None, problem, server_configured),
             })
         }
         None => json!({
@@ -190,22 +190,32 @@ pub fn status_json(state: &LicenseState) -> Value {
             "days_remaining": 0,
             "fingerprint": short_fp,
             "trial_available": server_configured,
-            "activation_hint": activation_hint(enforce, false, None, server_configured),
+            "activation_hint": activation_hint(enforce, None, None, server_configured),
         }),
     }
 }
 
+/// `licensed_kind` is `Some` when a valid license is active.
 fn activation_hint(
     enforce: bool,
-    licensed: bool,
+    licensed_kind: Option<LicenseKind>,
     problem: Option<LicenseProblem>,
     server_configured: bool,
 ) -> String {
-    if licensed {
-        return "To replace a trial with a commercial license, mount a vendor-signed file via \
-                LICENSE_FILE (or copy it to LICENSE_STORE_PATH); the API adopts a changed store \
-                file within a minute."
-            .into();
+    match licensed_kind {
+        Some(LicenseKind::Commercial) => {
+            return "Commercial license active. To renew or re-issue, mount the new vendor-signed \
+                    file via LICENSE_FILE (or copy it to LICENSE_STORE_PATH); the API adopts a \
+                    changed store file within a minute."
+                .into();
+        }
+        Some(LicenseKind::Trial) => {
+            return "To replace a trial with a commercial license, mount a vendor-signed file via \
+                    LICENSE_FILE (or copy it to LICENSE_STORE_PATH); the API adopts a changed store \
+                    file within a minute."
+                .into();
+        }
+        None => {}
     }
     match problem {
         Some(LicenseProblem::HeartbeatGraceExpired) => {
