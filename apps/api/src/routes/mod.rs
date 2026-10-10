@@ -10,5 +10,6 @@ pub mod llm;
 pub mod metrics;
 pub mod openapi;
 pub mod schedules;
+pub mod secrets;
 pub mod specs;
 pub mod templates;

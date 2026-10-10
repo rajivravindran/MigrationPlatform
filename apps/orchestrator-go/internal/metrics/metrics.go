@@ -48,10 +48,18 @@ var (
 		Name: "batch_dag_total",
 		Help: "Batch manifests materialized with dependency edges.",
 	})
+	JobsReconciled = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "jobs_reconciled_total",
+		Help: "Non-terminal jobs repaired because their workflow ended without finalizing them.",
+	}, []string{"workflow_status", "job_status"})
+	ReconcileErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "job_reconcile_errors_total",
+		Help: "Reconciler passes or job repairs that failed.",
+	})
 )
 
 func init() {
-	prometheus.MustRegister(RowsProcessed, RowsFailed, EndpointLatency, LicenseDenied, SFTPFailures, QuarantinedBatches, WatchLag, DAGBatches)
+	prometheus.MustRegister(RowsProcessed, RowsFailed, EndpointLatency, LicenseDenied, SFTPFailures, QuarantinedBatches, WatchLag, DAGBatches, JobsReconciled, ReconcileErrors)
 }
 
 func ServeHTTP(addr string) *http.Server {

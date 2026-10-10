@@ -47,13 +47,18 @@ type RetryRowRef struct {
 	// succeeded previously. Default (false) resumes at the first failed step
 	// so non-idempotent creates are not repeated.
 	FromStart bool `json:"fromStart,omitempty"`
+	// ConfirmNotApplied records that an operator checked the destination and
+	// found no effect from an unresolved operation, so it may be sent again.
+	ConfirmNotApplied bool `json:"confirmNotApplied,omitempty"`
 }
 
 // Result summarises the workflow outcome.
 type MigrationWorkflowResult struct {
 	Processed int64 `json:"processed"`
 	Failed    int64 `json:"failed"`
-	Cancelled bool  `json:"cancelled"`
+	// Unresolved rows stopped at an operation whose effect is unknown.
+	Unresolved int64 `json:"unresolved,omitempty"`
+	Cancelled  bool  `json:"cancelled"`
 }
 
 // MigrationWorkflow is the entrypoint workflow for a migration job. It loads
@@ -67,12 +72,31 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 
 	ao := defaultActivityOptions(nil)
 	ctx = workflow.WithActivityOptions(ctx, ao)
-	if err := requireLicensed(ctx); err != nil {
-		return nil, err
+	if in.RetryRow != nil {
+		if err := requireLicensed(ctx); err != nil {
+			return nil, err
+		}
+		return runSingleRowRetry(ctx, in)
 	}
 
-	if in.RetryRow != nil {
-		return runSingleRowRetry(ctx, in)
+	result, err := runMigration(ctx, in)
+	var continued *workflow.ContinueAsNewError
+	if errors.As(err, &continued) {
+		return nil, err
+	}
+	if err == nil {
+		log.Info("MigrationWorkflow done", "processed", result.Processed, "failed", result.Failed, "unresolved", result.Unresolved)
+	}
+	return result, finishJob(ctx, in.JobID, err)
+}
+
+// runMigration does the work of one run. It returns a ContinueAsNewError to
+// hand over, or the error that stopped the job; MigrationWorkflow records the
+// outcome either way.
+func runMigration(ctx workflow.Context, in MigrationWorkflowInput) (*MigrationWorkflowResult, error) {
+	log := workflow.GetLogger(ctx)
+	if err := requireLicensed(ctx); err != nil {
+		return nil, err
 	}
 
 	var tplOut activities.LoadTemplateOutput
@@ -110,7 +134,7 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 	if err != nil {
 		return nil, err
 	}
-	result := &MigrationWorkflowResult{Processed: cp.Processed, Failed: cp.Failed}
+	result := &MigrationWorkflowResult{Processed: cp.Processed, Failed: cp.Failed, Unresolved: cp.Unresolved}
 	const batchSize = 500
 	batchIdx := 0
 	pendingPolls := 0
@@ -186,20 +210,20 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 		}
 
 		for _, row := range rows {
-			if err := processOneRow(ctx, in.JobID, tplOut.Template, row, nil, result); err != nil {
+			if err := processOneRow(ctx, in.JobID, tplOut.Template, row, rowRun{}, result); err != nil {
 				return result, err
 			}
 		}
 
 		cp.Offset, cp.NextRowIndex = ingest.NewOffset, ingest.NewOffset.Items
-		cp.Processed, cp.Failed = result.Processed, result.Failed
+		cp.Processed, cp.Failed, cp.Unresolved = result.Processed, result.Failed, result.Unresolved
 		if cp.SourceVersion == "" {
 			cp.SourceVersion = ingest.SourceVersion
 		}
 
 		// Publish aggregate progress once per batch.
 		_ = workflow.ExecuteActivity(ctx, "PublishProgress", activities.PublishProgressInput{
-			JobID: in.JobID, Processed: result.Processed, Failed: result.Failed,
+			JobID: in.JobID, Processed: result.Processed, Failed: result.Failed + result.Unresolved,
 			Pending: 0, LastRow: cp.NextRowIndex,
 		}).Get(ctx, nil)
 
@@ -216,8 +240,6 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 		}
 	}
 
-	log.Info("MigrationWorkflow done", "processed", result.Processed, "failed", result.Failed)
-	finalizeAndExport(ctx, in.JobID, result.Cancelled)
 	return result, nil
 }
 
@@ -236,15 +258,6 @@ func continueMigrationAsNew(ctx workflow.Context, in MigrationWorkflowInput, cp 
 		next.RuleTemplateVersion = templateVersion
 	}
 	return workflow.NewContinueAsNewError(ctx, MigrationWorkflow, next)
-}
-
-func finalizeAndExport(ctx workflow.Context, jobID int64, cancelled bool) {
-	_ = workflow.ExecuteActivity(ctx, "FinalizeJob", activities.FinalizeJobInput{
-		JobID: jobID, Cancelled: cancelled,
-	}).Get(ctx, nil)
-	_ = workflow.ExecuteActivity(ctx, "ExportJobResults", activities.ExportJobResultsInput{
-		JobID: jobID,
-	}).Get(ctx, nil)
 }
 
 // preprocessRows runs the template's preprocess steps on the Python sandbox
@@ -278,40 +291,60 @@ func preprocessRows(ctx workflow.Context, tpl template.RuleTemplate, rows []conn
 
 // stepOutcome captures what happened to one step for row-level reporting.
 type stepOutcome struct {
-	failed   bool
-	err      string
-	payload  map[string]any
-	response json.RawMessage
+	failed bool
+	// unresolved: the step may have been applied; the chain stops (ADR 0003).
+	unresolved bool
+	err        string
+	payload    map[string]any
+	response   json.RawMessage
 }
 
-// processOneRow executes the template's step chain for one row.
+// rowRun says how a row is (re-)processed.
 //
 // resume, when non-nil, maps step names to persisted responses of previously
 // succeeded steps: those steps are skipped and their responses seeded into the
 // render context so `$fromResponse` bindings still resolve. This is how a
-// retry avoids re-firing non-idempotent earlier calls.
+// retry avoids re-firing non-idempotent earlier calls. resend re-applies
+// operations that already succeeded (a from-start retry); confirmNotApplied
+// lets an unresolved operation be sent.
+type rowRun struct {
+	resume            map[string]json.RawMessage
+	resend            bool
+	confirmNotApplied bool
+}
+
+// processOneRow executes the template's step chain for one row.
 func processOneRow(
 	ctx workflow.Context,
 	jobID int64,
 	tpl template.RuleTemplate,
 	row connectors.Row,
-	resume map[string]json.RawMessage,
+	run rowRun,
 	result *MigrationWorkflowResult,
 ) error {
 	steps := tpl.ExecutionSteps()
 	multiStep := len(steps) > 1
 	rctx := template.NewContext(row.Data)
+	attemptID := fmt.Sprintf("%s:%d", workflow.GetInfo(ctx).WorkflowExecution.RunID, row.Index)
 
 	var last stepOutcome
-	anyFailed := false
+	anyFailed, unresolved := false, false
 	for i, step := range steps {
-		if resume != nil {
-			if resp, ok := resume[step.Name]; ok {
+		if run.resume != nil {
+			if resp, ok := run.resume[step.Name]; ok {
 				rctx.AddResponseJSON(step.Name, resp)
 				continue
 			}
 		}
-		last = executeStep(ctx, jobID, row, i, step, multiStep, rctx)
+		var err error
+		last, err = executeStep(ctx, jobID, row, i, step, multiStep, rctx, run, attemptID)
+		if err != nil {
+			return err
+		}
+		if last.unresolved {
+			unresolved = true
+			break
+		}
 		if last.failed {
 			anyFailed = true
 			if !step.ContinuesOnFailure() {
@@ -321,26 +354,35 @@ func processOneRow(
 	}
 
 	status := "succeeded"
-	if anyFailed {
+	switch {
+	case unresolved:
+		status = "unresolved"
+		result.Unresolved++
+	case anyFailed:
 		status = "failed"
 		result.Failed++
-	} else {
+	default:
 		result.Processed++
 	}
 
 	persistIn := activities.PersistOutcomeInput{
 		JobID: jobID, RowIndex: row.Index, Status: status,
 		IdempotencyKey: activities.ComputeIdempotencyKey(jobID, row.Index, "row", row.Data),
+		AttemptID:      attemptID,
 		Row:            row.Data,
 		Payload:        last.payload,
 		Response:       last.response,
 		LastError:      last.err,
 	}
-	return workflow.ExecuteActivity(ctx, "PersistOutcome", persistIn).Get(ctx, nil)
+	if err := workflow.ExecuteActivity(ctx, "PersistOutcome", persistIn).Get(ctx, nil); err != nil {
+		return fmt.Errorf("persist row %d outcome: %w", row.Index, err)
+	}
+	return nil
 }
 
 // executeStep renders and fires one HTTP call of the chain, persisting the
-// step outcome when the template is multi-step.
+// step outcome when the template is multi-step. A returned error means the
+// outcome could not be recorded; the row must not continue.
 func executeStep(
 	ctx workflow.Context,
 	jobID int64,
@@ -349,11 +391,28 @@ func executeStep(
 	step template.Step,
 	multiStep bool,
 	rctx *template.Context,
-) stepOutcome {
+	run rowRun,
+	rowAttemptID string,
+) (stepOutcome, error) {
 	out := stepOutcome{}
-
-	fail := func(msg string, requestURL string, payload map[string]any, respStatus int, respBody json.RawMessage) stepOutcome {
-		out.failed = true
+	persistStep := func(status, requestURL string, payload map[string]any, respStatus int, respBody json.RawMessage, msg string) error {
+		if !multiStep {
+			return nil
+		}
+		err := workflow.ExecuteActivity(ctx, "PersistStepOutcome", activities.PersistStepOutcomeInput{
+			JobID: jobID, RowIndex: row.Index, StepIndex: stepIndex, StepName: step.Name,
+			Status: status, RequestURL: requestURL, Request: payload,
+			ResponseStatus: respStatus, Response: respBody, LastError: msg,
+			AttemptID: fmt.Sprintf("%s:%d", rowAttemptID, stepIndex),
+		}).Get(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("persist step %q outcome for row %d: %w", step.Name, row.Index, err)
+		}
+		return nil
+	}
+	stop := func(status, msg, requestURL string, payload map[string]any, respStatus int, respBody json.RawMessage) (stepOutcome, error) {
+		out.failed = status == "failed"
+		out.unresolved = status == "unresolved"
 		if multiStep {
 			out.err = fmt.Sprintf("step %q: %s", step.Name, msg)
 		} else {
@@ -361,69 +420,98 @@ func executeStep(
 		}
 		out.payload = payload
 		out.response = respBody
-		if multiStep {
-			_ = workflow.ExecuteActivity(ctx, "PersistStepOutcome", activities.PersistStepOutcomeInput{
-				JobID: jobID, RowIndex: row.Index, StepIndex: stepIndex, StepName: step.Name,
-				Status: "failed", RequestURL: requestURL, Request: payload,
-				ResponseStatus: respStatus, Response: respBody, LastError: msg,
-			}).Get(ctx, nil)
-		}
-		return out
+		return out, persistStep(status, requestURL, payload, respStatus, respBody, msg)
 	}
 
 	payload, err := renderStepPayload(ctx, step, rctx)
 	if err != nil {
 		// Render failures are deterministic for the row: no retry budget spent.
-		return fail(err.Error(), "", nil, 0, nil)
+		return stop("failed", err.Error(), "", nil, 0, nil)
 	}
 
 	rendered, err := template.RenderDestination(step.Destination, rctx)
 	if err != nil {
-		return fail(err.Error(), "", payload, 0, nil)
+		return stop("failed", err.Error(), "", payload, 0, nil)
 	}
 
-	idem := activities.ComputeIdempotencyKey(jobID, row.Index, step.Name, payload)
-	var call activities.CallEndpointOutput
-	callErr := workflow.ExecuteActivity(ctx, "CallEndpoint", activities.CallEndpointInput{
+	in := activities.CallEndpointInput{
 		JobID:             jobID,
 		RowIndex:          row.Index,
+		StepIndex:         stepIndex,
 		StepName:          step.Name,
 		Method:            step.Destination.Method,
 		URL:               rendered.URL,
 		Headers:           rendered.Headers,
 		Payload:           payload,
 		HasBody:           step.PayloadTemplate() != nil,
-		IdempotencyKey:    idem,
+		IdempotencyKey:    activities.ComputeIdempotencyKey(jobID, row.Index, step.Name, payload),
 		IdempotencyHeader: step.Destination.IdempotencyHeader,
-	}).Get(ctx, &call)
+		DeliveryMode:      step.Destination.EffectiveDeliveryMode(),
+		Resend:            run.resend,
+		ConfirmNotApplied: run.confirmNotApplied,
+	}
+	if d := step.Destination.Delivery; d != nil {
+		in.RetentionHours = d.RetentionHours()
+		if d.Lookup != nil {
+			lookup, err := template.RenderLookup(*d.Lookup, rctx)
+			if err != nil {
+				return stop("failed", "delivery.lookup: "+err.Error(), rendered.URL, payload, 0, nil)
+			}
+			in.Lookup = &activities.RenderedLookup{
+				Method: d.Lookup.Method, URL: lookup.URL, Headers: lookup.Headers, FoundPath: d.Lookup.FoundPath,
+			}
+		}
+	}
+	if a := step.Destination.Auth; a != nil {
+		in.Auth = &activities.DestinationAuth{Type: a.Type, SecretRef: a.SecretRef, HeaderName: a.HeaderName}
+	}
 
+	var call activities.CallEndpointOutput
+	callErr := workflow.ExecuteActivity(ctx, "CallEndpoint", in).Get(ctx, &call)
 	if callErr != nil {
 		msg := call.Error
 		if msg == "" {
 			msg = callErr.Error()
 		}
-		return fail(msg, rendered.URL, payload, call.Status, call.Body)
+		if effectMayExist(callErr) {
+			return stop("unresolved", msg, rendered.URL, payload, call.Status, call.Body)
+		}
+		return stop("failed", msg, rendered.URL, payload, call.Status, call.Body)
 	}
-	if !call.Succeeded {
+	switch {
+	case call.Outcome == activities.CallUnresolved:
+		return stop("unresolved", call.Error, rendered.URL, payload, call.Status, call.Body)
+	case !call.Succeeded:
 		msg := call.Error
 		if msg == "" {
 			msg = fmt.Sprintf("status %d", call.Status)
 		}
-		return fail(msg, rendered.URL, payload, call.Status, call.Body)
+		return stop("failed", msg, rendered.URL, payload, call.Status, call.Body)
 	}
 
-	if multiStep {
-		_ = workflow.ExecuteActivity(ctx, "PersistStepOutcome", activities.PersistStepOutcomeInput{
-			JobID: jobID, RowIndex: row.Index, StepIndex: stepIndex, StepName: step.Name,
-			Status: "succeeded", RequestURL: rendered.URL, Request: payload,
-			ResponseStatus: call.Status, Response: call.Body,
-		}).Get(ctx, nil)
+	if err := persistStep("succeeded", rendered.URL, payload, call.Status, call.Body, ""); err != nil {
+		return out, err
 	}
-
 	rctx.AddResponse(step.Name, []byte(call.Body))
 	out.payload = payload
 	out.response = call.Body
-	return out
+	return out, nil
+}
+
+// effectMayExist reports whether a failed CallEndpoint may still have been
+// applied by the destination: its last attempt saw an unknown outcome, could
+// not take the operation's lease, or timed out while possibly sending.
+func effectMayExist(err error) bool {
+	var appErr *temporal.ApplicationError
+	if errors.As(err, &appErr) {
+		switch appErr.Type() {
+		case activities.ErrTypeOutcomeUnknown, activities.ErrTypeOperationBusy:
+			return true
+		}
+		return false
+	}
+	var timeoutErr *temporal.TimeoutError
+	return errors.As(err, &timeoutErr)
 }
 
 // renderStepPayload renders a step's payload template: $from/$fromResponse/
@@ -493,14 +581,14 @@ func runSingleRowRetry(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 	ctx = workflow.WithActivityOptions(ctx, defaultActivityOptions(tplOut.Template.Retry))
 
 	result := &MigrationWorkflowResult{}
-	if err := retryPersistedRow(ctx, in.RetryRow.JobID, tplOut.Template, in.RetryRow.RowIndex, in.RetryRow.FromStart, result); err != nil {
+	if err := retryPersistedRow(ctx, in.RetryRow.JobID, tplOut.Template, in.RetryRow.RowIndex,
+		in.RetryRow.FromStart, in.RetryRow.ConfirmNotApplied, result); err != nil {
 		return result, err
 	}
 	_ = workflow.ExecuteActivity(ctx, "PublishProgress", activities.PublishProgressInput{
-		JobID: in.RetryRow.JobID, Processed: result.Processed, Failed: result.Failed,
+		JobID: in.RetryRow.JobID, Processed: result.Processed, Failed: result.Failed + result.Unresolved,
 	}).Get(ctx, nil)
-	finalizeAndExport(ctx, in.RetryRow.JobID, false)
-	return result, nil
+	return result, finishJob(ctx, in.RetryRow.JobID, nil)
 }
 
 // RetryFailedRowsInput drives RetryFailedRowsWorkflow.
@@ -559,13 +647,13 @@ func RetryFailedRowsWorkflow(ctx workflow.Context, in RetryFailedRowsInput) (*Mi
 		}
 		for _, rowIndex := range page.RowIndexes {
 			cursor = &rowIndex
-			if err := retryPersistedRow(ctx, in.JobID, tplOut.Template, rowIndex, in.FromStart, result); err != nil {
+			if err := retryPersistedRow(ctx, in.JobID, tplOut.Template, rowIndex, in.FromStart, false, result); err != nil {
 				return result, err
 			}
 			processedThisRun++
 		}
 		_ = workflow.ExecuteActivity(ctx, "PublishProgress", activities.PublishProgressInput{
-			JobID: in.JobID, Processed: result.Processed, Failed: result.Failed,
+			JobID: in.JobID, Processed: result.Processed, Failed: result.Failed + result.Unresolved,
 		}).Get(ctx, nil)
 
 		if page.Done {
@@ -577,8 +665,7 @@ func RetryFailedRowsWorkflow(ctx workflow.Context, in RetryFailedRowsInput) (*Mi
 			return nil, workflow.NewContinueAsNewError(ctx, RetryFailedRowsWorkflow, next)
 		}
 	}
-	finalizeAndExport(ctx, in.JobID, false)
-	return result, nil
+	return result, finishJob(ctx, in.JobID, nil)
 }
 
 // retryPersistedRow re-runs one row from its persisted state (shared by the
@@ -588,7 +675,7 @@ func retryPersistedRow(
 	jobID int64,
 	tpl template.RuleTemplate,
 	rowIndex int64,
-	fromStart bool,
+	fromStart, confirmNotApplied bool,
 	result *MigrationWorkflowResult,
 ) error {
 	var state activities.LoadRowStateOutput
@@ -607,17 +694,17 @@ func retryPersistedRow(
 		result.Failed++
 		return nil
 	}
-	var resume map[string]json.RawMessage
+	run := rowRun{resend: fromStart, confirmNotApplied: confirmNotApplied}
 	if !fromStart {
-		resume = map[string]json.RawMessage{}
+		run.resume = map[string]json.RawMessage{}
 		for _, s := range state.Steps {
 			if s.Status == "succeeded" {
-				resume[s.StepName] = s.Response
+				run.resume[s.StepName] = s.Response
 			}
 		}
 	}
 	row := connectors.Row{Index: rowIndex, Data: state.Row}
-	return processOneRow(ctx, jobID, tpl, row, resume, result)
+	return processOneRow(ctx, jobID, tpl, row, run, result)
 }
 
 // ProcessShardWorkflow lets large jobs run several MigrationWorkflow shards in

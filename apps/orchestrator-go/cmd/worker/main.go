@@ -20,6 +20,7 @@ import (
 	"github.com/migration-platform/orchestrator/internal/config"
 	"github.com/migration-platform/orchestrator/internal/connectors"
 	"github.com/migration-platform/orchestrator/internal/db"
+	"github.com/migration-platform/orchestrator/internal/lifecycle"
 	"github.com/migration-platform/orchestrator/internal/metrics"
 	"github.com/migration-platform/orchestrator/internal/redisbus"
 	"github.com/migration-platform/orchestrator/internal/security"
@@ -103,6 +104,7 @@ func main() {
 	w.RegisterWorkflow(workflows.RetryFailedRowsWorkflow)
 	w.RegisterWorkflow(workflows.WatchPrefixWorkflow)
 	w.RegisterWorkflow(workflows.BatchWorkflow)
+	w.RegisterWorkflow(workflows.ExportResultsWorkflow)
 
 	w.RegisterActivityWithOptions(acts.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	w.RegisterActivityWithOptions(acts.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
@@ -131,6 +133,8 @@ func main() {
 	w.RegisterActivityWithOptions(acts.PublishProgress, activities.RegisterOptions("PublishProgress"))
 	w.RegisterActivityWithOptions(acts.FinalizeJob, activities.RegisterOptions("FinalizeJob"))
 	w.RegisterActivityWithOptions(acts.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
+	w.RegisterActivityWithOptions(acts.RecordExportStarted, activities.RegisterOptions("RecordExportStarted"))
+	w.RegisterActivityWithOptions(acts.RecordExportFailure, activities.RegisterOptions("RecordExportFailure"))
 
 	// Internal Temporal bridge for the Rust API (start/signal/cancel/schedules).
 	bridgeSrv := &http.Server{
@@ -150,6 +154,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	reconciler := &lifecycle.Reconciler{
+		DB: pg, Temporal: c, Interval: cfg.ReconcileInterval, StaleAfter: cfg.ReconcileStaleAfter,
+		Log: logger.With("component", "job-reconciler"),
+	}
+	go reconciler.Run(ctx)
 
 	go func() {
 		<-ctx.Done()

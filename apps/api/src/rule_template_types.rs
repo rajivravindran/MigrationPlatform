@@ -69,7 +69,7 @@ pub struct PreprocessStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum AuthType {
     Bearer,
     Basic,
@@ -142,6 +142,56 @@ pub struct Destination {
         rename = "idempotencyHeader"
     )]
     pub idempotency_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Delivery>,
+}
+
+/// What the platform may do when a call's outcome is unknown (ADR 0003).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeliveryMode {
+    Idempotent,
+    Lookup,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Delivery {
+    pub mode: DeliveryMode,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "idempotencyRetentionHours"
+    )]
+    pub idempotency_retention_hours: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup: Option<Lookup>,
+}
+
+/// A read that finds an already-applied effect by business key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Lookup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    pub url: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "pathParams"
+    )]
+    pub path_params: Option<std::collections::BTreeMap<String, Value>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "queryParams"
+    )]
+    pub query_params: Option<std::collections::BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, Value>>,
+    #[serde(rename = "foundPath")]
+    pub found_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

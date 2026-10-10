@@ -36,18 +36,19 @@ type Checkpoint struct {
 	NextRowIndex int64 `json:"nextRowIndex"`
 	Processed    int64 `json:"processed"`
 	Failed       int64 `json:"failed"`
+	Unresolved   int64 `json:"unresolved,omitempty"`
 }
 
 func (c Checkpoint) validate() error {
 	switch {
 	case c.Version != checkpointVersion:
 		return fmt.Errorf("checkpoint version %d is not supported (want %d)", c.Version, checkpointVersion)
-	case c.NextRowIndex < 0 || c.Processed < 0 || c.Failed < 0:
+	case c.NextRowIndex < 0 || c.Processed < 0 || c.Failed < 0 || c.Unresolved < 0:
 		return fmt.Errorf("checkpoint has negative position or totals: %+v", c)
 	case c.Offset.Items != c.NextRowIndex:
 		return fmt.Errorf("checkpoint offset is at row %d but next row index is %d", c.Offset.Items, c.NextRowIndex)
-	case c.Processed+c.Failed > c.NextRowIndex:
-		return fmt.Errorf("checkpoint counts %d outcomes for %d rows", c.Processed+c.Failed, c.NextRowIndex)
+	case c.Processed+c.Failed+c.Unresolved > c.NextRowIndex:
+		return fmt.Errorf("checkpoint counts %d outcomes for %d rows", c.Processed+c.Failed+c.Unresolved, c.NextRowIndex)
 	}
 	return nil
 }

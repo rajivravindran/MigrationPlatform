@@ -27,6 +27,7 @@ pub fn build_router(state: state::AppState) -> axum::Router {
         .merge(routes::files::router())
         .merge(routes::connectors::router())
         .merge(routes::jobs::router())
+        .merge(routes::secrets::router())
         .merge(routes::batches::router())
         .merge(routes::schedules::router())
         .merge(routes::dry_run::router())

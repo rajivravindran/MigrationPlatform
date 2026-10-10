@@ -9,6 +9,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	enums "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 )
 
@@ -106,12 +108,30 @@ func (s *Server) startWorkflow(w http.ResponseWriter, r *http.Request) {
 		ID:                    req.WorkflowID,
 		TaskQueue:             req.TaskQueue,
 		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+		// A running workflow with this ID is a conflict, not the caller's run.
+		WorkflowExecutionErrorWhenAlreadyStarted: true,
 	}, req.WorkflowType, req.Input)
+	var running *serviceerror.WorkflowExecutionAlreadyStarted
+	if errors.As(err, &running) {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, "workflow "+req.WorkflowID+" is already running"), http.StatusConflict)
+		return
+	}
 	if err != nil {
 		serverError(w, err)
 		return
 	}
 	writeJSON(w, map[string]string{"workflowId": run.GetID(), "runId": run.GetRunID()})
+}
+
+// workflowError reports a workflow that does not exist (never started, or
+// closed past retention) as 404 so callers can tell it from a bridge failure.
+func workflowError(w http.ResponseWriter, workflowID string, err error) {
+	var notFound *serviceerror.NotFound
+	if errors.As(err, &notFound) {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, "workflow "+workflowID+" not found"), http.StatusNotFound)
+		return
+	}
+	serverError(w, err)
 }
 
 type signalRequest struct {
@@ -129,7 +149,7 @@ func (s *Server) signalWorkflow(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	if err := s.temporal.SignalWorkflow(ctx, req.WorkflowID, "", req.Signal, req.Payload); err != nil {
-		serverError(w, err)
+		workflowError(w, req.WorkflowID, err)
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})
@@ -148,7 +168,7 @@ func (s *Server) cancelWorkflow(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	if err := s.temporal.CancelWorkflow(ctx, req.WorkflowID, ""); err != nil {
-		serverError(w, err)
+		workflowError(w, req.WorkflowID, err)
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})

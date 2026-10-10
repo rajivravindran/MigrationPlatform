@@ -320,9 +320,9 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 				if item.st.OnFailure != "continue" {
 					stopEarly = true
 				}
-			} else if childResult.Failed > 0 || childResult.Cancelled {
+			} else if childResult.Failed > 0 || childResult.Unresolved > 0 || childResult.Cancelled {
 				stageStatus = "failed"
-				stageErr = fmt.Sprintf("job finished with failed=%d cancelled=%v", childResult.Failed, childResult.Cancelled)
+				stageErr = fmt.Sprintf("job finished with failed=%d unresolved=%d cancelled=%v", childResult.Failed, childResult.Unresolved, childResult.Cancelled)
 				result.StagesFailed++
 				status[item.st.StageKey] = batch.StageFailed
 				if item.st.OnFailure != "continue" {
@@ -449,9 +449,9 @@ func runOneStage(ctx workflow.Context, in BatchWorkflowInput, st activities.Reso
 		}
 		return false, st.OnFailure != "continue", nil
 	}
-	if childResult.Failed > 0 || childResult.Cancelled {
+	if childResult.Failed > 0 || childResult.Unresolved > 0 || childResult.Cancelled {
 		stageStatus = "failed"
-		stageErr = fmt.Sprintf("job finished with failed=%d cancelled=%v", childResult.Failed, childResult.Cancelled)
+		stageErr = fmt.Sprintf("job finished with failed=%d unresolved=%d cancelled=%v", childResult.Failed, childResult.Unresolved, childResult.Cancelled)
 		result.StagesFailed++
 		if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
 			StageRowID: st.StageRowID, JobID: started.JobID, Status: stageStatus, Error: stageErr,

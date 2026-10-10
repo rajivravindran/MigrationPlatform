@@ -14,7 +14,7 @@ import { formatBytes, sourceSummary, type JobSource } from "@/lib/job-source";
 type Job = {
   id: number;
   status: "pending" | "running" | "paused" | "succeeded" | "failed" | "cancelled";
-  totals_json: { processed?: number; failed?: number; total?: number };
+  totals_json: { processed?: number; failed?: number; unresolved?: number; total?: number };
   rule_template_id: number;
   started_at?: string;
   finished_at?: string;
@@ -22,11 +22,14 @@ type Job = {
   source?: JobSource;
   source_ref?: JobSource;
   results_ref?: { key?: string; failed_key?: string; rows?: number; failed_rows?: number } | null;
+  last_error?: string | null;
+  export_status?: "pending" | "succeeded" | "failed" | null;
+  export_error?: string | null;
 };
 
 type JobRow = {
   row_index: number;
-  status: "pending" | "running" | "succeeded" | "failed" | "skipped";
+  status: "pending" | "running" | "succeeded" | "failed" | "unresolved" | "skipped";
   attempts: number;
   last_error?: string | null;
   payload_json?: unknown;
@@ -49,8 +52,16 @@ type JobRowStep = {
 function tone(s: string) {
   if (s === "succeeded") return "ok";
   if (s === "failed") return "fail";
-  if (s === "paused") return "warn";
+  if (s === "paused" || s === "unresolved") return "warn";
   return "neutral";
+}
+
+const UNRESOLVED_CONFIRM =
+  "The destination may already have applied this row: the last call's outcome is unknown and the destination " +
+  "has no deduplication or lookup policy. Check the destination first. Send it again only if the record is NOT there.";
+
+function confirmNotApplied(rowIndex: number) {
+  return window.confirm(`Row #${rowIndex}: ${UNRESOLVED_CONFIRM}\n\nI checked and it was not applied. Retry now?`);
 }
 
 /** HTTP status from CallEndpoint last_error ("status 404: …" / "retryable 503: …"). */
@@ -212,11 +223,16 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
     onSuccess: () => { toast.success("Retrying failed rows"); client.invalidateQueries({ queryKey: ["job-rows", params.id] }); },
     onError: (err) => toast.error(err instanceof Error ? err.message : String(err))
   });
+  const retryExport = useMutation({
+    mutationFn: () => apiFetch(`/jobs/${params.id}/export`, { method: "POST" }),
+    onSuccess: () => { toast.success("Export restarted"); client.invalidateQueries({ queryKey: ["job", params.id] }); },
+    onError: (err) => toast.error(err instanceof Error ? err.message : String(err))
+  });
   const retryOne = useMutation({
-    mutationFn: ({ rowIndex, fromStart }: { rowIndex: number; fromStart?: boolean }) =>
+    mutationFn: ({ rowIndex, fromStart, confirmNotApplied }: { rowIndex: number; fromStart?: boolean; confirmNotApplied?: boolean }) =>
       apiFetch(`/jobs/${params.id}/rows/${rowIndex}/retry`, {
         method: "POST",
-        body: JSON.stringify({ from_start: fromStart ?? false })
+        body: JSON.stringify({ from_start: fromStart ?? false, confirm_not_applied: confirmNotApplied ?? false })
       }),
     onSuccess: (_res, vars) => {
       toast.success(`Row #${vars.rowIndex} queued for retry${vars.fromStart ? " (from start)" : ""}`);
@@ -232,9 +248,12 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
   const job = jobQ.data;
 
   const processed = live?.processed ?? job.totals_json.processed ?? 0;
-  const failed = live?.failed ?? job.totals_json.failed ?? 0;
-  const total = job.totals_json.total ?? processed + failed;
-  const pct = total ? Math.min(100, Math.round(((processed + failed) / total) * 100)) : 0;
+  const unresolved = job.totals_json.unresolved ?? 0;
+  // Live progress reports failed and unresolved rows together.
+  const notSucceeded = live?.failed ?? (job.totals_json.failed ?? 0) + unresolved;
+  const failed = Math.max(0, notSucceeded - unresolved);
+  const total = job.totals_json.total ?? processed + notSucceeded;
+  const pct = total ? Math.min(100, Math.round(((processed + notSucceeded) / total) * 100)) : 0;
   const selected = selectedRow !== null ? items.find((r) => r.row_index === selectedRow) : undefined;
   const source = sourceSummary(job);
 
@@ -249,7 +268,7 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
           <span data-testid="job-status"><StatusBadge status={job.status} /></span>
           <Button variant="ghost" onClick={() => pause.mutate()} disabled={job.status !== "running"}>Pause</Button>
           <Button variant="ghost" onClick={() => resume.mutate()} disabled={job.status !== "paused"}>Resume</Button>
-          <Button variant="danger" onClick={() => window.confirm("Cancel this job? In-flight work may finish, but no new rows will start.") && cancel.mutate()} disabled={!["running", "paused"].includes(job.status)}>Cancel job</Button>
+          <Button variant="danger" onClick={() => window.confirm("Cancel this job? In-flight work may finish, but no new rows will start.") && cancel.mutate()} disabled={!["pending", "running", "paused"].includes(job.status)}>Cancel job</Button>
           <Button onClick={() => retryAll.mutate()} disabled={failed === 0}>Retry failed</Button>
           {["succeeded", "failed", "cancelled"].includes(job.status) ? (
             <>
@@ -263,7 +282,7 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
               >
                 Download results
               </Button>
-              {failed > 0 ? (
+              {notSucceeded > 0 ? (
                 <Button
                   variant="secondary"
                   onClick={() => {
@@ -275,11 +294,39 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
                   Download failures
                 </Button>
               ) : null}
+              {job.export_status === "failed" ? (
+                <Button variant="secondary" onClick={() => retryExport.mutate()} disabled={retryExport.isPending}>
+                  Retry export
+                </Button>
+              ) : null}
             </>
           ) : null}
           </>
         }
       />
+
+      {job.last_error ? (
+        <Card className="border-rose-200 bg-rose-50 text-sm text-rose-800" data-testid="job-error">
+          <div className="font-medium">The job stopped before every source record was processed</div>
+          <div className="mt-1 whitespace-pre-wrap break-words text-xs">{job.last_error}</div>
+          <div className="mt-1 text-xs text-rose-700">
+            Retrying rows cannot cover records that were never read; start a new job once the cause is fixed.
+          </div>
+        </Card>
+      ) : null}
+      {job.export_status === "failed" || job.export_status === "pending" ? (
+        <Card className="border-amber-200 bg-amber-50 text-sm text-amber-900" data-testid="job-export-status">
+          <div className="font-medium">
+            {job.export_status === "pending" ? "Exporting results…" : "The results export failed; the migration outcome is unaffected"}
+          </div>
+          {job.export_error ? <div className="mt-1 whitespace-pre-wrap break-words text-xs">{job.export_error}</div> : null}
+          {job.export_status === "failed" ? (
+            <div className="mt-1 text-xs">
+              Downloads still work from the database. Retry export rebuilds the files without contacting the destination.
+            </div>
+          ) : null}
+        </Card>
+      ) : null}
 
       <Card className="text-sm" data-testid="job-source">
         <dl className="grid gap-2 sm:grid-cols-2">
@@ -333,11 +380,14 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
 
       <Card>
         <div className="mb-2 flex items-center justify-between text-sm">
-          <span>{processed} processed · {failed} failed · {total} total</span>
+          <span>
+            {processed} processed · {failed} failed
+            {unresolved > 0 ? <span className="text-amber-700"> · {unresolved} unresolved</span> : null} · {total} total
+          </span>
           <span>{pct}%</span>
         </div>
         <div className="h-2 w-full rounded bg-slate-200" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-label="Job progress">
-          <div className={`h-2 rounded ${failed ? "bg-rose-500" : "bg-brand-600"}`} style={{ width: `${pct}%` }} />
+          <div className={`h-2 rounded ${notSucceeded ? "bg-rose-500" : "bg-brand-600"}`} style={{ width: `${pct}%` }} />
         </div>
       </Card>
 
@@ -394,6 +444,18 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
                         Retry
                       </Button>
                     ) : null}
+                    {r.status === "unresolved" ? (
+                      <Button
+                        variant="ghost"
+                        title={UNRESOLVED_CONFIRM}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (confirmNotApplied(r.row_index)) retryOne.mutate({ rowIndex: r.row_index, confirmNotApplied: true });
+                        }}
+                      >
+                        Confirm &amp; retry
+                      </Button>
+                    ) : null}
                   </div>
                 </div>
               );
@@ -421,9 +483,23 @@ export default function JobDetailPage({ params }: { params: { id: string } }) {
                   </Button>
                 </>
               ) : null}
+              {selected?.status === "unresolved" ? (
+                <Button
+                  variant="ghost"
+                  title={UNRESOLVED_CONFIRM}
+                  onClick={() => confirmNotApplied(selectedRow) && retryOne.mutate({ rowIndex: selectedRow, confirmNotApplied: true })}
+                >
+                  Not applied — retry
+                </Button>
+              ) : null}
               <Button variant="ghost" onClick={() => setSelectedRow(null)}>Close</Button>
             </div>
           </div>
+          {selected?.status === "unresolved" ? (
+            <p className="mb-2 rounded bg-amber-50 p-2 text-sm text-amber-800" data-testid="unresolved-explainer">
+              Unresolved: {UNRESOLVED_CONFIRM}
+            </p>
+          ) : null}
           {selected ? (
             <RowOutcome jobId={params.id} row={selected} />
           ) : (

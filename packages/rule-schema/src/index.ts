@@ -47,12 +47,33 @@ export const DestinationSchema = z.object({
   auth: z
     .object({
       type: z.enum(["bearer", "basic", "api_key", "oauth2_client"]),
-      secretRef: z.string().optional(),
+      secretRef: z
+        .string()
+        .regex(/^[A-Za-z0-9_.-]{1,128}$/)
+        .optional(),
       headerName: z.string().optional()
     })
     .optional(),
   idempotencyKey: z.any().optional(),
-  idempotencyHeader: z.string().optional()
+  idempotencyHeader: z.string().optional(),
+  delivery: z
+    .object({
+      mode: z.enum(["idempotent", "lookup", "manual"]),
+      idempotencyRetentionHours: z.number().int().min(1).max(8760).optional(),
+      lookup: z
+        .object({
+          method: z.literal("GET").optional(),
+          url: z.string().min(1),
+          pathParams: z.record(ValueExprSchema).optional(),
+          queryParams: z.record(ValueExprSchema).optional(),
+          headers: z.record(ValueExprSchema).optional(),
+          foundPath: z.string().startsWith("$")
+        })
+        .strict()
+        .optional()
+    })
+    .strict()
+    .optional()
 });
 
 export const MappingSchema = z.object({ payload: z.record(z.any()) });

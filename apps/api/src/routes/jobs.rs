@@ -24,6 +24,7 @@ use crate::middleware::auth::{require_role, AuthUser};
 use crate::security::audit::record_audit;
 use crate::sources;
 use crate::state::AppState;
+use crate::temporal::{WorkflowAlreadyRunning, WorkflowNotFound};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -37,13 +38,14 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id/rows/:row_index/retry", post(retry_row))
         .route("/jobs/:id/retry-failed", post(retry_all_failed))
         .route("/jobs/:id/results", get(download_results))
+        .route("/jobs/:id/export", post(retry_export))
         .route("/jobs/:id/stream", get(stream_updates))
 }
 
 /// Columns on `jobs` that map to [`JobRow`], including batch provenance.
-const JOB_COLS: &str = "id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at, batch_id, batch_stage_id, results_ref";
+const JOB_COLS: &str = "id, org_id, rule_template_id, rule_template_version, schedule_id, source_ref, status::text AS status, totals_json, temporal_workflow_id, temporal_run_id, started_at, paused_at, finished_at, created_by, created_at, updated_at, batch_id, batch_stage_id, results_ref, last_error, export_status, export_error";
 
-const JOB_JOIN_COLS: &str = "j.id, j.org_id, j.rule_template_id, j.rule_template_version, j.schedule_id, j.source_ref, j.status::text AS status, j.totals_json, j.temporal_workflow_id, j.temporal_run_id, j.started_at, j.paused_at, j.finished_at, j.created_by, j.created_at, j.updated_at, j.batch_id, j.batch_stage_id, j.results_ref, b.source_ref AS batch_source_ref, s.stage_key AS batch_stage_key, s.file_path AS batch_stage_file";
+const JOB_JOIN_COLS: &str = "j.id, j.org_id, j.rule_template_id, j.rule_template_version, j.schedule_id, j.source_ref, j.status::text AS status, j.totals_json, j.temporal_workflow_id, j.temporal_run_id, j.started_at, j.paused_at, j.finished_at, j.created_by, j.created_at, j.updated_at, j.batch_id, j.batch_stage_id, j.results_ref, j.last_error, j.export_status, j.export_error, b.source_ref AS batch_source_ref, s.stage_key AS batch_stage_key, s.file_path AS batch_stage_file";
 
 #[derive(sqlx::FromRow)]
 struct JobJoinRow {
@@ -111,40 +113,21 @@ async fn create_job(
     .fetch_one(&state.db)
     .await?;
 
-    let start = state
-        .temporal
-        .start_migration_workflow(
-            &workflow_id,
-            &json!({
-                "orgId": claims.org,
-                "jobId": row.id,
-                "ruleTemplateId": req.rule_template_id,
-                "ruleTemplateVersion": tpl_version,
-                "sourceRef": source_ref,
-            }),
-        )
-        .await;
-
-    let run_id = match start {
-        Ok(run_id) => run_id,
-        Err(e) => {
-            sqlx::query("UPDATE jobs SET status = 'failed'::job_status, finished_at = now(), updated_at = now() WHERE id = $1")
-                .bind(row.id)
-                .execute(&state.db)
-                .await?;
-            return Err(ApiError::External(format!("temporal: {e}")));
-        }
-    };
-
-    row = sqlx::query_as(&format!(
-        "UPDATE jobs SET status = 'running'::job_status, temporal_run_id = $1, started_at = now(), updated_at = now()
-         WHERE id = $2
-         RETURNING {JOB_COLS}"
-    ))
-    .bind(&run_id)
-    .bind(row.id)
-    .fetch_one(&state.db)
-    .await?;
+    let input = json!({
+        "orgId": claims.org,
+        "jobId": row.id,
+        "ruleTemplateId": req.rule_template_id,
+        "ruleTemplateVersion": tpl_version,
+        "sourceRef": source_ref,
+    });
+    // Starting the workflow and recording it run on a detached task: if the
+    // client disconnects, dropping this handler midway would leave a pending
+    // job whose workflow may or may not exist.
+    let task_state = state.clone();
+    let job_id = row.id;
+    row = tokio::spawn(async move { start_job(&task_state, job_id, &workflow_id, &input).await })
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("job start task: {e}")))??;
 
     record_audit(
         &state.db,
@@ -160,6 +143,63 @@ async fn create_job(
     metrics::counter!("jobs_created_total").increment(1);
 
     Ok(Json(row))
+}
+
+/// Starts the workflow for a pending job and records the run. Transitions
+/// are conditional on `pending`: a fast workflow may already have finalized
+/// the job, and that terminal state must not be overwritten.
+async fn start_job(
+    state: &AppState,
+    job_id: i64,
+    workflow_id: &str,
+    input: &Value,
+) -> ApiResult<JobRow> {
+    let run_id = match state
+        .temporal
+        .start_migration_workflow(workflow_id, input)
+        .await
+    {
+        Ok(run_id) => run_id,
+        Err(e) if !start_never_reached_bridge(&e) => {
+            // The start may have happened (timeout, lost response). The job
+            // stays pending; the reconciler settles it from Temporal's view.
+            tracing::warn!(job_id, workflow_id, error = %e, "workflow start outcome unknown");
+            return Err(ApiError::External(format!(
+                "temporal: {e}; job {job_id} will be reconciled"
+            )));
+        }
+        Err(e) => {
+            let message = format!("workflow start failed: {e}");
+            sqlx::query(
+                "UPDATE jobs SET status = 'failed'::job_status, last_error = $2,
+                   finished_at = now(), updated_at = now()
+                 WHERE id = $1 AND status = 'pending'::job_status",
+            )
+            .bind(job_id)
+            .bind(&message)
+            .execute(&state.db)
+            .await?;
+            return Err(ApiError::External(format!("temporal: {e}")));
+        }
+    };
+
+    Ok(sqlx::query_as(&format!(
+        "UPDATE jobs SET
+           status = CASE WHEN status = 'pending'::job_status THEN 'running'::job_status ELSE status END,
+           temporal_run_id = $1, started_at = COALESCE(started_at, now()), updated_at = now()
+         WHERE id = $2
+         RETURNING {JOB_COLS}"
+    ))
+    .bind(&run_id)
+    .bind(job_id)
+    .fetch_one(&state.db)
+    .await?)
+}
+
+/// True when the bridge refused the connection, so no workflow can exist.
+fn start_never_reached_bridge(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_connect)
 }
 
 #[derive(Deserialize)]
@@ -242,15 +282,19 @@ async fn download_results(
     Path(id): Path<i64>,
     Query(q): Query<ResultsQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    let row: Option<(Option<Value>,)> =
-        sqlx::query_as("SELECT results_ref FROM jobs WHERE id = $1 AND org_id = $2")
+    let row: Option<(Option<Value>, Option<String>)> =
+        sqlx::query_as("SELECT results_ref, export_status FROM jobs WHERE id = $1 AND org_id = $2")
             .bind(id)
             .bind(claims.org)
             .fetch_optional(&state.db)
             .await?;
-    let Some((results_ref,)) = row else {
+    let Some((results_ref, export_status)) = row else {
         return Err(ApiError::NotFound);
     };
+    // Exported files are current only while the latest export succeeded
+    // (NULL: exported before export_status existed). Otherwise read rows.
+    let results_ref =
+        results_ref.filter(|_| export_status.as_deref().map_or(true, |s| s == "succeeded"));
 
     let filename = if q.failed {
         format!("job-{id}-results-failed.csv")
@@ -321,7 +365,8 @@ async fn stream_results_from_db(
     let rows: Vec<(i64, String, Option<String>)> = if failed_only {
         sqlx::query_as(
             "SELECT row_index, status::text, last_error FROM job_rows
-             WHERE job_id = $1 AND status = 'failed'::row_status ORDER BY row_index",
+             WHERE job_id = $1 AND status IN ('failed'::row_status, 'unresolved'::row_status)
+             ORDER BY row_index",
         )
         .bind(job_id)
         .fetch_all(&state.db)
@@ -346,6 +391,54 @@ async fn stream_results_from_db(
         .map_err(|e| ApiError::External(e.to_string()))
 }
 
+/// The job states an operator action may start from.
+const PAUSABLE: &[&str] = &["running"];
+const RESUMABLE: &[&str] = &["paused"];
+const CANCELLABLE: &[&str] = &["pending", "running", "paused"];
+
+/// Loads the job's workflow id and refuses the action unless the job is in
+/// one of `from`.
+async fn action_target(
+    state: &AppState,
+    org: i64,
+    id: i64,
+    action: &str,
+    from: &[&str],
+) -> ApiResult<Option<String>> {
+    let row: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT temporal_workflow_id, status::text FROM jobs WHERE id = $1 AND org_id = $2",
+    )
+    .bind(id)
+    .bind(org)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((workflow_id, status)) = row else {
+        return Err(ApiError::NotFound);
+    };
+    if !from.contains(&status.as_str()) {
+        return Err(ApiError::Conflict(format!(
+            "job {id} is {status}; cannot {action} it"
+        )));
+    }
+    Ok(workflow_id)
+}
+
+/// The job moved on (usually finished) between the check and the update.
+async fn transition_lost(state: &AppState, org: i64, id: i64, action: &str) -> ApiError {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status::text FROM jobs WHERE id = $1 AND org_id = $2")
+            .bind(id)
+            .bind(org)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    ApiError::Conflict(format!(
+        "job {id} became {} before it could {action}",
+        status.as_deref().unwrap_or("unavailable")
+    ))
+}
+
 async fn signal_and_record(
     state: &AppState,
     claims: &crate::security::Claims,
@@ -353,36 +446,41 @@ async fn signal_and_record(
     signal_name: &str,
     new_status: &str,
     action: &str,
+    from: &[&str],
 ) -> ApiResult<JobRow> {
-    let workflow_id: Option<String> =
-        sqlx::query_scalar("SELECT temporal_workflow_id FROM jobs WHERE id = $1 AND org_id = $2")
-            .bind(id)
-            .bind(claims.org)
-            .fetch_optional(&state.db)
-            .await?
-            .flatten();
-
-    let Some(workflow_id) = workflow_id else {
+    let Some(workflow_id) = action_target(state, claims.org, id, action, from).await? else {
         return Err(ApiError::NotFound);
     };
 
-    state
+    if let Err(e) = state
         .temporal
         .signal_workflow(&workflow_id, signal_name, &json!({}))
         .await
-        .map_err(|e| ApiError::External(format!("temporal: {e}")))?;
+    {
+        return Err(match e.downcast_ref::<WorkflowNotFound>() {
+            Some(_) => ApiError::Conflict(format!(
+                "job {id}'s workflow has ended; it will be reconciled"
+            )),
+            None => ApiError::External(format!("temporal: {e}")),
+        });
+    }
 
-    let row: JobRow = sqlx::query_as(&format!(
+    let from: Vec<String> = from.iter().map(|s| s.to_string()).collect();
+    let row: Option<JobRow> = sqlx::query_as(&format!(
         "UPDATE jobs SET status = $1::job_status, updated_at = now(),
            paused_at = CASE WHEN $1 = 'paused' THEN now() ELSE paused_at END
-         WHERE id = $2 AND org_id = $3
+         WHERE id = $2 AND org_id = $3 AND status::text = ANY($4)
          RETURNING {JOB_COLS}"
     ))
     .bind(new_status)
     .bind(id)
     .bind(claims.org)
-    .fetch_one(&state.db)
+    .bind(&from)
+    .fetch_optional(&state.db)
     .await?;
+    let Some(row) = row else {
+        return Err(transition_lost(state, claims.org, id, action).await);
+    };
 
     record_audit(
         &state.db,
@@ -405,7 +503,7 @@ async fn pause_job(
 ) -> ApiResult<Json<JobRow>> {
     require_role(&c, &["admin", "editor", "operator"])?;
     Ok(Json(
-        signal_and_record(&s, &c, id, "pause", "paused", "pause").await?,
+        signal_and_record(&s, &c, id, "pause", "paused", "pause", PAUSABLE).await?,
     ))
 }
 
@@ -417,38 +515,51 @@ async fn resume_job(
     require_role(&c, &["admin", "editor", "operator"])?;
     crate::security::license::require_licensed()?;
     Ok(Json(
-        signal_and_record(&s, &c, id, "resume", "running", "resume").await?,
+        signal_and_record(&s, &c, id, "resume", "running", "resume", RESUMABLE).await?,
     ))
 }
 
+/// Cancels a non-terminal job. When the workflow no longer exists (it never
+/// started, or ended without finalizing) nothing is running, so the job is
+/// cancelled directly instead of failing the request.
 async fn cancel_job(
     State(s): State<AppState>,
     AuthUser(c): AuthUser,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<JobRow>> {
     require_role(&c, &["admin", "editor", "operator"])?;
-    let workflow_id: Option<String> =
-        sqlx::query_scalar("SELECT temporal_workflow_id FROM jobs WHERE id = $1 AND org_id = $2")
-            .bind(id)
-            .bind(c.org)
-            .fetch_optional(&s.db)
-            .await?
-            .flatten();
+    let workflow_id = action_target(&s, c.org, id, "cancel", CANCELLABLE).await?;
+    let mut workflow_found = workflow_id.is_some();
     if let Some(wid) = workflow_id {
-        s.temporal
-            .cancel_workflow(&wid)
-            .await
-            .map_err(|e| ApiError::External(format!("temporal: {e}")))?;
+        if let Err(e) = s.temporal.cancel_workflow(&wid).await {
+            if e.downcast_ref::<WorkflowNotFound>().is_none() {
+                return Err(ApiError::External(format!("temporal: {e}")));
+            }
+            workflow_found = false;
+        }
     }
-    let row: JobRow = sqlx::query_as(&format!(
-        "UPDATE jobs SET status = 'cancelled'::job_status, finished_at = now(), updated_at = now()
+    let row: Option<JobRow> = sqlx::query_as(&format!(
+        "UPDATE jobs SET status = 'cancelled'::job_status, finished_at = now(), updated_at = now(),
+           totals_json = (
+             SELECT jsonb_build_object(
+               'processed', count(*) FILTER (WHERE status = 'succeeded'::row_status),
+               'failed', count(*) FILTER (WHERE status = 'failed'::row_status),
+               'unresolved', count(*) FILTER (WHERE status = 'unresolved'::row_status),
+               'total', count(*))
+             FROM job_rows WHERE job_id = $1)
          WHERE id = $1 AND org_id = $2
+           AND status IN ('pending'::job_status, 'running'::job_status, 'paused'::job_status)
          RETURNING {JOB_COLS}"
     ))
     .bind(id)
     .bind(c.org)
-    .fetch_one(&s.db)
+    .fetch_optional(&s.db)
     .await?;
+    let Some(row) = row else {
+        return Err(transition_lost(&s, c.org, id, "cancel").await);
+    };
+    let mut after = serde_json::to_value(&row)?;
+    after["workflow_found"] = json!(workflow_found);
     record_audit(
         &s.db,
         c.org,
@@ -457,10 +568,69 @@ async fn cancel_job(
         Some(id.to_string()),
         "cancel",
         None,
-        Some(&serde_json::to_value(&row)?),
+        Some(&after),
     )
     .await?;
     Ok(Json(row))
+}
+
+fn export_workflow_id(job_workflow_id: &str) -> String {
+    format!("{job_workflow_id}-export")
+}
+
+/// Re-runs only the results export of a finished job. The export workflow
+/// reads job_rows and uploads files; it makes no destination calls.
+async fn retry_export(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    require_role(&claims, &["admin", "editor", "operator"])?;
+    let row: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT temporal_workflow_id, status::text FROM jobs WHERE id = $1 AND org_id = $2",
+    )
+    .bind(id)
+    .bind(claims.org)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((Some(job_workflow_id), status)) = row else {
+        return Err(ApiError::NotFound);
+    };
+    if CANCELLABLE.contains(&status.as_str()) {
+        return Err(ApiError::Conflict(format!(
+            "job {id} is {status}; its results are exported when it finishes"
+        )));
+    }
+
+    let workflow_id = export_workflow_id(&job_workflow_id);
+    let start = state
+        .temporal
+        .start_workflow(&workflow_id, "ExportResultsWorkflow", &json!({"jobId": id}))
+        .await;
+    if let Err(e) = start {
+        if e.downcast_ref::<WorkflowAlreadyRunning>().is_some() {
+            return Err(ApiError::Conflict(format!(
+                "an export of job {id} is already running"
+            )));
+        }
+        return Err(ApiError::External(format!("temporal: {e}")));
+    }
+
+    record_audit(
+        &state.db,
+        claims.org,
+        &claims.sub,
+        "job",
+        Some(id.to_string()),
+        "retry_export",
+        None,
+        Some(&json!({"workflow_id": workflow_id})),
+    )
+    .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"job_id": id, "workflow_id": workflow_id})),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -555,21 +725,54 @@ pub struct RetryOptions {
     /// Re-run the whole step chain even if earlier steps succeeded.
     #[serde(default)]
     pub from_start: bool,
+    /// The operator checked the destination and found no effect from the
+    /// row's unresolved operation, so it may be sent again (ADR 0003).
+    #[serde(default)]
+    pub confirm_not_applied: bool,
 }
 
-/// Fetch (workflow_id, rule_template_id, rule_template_version) for an owned job.
-async fn job_dispatch_info(state: &AppState, org: i64, id: i64) -> ApiResult<(String, i64, i32)> {
-    let row: Option<(Option<String>, i64, i32)> = sqlx::query_as(
-        "SELECT temporal_workflow_id, rule_template_id, rule_template_version FROM jobs WHERE id = $1 AND org_id = $2",
+struct RetryTarget {
+    workflow_id: String,
+    rule_template_id: i64,
+    rule_template_version: i32,
+}
+
+/// Load an owned job that may be retried. Retries of one job share one
+/// workflow ID, so a second retry while one runs is refused by Temporal; a
+/// job that is still running is refused here.
+async fn retry_target(state: &AppState, org: i64, id: i64) -> ApiResult<RetryTarget> {
+    let row: Option<(Option<String>, i64, i32, String)> = sqlx::query_as(
+        "SELECT temporal_workflow_id, rule_template_id, rule_template_version, status::text
+         FROM jobs WHERE id = $1 AND org_id = $2",
     )
     .bind(id)
     .bind(org)
     .fetch_optional(&state.db)
     .await?;
-    let Some((Some(workflow_id), tpl_id, tpl_version)) = row else {
+    let Some((Some(workflow_id), rule_template_id, rule_template_version, status)) = row else {
         return Err(ApiError::NotFound);
     };
-    Ok((workflow_id, tpl_id, tpl_version))
+    if matches!(status.as_str(), "pending" | "running" | "paused") {
+        return Err(ApiError::Conflict(format!(
+            "job {id} is {status}; retry rows after it finishes"
+        )));
+    }
+    Ok(RetryTarget {
+        workflow_id,
+        rule_template_id,
+        rule_template_version,
+    })
+}
+
+fn retry_workflow_id(job_workflow_id: &str) -> String {
+    format!("{job_workflow_id}-retry")
+}
+
+fn start_error(e: anyhow::Error) -> ApiError {
+    match e.downcast_ref::<WorkflowAlreadyRunning>() {
+        Some(_) => ApiError::Conflict("a retry of this job is already running".into()),
+        None => ApiError::External(format!("temporal: {e}")),
+    }
 }
 
 async fn retry_row(
@@ -581,41 +784,44 @@ async fn retry_row(
     require_role(&claims, &["admin", "editor", "operator"])?;
     crate::security::license::require_licensed()?;
     let opts = body.map(|Json(b)| b).unwrap_or_default();
-    let (workflow_id, tpl_id, tpl_version) = job_dispatch_info(&state, claims.org, id).await?;
+    let target = retry_target(&state, claims.org, id).await?;
 
-    let retry_id = format!(
-        "{}-retry-{}-{}",
-        workflow_id,
-        row_index,
-        uuid::Uuid::new_v4().simple()
-    );
+    let row_status: Option<String> = sqlx::query_scalar(
+        "SELECT status::text FROM job_rows WHERE job_id = $1 AND row_index = $2",
+    )
+    .bind(id)
+    .bind(row_index)
+    .fetch_optional(&state.db)
+    .await?;
+    if row_status.as_deref() == Some("unresolved") && !opts.confirm_not_applied {
+        return Err(ApiError::Conflict(format!(
+            "row {row_index} is unresolved: the destination may already have applied it. \
+             Check the destination, then retry with confirm_not_applied=true if it did not"
+        )));
+    }
+
+    // The row keeps its status until the retry persists a new outcome.
     state
         .temporal
         .start_workflow(
-            &retry_id,
+            &retry_workflow_id(&target.workflow_id),
             "RetryRowWorkflow",
             &json!({
                 "orgId": claims.org,
                 "jobId": id,
-                "ruleTemplateId": tpl_id,
-                "ruleTemplateVersion": tpl_version,
+                "ruleTemplateId": target.rule_template_id,
+                "ruleTemplateVersion": target.rule_template_version,
                 "sourceRef": {},
-                "retryRow": {"jobId": id, "rowIndex": row_index, "fromStart": opts.from_start},
+                "retryRow": {
+                    "jobId": id,
+                    "rowIndex": row_index,
+                    "fromStart": opts.from_start,
+                    "confirmNotApplied": opts.confirm_not_applied,
+                },
             }),
         )
         .await
-        .map_err(|e| ApiError::External(format!("temporal: {e}")))?;
-
-    // Attempts are incremented by the orchestrator when the retry actually
-    // persists an outcome; here we only flag the row as queued again.
-    sqlx::query(
-        "UPDATE job_rows SET status = 'pending'::row_status, last_error = NULL, updated_at = now()
-         WHERE job_id = $1 AND row_index = $2",
-    )
-    .bind(id)
-    .bind(row_index)
-    .execute(&state.db)
-    .await?;
+        .map_err(start_error)?;
 
     record_audit(
         &state.db,
@@ -624,15 +830,24 @@ async fn retry_row(
         "job_row",
         Some(format!("{id}:{row_index}")),
         "retry",
-        None,
-        None,
+        row_status.map(|s| json!({"status": s})).as_ref(),
+        Some(&json!({
+            "from_start": opts.from_start,
+            "confirm_not_applied": opts.confirm_not_applied,
+        })),
     )
     .await?;
-    Ok(Json(
-        json!({"job_id": id, "row_index": row_index, "queued": true, "from_start": opts.from_start}),
-    ))
+    Ok(Json(json!({
+        "job_id": id,
+        "row_index": row_index,
+        "queued": true,
+        "from_start": opts.from_start,
+        "confirm_not_applied": opts.confirm_not_applied,
+    })))
 }
 
+/// Retries `failed` rows. `unresolved` rows are excluded: each needs an
+/// operator decision through the single-row retry.
 async fn retry_all_failed(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
@@ -642,7 +857,12 @@ async fn retry_all_failed(
     require_role(&claims, &["admin", "editor", "operator"])?;
     crate::security::license::require_licensed()?;
     let opts = body.map(|Json(b)| b).unwrap_or_default();
-    let (workflow_id, tpl_id, tpl_version) = job_dispatch_info(&state, claims.org, id).await?;
+    if opts.confirm_not_applied {
+        return Err(ApiError::BadRequest(
+            "confirm_not_applied is decided per row; use the single-row retry".into(),
+        ));
+    }
+    let target = retry_target(&state, claims.org, id).await?;
 
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM job_rows WHERE job_id = $1 AND status = 'failed'::row_status",
@@ -656,26 +876,21 @@ async fn retry_all_failed(
 
     // The retry workflow enumerates failed rows itself (paged) and re-runs
     // each from persisted state, resuming at the first failed step.
-    let retry_wf_id = format!(
-        "{}-retryfailed-{}",
-        workflow_id,
-        uuid::Uuid::new_v4().simple()
-    );
     state
         .temporal
         .start_workflow(
-            &retry_wf_id,
+            &retry_workflow_id(&target.workflow_id),
             "RetryFailedRowsWorkflow",
             &json!({
                 "orgId": claims.org,
                 "jobId": id,
-                "ruleTemplateId": tpl_id,
-                "ruleTemplateVersion": tpl_version,
+                "ruleTemplateId": target.rule_template_id,
+                "ruleTemplateVersion": target.rule_template_version,
                 "fromStart": opts.from_start,
             }),
         )
         .await
-        .map_err(|e| ApiError::External(format!("temporal: {e}")))?;
+        .map_err(start_error)?;
 
     record_audit(
         &state.db,
@@ -685,7 +900,7 @@ async fn retry_all_failed(
         Some(id.to_string()),
         "retry_all_failed",
         None,
-        None,
+        Some(&json!({"from_start": opts.from_start, "rows": n})),
     )
     .await?;
     Ok(Json(json!({"job_id": id, "retried": n})))

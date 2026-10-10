@@ -64,6 +64,11 @@ pub struct JobRow {
     pub batch_id: Option<i64>,
     pub batch_stage_id: Option<i64>,
     pub results_ref: Option<serde_json::Value>,
+    /// Execution failure outside any row (ingest, license, termination).
+    pub last_error: Option<String>,
+    /// Results export state, separate from the migration outcome.
+    pub export_status: Option<String>,
+    pub export_error: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]

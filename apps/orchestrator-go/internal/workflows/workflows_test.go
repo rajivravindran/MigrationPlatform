@@ -62,8 +62,7 @@ func registerStub(env *testsuite.TestWorkflowEnvironment, stub interface {
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
-	env.RegisterActivityWithOptions(stub.FinalizeJob, activities.RegisterOptions("FinalizeJob"))
-	env.RegisterActivityWithOptions(stub.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
+	registerJobFinish(env)
 }
 
 type stubActivitiesFailing struct{ stubActivities }
@@ -120,6 +119,7 @@ func TestRetryRowWorkflowUsesPersistedRowData(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
+	registerJobFinish(env)
 
 	env.ExecuteWorkflow(RetryRowWorkflow, MigrationWorkflowInput{
 		OrgID: 1, JobID: 2, RuleTemplateID: 3, RuleTemplateVersion: 1,
@@ -205,6 +205,7 @@ func TestMigrationWorkflowRendersTemplatedDestinationPerRow(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
+	registerJobFinish(env)
 
 	env.ExecuteWorkflow(MigrationWorkflow, MigrationWorkflowInput{
 		OrgID: 1, JobID: 2, RuleTemplateID: 3, RuleTemplateVersion: 1,
@@ -241,6 +242,7 @@ func TestMigrationWorkflowFailsRowOnUnresolvedPathParam(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
+	registerJobFinish(env)
 
 	env.ExecuteWorkflow(MigrationWorkflow, MigrationWorkflowInput{
 		OrgID: 1, JobID: 2, RuleTemplateID: 3, RuleTemplateVersion: 1,
@@ -317,6 +319,7 @@ func TestMigrationWorkflowExecutesChainPerRow(t *testing.T) {
 	env.RegisterActivityWithOptions(persistStep, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
+	registerJobFinish(env)
 
 	env.ExecuteWorkflow(MigrationWorkflow, MigrationWorkflowInput{
 		OrgID: 1, JobID: 2, RuleTemplateID: 3, RuleTemplateVersion: 1,
@@ -375,6 +378,7 @@ func TestMigrationWorkflowChainStopsAtFailedStep(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
+	registerJobFinish(env)
 
 	env.ExecuteWorkflow(MigrationWorkflow, MigrationWorkflowInput{
 		OrgID: 1, JobID: 2, RuleTemplateID: 3, RuleTemplateVersion: 1,
@@ -445,8 +449,7 @@ func TestMigrationWorkflowChainContinuesOnFailure(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
-	env.RegisterActivityWithOptions(stub.FinalizeJob, activities.RegisterOptions("FinalizeJob"))
-	env.RegisterActivityWithOptions(stub.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
+	registerJobFinish(env)
 
 	env.ExecuteWorkflow(MigrationWorkflow, MigrationWorkflowInput{
 		OrgID: 1, JobID: 2, RuleTemplateID: 3, RuleTemplateVersion: 1,
@@ -491,6 +494,7 @@ func TestRetryRowResumesAtFailedStep(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
+	registerJobFinish(env)
 
 	env.ExecuteWorkflow(RetryRowWorkflow, MigrationWorkflowInput{
 		OrgID: 1, JobID: 2, RuleTemplateID: 3, RuleTemplateVersion: 1,
@@ -569,6 +573,7 @@ func TestMigrationWorkflowHappyPath(t *testing.T) {
 	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
+	registerJobFinish(env)
 
 	env.ExecuteWorkflow(MigrationWorkflow, MigrationWorkflowInput{
 		OrgID: 1, JobID: 2, RuleTemplateID: 3, RuleTemplateVersion: 1,

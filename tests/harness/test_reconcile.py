@@ -24,15 +24,17 @@ def receipt(key: str, tenant: str = "org-a") -> dict:
     return {"id": f"r-{key}-{tenant}", "external_id": key, "tenant": tenant}
 
 
-def run(rows, receipts, *, job_status="succeeded", totals=None, expect_failed=(), ambiguous=(), all_receipts=None):
+def run(rows, receipts, *, job_status="succeeded", totals=None, expect_failed=(), ambiguous=(), all_receipts=None,
+        unresolved=()):
     if totals is None:
         totals = {"processed": sum(r["status"] == "succeeded" for r in rows),
-                  "failed": sum(r["status"] == "failed" for r in rows), "total": len(rows)}
+                  "failed": sum(r["status"] == "failed" for r in rows),
+                  "unresolved": sum(r["status"] == "unresolved" for r in rows), "total": len(rows)}
     return harness.reconcile(
         tenant="org-a", source=SOURCE, rows=rows, receipts=receipts,
         all_receipts=receipts if all_receipts is None else all_receipts,
         job={"status": job_status, "totals_json": totals},
-        expect_failed=set(expect_failed), expect_ambiguous=set(ambiguous),
+        expect_failed=set(expect_failed), expect_ambiguous=set(ambiguous), expect_unresolved=set(unresolved),
     )
 
 
@@ -103,6 +105,30 @@ class ReconcileTest(unittest.TestCase):
         rows = [row(0, "K0", "succeeded"), row(1, "K1", "succeeded"), row(2, "K2", "succeeded")]
         rec = run(rows, [receipt("K1"), receipt("K2")], ambiguous={"K0"})
         self.assertIn("dispositions match expectations and destination receipts", failed_checks(rec))
+
+    def test_unresolved_rows_allow_at_most_one_effect_and_fail_the_job(self):
+        for effects in (0, 1):
+            rows = [row(0, "K0", "unresolved"), row(1, "K1", "succeeded"), row(2, "K2", "succeeded")]
+            receipts = [receipt("K0")] * effects + [receipt("K1"), receipt("K2")]
+            rec = run(rows, receipts, job_status="failed", unresolved={"K0"})
+            self.assertTrue(rec.passed, (effects, failed_checks(rec)))
+        rows = [row(0, "K0", "unresolved"), row(1, "K1", "succeeded"), row(2, "K2", "succeeded")]
+        rec = run(rows, [receipt("K0"), receipt("K0"), receipt("K1"), receipt("K2")], job_status="failed",
+                  unresolved={"K0"})
+        self.assertIn("dispositions match expectations and destination receipts", failed_checks(rec))
+        rec = run(rows, [receipt("K1"), receipt("K2")], job_status="succeeded", unresolved={"K0"})
+        self.assertIn("job terminal status agrees with row outcomes", failed_checks(rec))
+
+    def test_expected_unresolved_row_reported_succeeded_fails(self):
+        rows = [row(0, "K0", "succeeded"), row(1, "K1", "succeeded"), row(2, "K2", "succeeded")]
+        rec = run(rows, [receipt(k["external_id"]) for k in SOURCE], unresolved={"K0"})
+        self.assertIn("dispositions match expectations and destination receipts", failed_checks(rec))
+
+    def test_unresolved_totals_must_match(self):
+        rows = [row(0, "K0", "unresolved"), row(1, "K1", "succeeded"), row(2, "K2", "succeeded")]
+        rec = run(rows, [receipt("K1"), receipt("K2")], job_status="failed", unresolved={"K0"},
+                  totals={"processed": 2, "failed": 0, "total": 3})
+        self.assertIn("job totals agree with persisted rows and source", failed_checks(rec))
 
     def test_attempt_sequence_requires_the_injected_fault(self):
         def attempt(seq, status, key="idem-1", ext="K0"):

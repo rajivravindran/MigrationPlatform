@@ -159,8 +159,7 @@ func registerPaged(env *testsuite.TestWorkflowEnvironment, src *pagedSource,
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
-	env.RegisterActivityWithOptions(stub.FinalizeJob, activities.RegisterOptions("FinalizeJob"))
-	env.RegisterActivityWithOptions(stub.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
+	registerJobFinish(env)
 }
 
 func continuedInput(t *testing.T, env *testsuite.TestWorkflowEnvironment) MigrationWorkflowInput {

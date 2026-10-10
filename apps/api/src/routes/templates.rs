@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::db::RuleTemplateRow;
 use crate::error::{ApiError, ApiResult};
 use crate::middleware::auth::{require_role, AuthUser};
-use crate::rule_template_types::RuleTemplate;
+use crate::rule_template_types::{AuthType, DeliveryMode, RuleTemplate};
 use crate::security::audit::record_audit;
 use crate::state::AppState;
 
@@ -53,7 +53,49 @@ pub(crate) fn validate_template(body: &Value) -> ApiResult<RuleTemplate> {
     let tpl: RuleTemplate = serde_json::from_value(body.clone())
         .map_err(|e| ApiError::ValidationFailed(format!("shape: {e}")))?;
     validate_step_references(&tpl)?;
+    validate_destinations(&tpl)?;
     Ok(tpl)
+}
+
+/// Rules for what the runtime can execute safely: auth it can resolve and a
+/// delivery policy that is complete (ADR 0003).
+fn validate_destinations(tpl: &RuleTemplate) -> ApiResult<()> {
+    for step in tpl.execution_steps() {
+        let d = &step.destination;
+        let fail = |msg: &str| {
+            Err(ApiError::ValidationFailed(format!(
+                "step {:?}: {msg}",
+                step.name
+            )))
+        };
+        if let Some(auth) = &d.auth {
+            if auth.auth_type == AuthType::Oauth2Client {
+                return fail(
+                    "auth type oauth2_client is not supported yet; use bearer, basic or api_key",
+                );
+            }
+            if auth.secret_ref.as_deref().unwrap_or("").is_empty() {
+                return fail("auth requires secretRef naming a destination secret");
+            }
+        }
+        if let Some(delivery) = &d.delivery {
+            match delivery.mode {
+                DeliveryMode::Idempotent
+                    if d.idempotency_header.as_deref().unwrap_or("").is_empty() =>
+                {
+                    return fail("delivery mode idempotent requires idempotencyHeader");
+                }
+                DeliveryMode::Lookup if delivery.lookup.is_none() => {
+                    return fail("delivery mode lookup requires delivery.lookup");
+                }
+                DeliveryMode::Idempotent | DeliveryMode::Manual if delivery.lookup.is_some() => {
+                    return fail("delivery.lookup is only used with mode lookup");
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Cross-step rules the JSON Schema cannot express: step names must be
@@ -355,4 +397,89 @@ async fn delete_template(
     )
     .await?;
     Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_template;
+    use serde_json::{json, Value};
+
+    fn template(destination: Value) -> Value {
+        json!({
+            "id": "rt_delivery", "version": 1, "name": "delivery",
+            "source": {"type": "csv", "schema": [{"name": "id", "type": "string"}]},
+            "preprocess": [],
+            "mapping": {"payload": {"id": {"$from": "id"}}},
+            "destination": destination
+        })
+    }
+
+    fn rejected(destination: Value, needle: &str) {
+        let err =
+            validate_template(&template(destination)).expect_err("template should be rejected");
+        assert!(
+            err.to_string().contains(needle),
+            "{err} does not mention {needle:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_complete_delivery_policies() {
+        for destination in [
+            json!({"type": "http", "method": "POST", "url": "https://x/c",
+                   "idempotencyHeader": "Idempotency-Key",
+                   "delivery": {"mode": "idempotent", "idempotencyRetentionHours": 48}}),
+            json!({"type": "http", "method": "POST", "url": "https://x/c",
+                   "delivery": {"mode": "lookup", "lookup": {
+                       "url": "https://x/c", "queryParams": {"id": {"$from": "id"}},
+                       "foundPath": "$.items[0].id"}}}),
+            json!({"type": "http", "method": "POST", "url": "https://x/c",
+                   "auth": {"type": "api_key", "secretRef": "crm.key", "headerName": "X-Key"},
+                   "delivery": {"mode": "manual"}}),
+        ] {
+            let tpl = validate_template(&template(destination.clone()))
+                .unwrap_or_else(|e| panic!("{destination} rejected: {e}"));
+            let back = serde_json::to_value(tpl.destination.unwrap()).unwrap();
+            assert_eq!(back, destination, "destination must round-trip unchanged");
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_delivery_policies() {
+        rejected(
+            json!({"type": "http", "method": "POST", "url": "https://x/c", "delivery": {"mode": "idempotent"}}),
+            "requires idempotencyHeader",
+        );
+        rejected(
+            json!({"type": "http", "method": "POST", "url": "https://x/c", "delivery": {"mode": "lookup"}}),
+            "requires delivery.lookup",
+        );
+        rejected(
+            json!({"type": "http", "method": "POST", "url": "https://x/c", "delivery": {"mode": "manual",
+                   "lookup": {"url": "https://x/c", "foundPath": "$.id"}}}),
+            "only used with mode lookup",
+        );
+        rejected(
+            json!({"type": "http", "method": "POST", "url": "https://x/c", "delivery": {"mode": "maybe"}}),
+            "delivery",
+        );
+    }
+
+    #[test]
+    fn rejects_auth_the_runtime_cannot_resolve() {
+        rejected(
+            json!({"type": "http", "method": "POST", "url": "https://x/c", "auth": {"type": "bearer"}}),
+            "requires secretRef",
+        );
+        rejected(
+            json!({"type": "http", "method": "POST", "url": "https://x/c",
+                   "auth": {"type": "oauth2_client", "secretRef": "x"}}),
+            "oauth2_client is not supported",
+        );
+        rejected(
+            json!({"type": "http", "method": "POST", "url": "https://x/c",
+                   "auth": {"type": "bearer", "secretRef": "../etc"}}),
+            "secretRef",
+        );
+    }
 }

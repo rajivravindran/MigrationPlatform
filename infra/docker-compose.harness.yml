@@ -19,5 +19,12 @@ services:
     ports: ["18099:8099"]
     networks: [migration]
 
+  # Short reconciler timings so lifecycle scenarios finish in seconds. The
+  # defaults (1m interval, 5m staleness) apply everywhere else.
+  orchestrator:
+    environment:
+      RECONCILE_INTERVAL: 5s
+      RECONCILE_STALE_AFTER: 20s
+
 volumes:
   destination-ledger: {}

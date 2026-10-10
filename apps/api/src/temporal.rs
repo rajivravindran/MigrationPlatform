@@ -9,6 +9,17 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+/// The bridge refused a start because a workflow with that ID is running.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct WorkflowAlreadyRunning(pub String);
+
+/// The bridge has no workflow with that ID: it never started, or it closed
+/// (signals and cancels to a closed workflow are refused the same way).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct WorkflowNotFound(pub String);
+
 #[derive(Clone)]
 pub struct TemporalClient {
     bridge_url: Option<String>,
@@ -60,6 +71,20 @@ impl TemporalClient {
             .with_context(|| format!("bridge request {path}"))?;
         let status = resp.status();
         let payload: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+        if status == reqwest::StatusCode::CONFLICT {
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("workflow is already running");
+            return Err(WorkflowAlreadyRunning(msg.to_string()).into());
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("workflow not found");
+            return Err(WorkflowNotFound(msg.to_string()).into());
+        }
         if !status.is_success() {
             bail!(
                 "bridge {path} returned {status}: {}",

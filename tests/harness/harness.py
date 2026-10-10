@@ -24,6 +24,7 @@ Stdlib only; never calls external services.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import io
@@ -31,6 +32,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -278,15 +280,19 @@ class Reconciliation:
 
 def reconcile(*, tenant: str, source: list[dict], rows: list[dict], receipts: list[dict],
               all_receipts: list[dict], job: dict, expect_failed: set[str],
-              expect_ambiguous: set[str] | None = None) -> Reconciliation:
+              expect_ambiguous: set[str] | None = None,
+              expect_unresolved: set[str] | None = None) -> Reconciliation:
     """Compare source identities, platform rows and destination receipts.
 
     Invariants (handover §6): every source record has exactly one accounted-for
     outcome; succeeded rows have exactly one destination effect; failed rows have
-    none unless declared ambiguous; no effect exists without a source record; no
-    effect lands in another tenant; completion agrees with row outcomes.
+    none unless declared ambiguous; unresolved rows (ADR 0003) have at most one
+    and are never reported as succeeded; no effect exists without a source
+    record; no effect lands in another tenant; completion agrees with row
+    outcomes.
     """
     expect_ambiguous = expect_ambiguous or set()
+    expect_unresolved = expect_unresolved or set()
     rec = Reconciliation()
     source_keys = [r["external_id"] for r in source]
     rows_by_key: dict[str, list[dict]] = {}
@@ -318,6 +324,12 @@ def reconcile(*, tenant: str, source: list[dict], rows: list[dict], receipts: li
             if status == "succeeded" and n != 1:
                 bad.append({"key": key, "why": f"succeeded with {n} destination receipts"})
             continue
+        if key in expect_unresolved:
+            if status != "unresolved":
+                bad.append({"key": key, "why": f"platform status {status}, expected unresolved"})
+            if n > 1:
+                bad.append({"key": key, "why": f"unresolved row produced {n} destination effects"})
+            continue
         want = "failed" if key in expect_failed else "succeeded"
         if status != want:
             bad.append({"key": key, "why": f"platform status {status}, expected {want}"})
@@ -333,16 +345,18 @@ def reconcile(*, tenant: str, source: list[dict], rows: list[dict], receipts: li
     rec.check("no effect written to another tenant", not foreign, foreign[:20])
 
     n_failed = sum(1 for r in rows if r["status"] == "failed")
+    n_unresolved = sum(1 for r in rows if r["status"] == "unresolved")
     n_ok = sum(1 for r in rows if r["status"] == "succeeded")
-    want_status = "failed" if n_failed else "succeeded"
+    want_status = "failed" if n_failed or n_unresolved else "succeeded"
     rec.check("job terminal status agrees with row outcomes", job.get("status") == want_status,
               {"job": job.get("status"), "expected": want_status})
     totals = job.get("totals_json") or {}
     rec.check("job totals agree with persisted rows and source",
               totals.get("processed") == n_ok and totals.get("failed") == n_failed
+              and totals.get("unresolved", 0) == n_unresolved
               and totals.get("total") == len(rows) == len(source_keys),
               {"totals_json": totals, "rows_succeeded": n_ok, "rows_failed": n_failed,
-               "rows": len(rows), "source": len(source_keys)})
+               "rows_unresolved": n_unresolved, "rows": len(rows), "source": len(source_keys)})
     return rec
 
 
@@ -370,11 +384,13 @@ class Scenario:
 
 def run_customer_migration(*, tenant: str, faults: list[dict], expect_failed: set[str],
                            expect_ambiguous: set[str] | None = None, dest_config: dict | None = None,
+                           expect_unresolved: set[str] | None = None,
                            retry: dict | None = None,
                            customize: Callable[[dict], None] | None = None,
                            extra_checks: Callable[[list[dict], list[dict]], list[dict]] | None = None,
                            job_checks: Callable[[dict], list[dict]] | None = None,
-                           source_path: Path | None = None, job_timeout_s: int = JOB_TIMEOUT_S) -> dict:
+                           source_path: Path | None = None, job_timeout_s: int = JOB_TIMEOUT_S,
+                           template_id: int | None = None) -> dict:
     run_id = uuid.uuid4().hex[:8]
     dest_reset(dest_config, faults)
     token = login(tenant)
@@ -382,23 +398,26 @@ def run_customer_migration(*, tenant: str, faults: list[dict], expect_failed: se
     with source_path.open(newline="", encoding="utf-8") as f:
         source = list(csv.DictReader(f))
     source_ref = multipart_upload(token, source_path)
-    tpl = customer_template(tenant, run_id, retry)
-    if customize:
-        customize(tpl["schema_json"])
-    tpl_id = create_published_template(token, tpl)
+    tpl_id = template_id
+    if tpl_id is None:
+        tpl = customer_template(tenant, run_id, retry)
+        if customize:
+            customize(tpl["schema_json"])
+        tpl_id = create_published_template(token, tpl)
     job = start_job(token, tpl_id, source_ref)
     job = wait_job(token, job["id"], job_timeout_s)
     rows = job_rows(token, job["id"])
     receipts = dest_receipts(tenant)
     rec = reconcile(tenant=tenant, source=source, rows=rows, receipts=receipts,
                     all_receipts=dest_receipts(), job=job, expect_failed=expect_failed,
-                    expect_ambiguous=expect_ambiguous)
+                    expect_ambiguous=expect_ambiguous, expect_unresolved=expect_unresolved)
     checks = rec.checks + (extra_checks(source, receipts) if extra_checks else [])
     checks += job_checks(job) if job_checks else []
     return {
         "passed": all(c["passed"] for c in checks),
         "job": {k: job.get(k) for k in ("id", "status", "totals_json", "temporal_workflow_id")},
         "template_id": tpl_id,
+        "row_errors": sorted({(r.get("last_error") or "")[:200] for r in rows if r.get("last_error")})[:10],
         "source": {"path": str(source_path.relative_to(REPO)), "records": len(source),
                    "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest()},
         "faults": faults,
@@ -530,6 +549,397 @@ def scenario_source_authz(_: Scenario) -> dict:
     return {"passed": all(c["passed"] for c in checks), "checks": checks, "org_a_source_id": a_ref["source_id"]}
 
 
+# ------------------------------------------------- operation ledger (ADR 0003)
+
+
+def attempts_for(tenant: str, external_id: str) -> list[int]:
+    return [a["status"] for a in sorted(dest_attempts(), key=lambda a: a["seq"])
+            if a.get("tenant") == tenant and a.get("external_id") == external_id]
+
+
+def receipts_for(tenant: str, external_id: str) -> int:
+    return sum(1 for r in dest_receipts(tenant) if r["external_id"] == external_id)
+
+
+def exact(name: str, got: Any, want: Any) -> dict:
+    return {"check": name, "passed": got == want, "detail": {"got": got, "want": want}}
+
+
+def wait_retry(job: dict, timeout_s: int = 120, suffix: str = "retry") -> str:
+    """Wait for the job's retry (or export) workflow and return its final status."""
+    wid = f"{job['temporal_workflow_id']}-{suffix}"
+    deadline = time.monotonic() + timeout_s
+    status = ""
+    while time.monotonic() < deadline:
+        runs = workflow_runs(wid)
+        status = runs[0].get("status", "") if runs else ""
+        if status and status != "WORKFLOW_EXECUTION_STATUS_RUNNING":
+            return status
+        time.sleep(1)
+    raise HarnessError(f"retry workflow {wid} still {status or 'absent'} after {timeout_s}s")
+
+
+def row_by_key(token: str, job_id: int, external_id: str) -> dict:
+    for r in job_rows(token, job_id):
+        if (r.get("row_json") or {}).get("external_id") == external_id:
+            return r
+    raise HarnessError(f"job {job_id} has no row for {external_id}")
+
+
+def disconnect_after_commit(external_id: str) -> dict:
+    return {"id": f"commit-drop-{external_id}", "tenant": "org-a", "external_id": external_id,
+            "action": "commit_then_disconnect", "times": 1}
+
+
+def scenario_ambiguous_idempotent(_: Scenario) -> dict:
+    """Response lost after commit; verified deduplication: re-sent with the same key, one effect."""
+    key = "A-CUS-0005"
+    return run_customer_migration(
+        tenant="org-a", faults=[disconnect_after_commit(key)], expect_failed=set(),
+        customize=lambda s: s["destination"].update({"delivery": {"mode": "idempotent"}}),
+        extra_checks=lambda _src, _rcpt: [attempt_sequence_check(
+            dest_attempts(), tenant="org-a", external_id=key, statuses=[0, 200])])
+
+
+def scenario_ambiguous_lookup(_: Scenario) -> dict:
+    """Response lost after commit; no deduplication but a business-key lookup finds the effect."""
+    key = "A-CUS-0005"
+
+    def customize(schema: dict) -> None:
+        schema["destination"]["delivery"] = {"mode": "lookup", "lookup": {
+            "url": f"{DEST_INTERNAL}/v1/customers",
+            "queryParams": {"external_id": {"$from": "external_id"}},
+            "headers": {"X-Tenant": "org-a"},
+            "foundPath": "$.data[0].id"}}
+
+    return run_customer_migration(
+        tenant="org-a", faults=[disconnect_after_commit(key)], expect_failed=set(),
+        dest_config={"idempotency": False, "unique_business_key": True}, customize=customize,
+        extra_checks=lambda _src, _rcpt: [
+            exact(f"the destination saw one create for {key} (the lookup supplied the receipt)",
+                  attempts_for("org-a", key), [0])])
+
+
+def scenario_ambiguous_manual(_: Scenario) -> dict:
+    """POST without a delivery policy: unknown outcomes stop as unresolved; only a confirmed retry re-sends."""
+    committed, not_committed = "A-CUS-0005", "A-CUS-0011"
+    faults = [disconnect_after_commit(committed),
+              {"id": "503-once", "tenant": "org-a", "external_id": not_committed,
+               "action": "server_error", "status": 503, "times": 1}]
+
+    def job_checks(job: dict) -> list[dict]:
+        token = login("org-a")
+        checks = [
+            exact(f"{committed}: sent once, effect kept, never re-sent", attempts_for("org-a", committed), [0]),
+            exact(f"{not_committed}: sent once and not re-sent", attempts_for("org-a", not_committed), [503]),
+        ]
+        rows = {k: row_by_key(token, job["id"], k) for k in (committed, not_committed)}
+        status, body = http("POST", f"{API}/jobs/{job['id']}/rows/{rows[committed]['row_index']}/retry",
+                            token=token, body={})
+        checks.append(exact("retrying an unresolved row without confirm_not_applied is refused (409)", status, 409))
+        status, body = http("POST", f"{API}/jobs/{job['id']}/rows/{rows[not_committed]['row_index']}/retry",
+                            token=token, body={"confirm_not_applied": True})
+        checks.append(exact("a confirmed retry is accepted", status, 200))
+        if status == 200:
+            checks.append(exact("the confirmed retry workflow completed", wait_retry(job),
+                                "WORKFLOW_EXECUTION_STATUS_COMPLETED"))
+            checks.append(exact(f"{not_committed}: confirmed retry sent it once more",
+                                attempts_for("org-a", not_committed), [503, 201]))
+            checks.append(exact(f"{not_committed}: exactly one effect", receipts_for("org-a", not_committed), 1))
+            after = row_by_key(token, job["id"], not_committed)
+            checks.append(exact(f"{not_committed}: row succeeded after the confirmed retry", after["status"], "succeeded"))
+            final = ok(*http("GET", f"{API}/jobs/{job['id']}", token=token), "get job")
+            checks.append(exact("job stays failed while a row is unresolved", final["status"], "failed"))
+            checks.append(exact("job totals count the remaining unresolved row",
+                                (final.get("totals_json") or {}).get("unresolved"), 1))
+        checks.append(exact(f"{committed}: still exactly one effect", receipts_for("org-a", committed), 1))
+        return checks
+
+    return run_customer_migration(
+        tenant="org-a", faults=faults, expect_failed=set(), expect_unresolved={committed, not_committed},
+        dest_config={"idempotency": False}, job_checks=job_checks)
+
+
+def decoded_payloads(node: Any, out: list[str]) -> None:
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "data" and isinstance(v, str):
+                try:
+                    out.append(base64.b64decode(v, validate=True).decode("utf-8", "replace"))
+                except ValueError:
+                    pass
+            decoded_payloads(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            decoded_payloads(v, out)
+
+
+def workflow_history_text(workflow_id: str) -> str:
+    """Every event of every run of a workflow, with payloads base64-decoded."""
+    parts: list[str] = []
+    for run in workflow_runs(workflow_id):
+        run_id = run["execution"]["runId"]
+        page_token = ""
+        while True:
+            q = f"execution.runId={run_id}&maximumPageSize=1000"
+            if page_token:
+                q += f"&nextPageToken={urllib.parse.quote(page_token)}"
+            page = ok(*http("GET", f"{TEMPORAL_HTTP}/api/v1/namespaces/default/workflows/"
+                                   f"{urllib.parse.quote(workflow_id)}/history?{q}"), "workflow history")
+            parts.append(json.dumps(page))
+            decoded_payloads(page, parts)
+            page_token = page.get("nextPageToken") or ""
+            if not page_token:
+                break
+    return "\n".join(parts)
+
+
+def service_logs(since: str) -> tuple[bool, str]:
+    cmd = COMPOSE.split() + ["logs", "--no-color", "--since", since, "api", "orchestrator"]
+    res = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, check=False)
+    return res.returncode == 0, res.stdout + res.stderr
+
+
+def scenario_destination_auth(_: Scenario) -> dict:
+    """auth.secretRef resolves per call: missing, other-org, rotated and revoked secrets; values never leak."""
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5))
+    tok1, tok2 = f"hx-{uuid.uuid4().hex}", f"hx-{uuid.uuid4().hex}"
+    name, other_org_name = f"hx_crm_{uuid.uuid4().hex[:6]}", f"hx_orgb_{uuid.uuid4().hex[:6]}"
+    token_a, token_b = login("org-a"), login("org-b")
+    ok(*http("PUT", f"{API}/secrets/{name}", token=token_a, body={"value": tok1}), "create secret")
+    ok(*http("PUT", f"{API}/secrets/{other_org_name}", token=token_b, body={"value": tok1}), "org B secret")
+    source_path = generated_customers("org-a", 5)
+    every = {f"A-GEN-{i:05d}" for i in range(5)}
+
+    def with_auth(ref: str) -> Callable[[dict], None]:
+        return lambda s: s["destination"].update({"auth": {"type": "bearer", "secretRef": ref}})
+
+    def nothing_sent(_src: list[dict], _rcpt: list[dict]) -> list[dict]:
+        return [exact("nothing was sent to the destination", len(dest_attempts()), 0)]
+
+    phases: dict[str, dict] = {}
+    phases["authorized"] = run_customer_migration(
+        tenant="org-a", faults=[], expect_failed=set(), source_path=source_path,
+        dest_config={"required_token": tok1}, customize=with_auth(name))
+    template_id = phases["authorized"]["template_id"]
+    phases["missing secret"] = run_customer_migration(
+        tenant="org-a", faults=[], expect_failed=every, source_path=source_path,
+        dest_config={"required_token": tok1}, customize=with_auth(f"hx_missing_{uuid.uuid4().hex[:6]}"),
+        extra_checks=nothing_sent)
+    phases["other org's secret"] = run_customer_migration(
+        tenant="org-a", faults=[], expect_failed=every, source_path=source_path,
+        dest_config={"required_token": tok1}, customize=with_auth(other_org_name), extra_checks=nothing_sent)
+    ok(*http("PUT", f"{API}/secrets/{name}", token=token_a, body={"value": tok2}), "rotate secret")
+    phases["rotated (same template)"] = run_customer_migration(
+        tenant="org-a", faults=[], expect_failed=set(), source_path=source_path,
+        dest_config={"required_token": tok2}, template_id=template_id)
+    ok(*http("DELETE", f"{API}/secrets/{name}", token=token_a), "revoke secret")
+    phases["revoked (same template)"] = run_customer_migration(
+        tenant="org-a", faults=[], expect_failed=every, source_path=source_path,
+        dest_config={"required_token": tok2}, template_id=template_id, extra_checks=nothing_sent)
+
+    checks: list[dict] = []
+    for phase, result in phases.items():
+        for c in result["checks"]:
+            checks.append({**c, "check": f"{phase}: {c['check']}"})
+    for phase in ("missing secret", "other org's secret", "revoked (same template)"):
+        errors = phases[phase]["row_errors"]
+        checks.append({"check": f"{phase}: rows say the secret is unavailable",
+                       "passed": bool(errors) and all("not available" in e for e in errors), "detail": errors})
+
+    haystack = "".join(json.dumps(p) for p in phases.values())
+    for result in phases.values():
+        wid = result["job"]["temporal_workflow_id"]
+        haystack += workflow_history_text(wid)
+    logs_ok, logs = service_logs(started)
+    checks.append({"check": "service logs were collected", "passed": logs_ok and len(logs) > 0,
+                   "detail": logs[-300:] if not logs_ok else len(logs)})
+    leaked = [label for label, tok in (("v1", tok1), ("v2", tok2)) if tok in haystack or tok in logs]
+    checks.append({"check": "secret values absent from workflow history, job rows and service logs",
+                   "passed": not leaked, "detail": {"leaked": leaked, "history_bytes": len(haystack),
+                                                    "log_bytes": len(logs)}})
+    return {"passed": all(c["passed"] for c in checks), "checks": checks,
+            "jobs": {p: r["job"] for p, r in phases.items()}}
+
+
+def scenario_retry_serialized(_: Scenario) -> dict:
+    """Retries are refused while the job runs; two concurrent retries of one job start one workflow."""
+    rejected = {"A-CUS-0000", "A-CUS-0007"}
+    faults = [{"id": f"reject-{k}", "tenant": "org-a", "external_id": k, "action": "reject", "status": 400}
+              for k in sorted(rejected)]
+    dest_reset(None, faults)
+    token = login("org-a")
+    tpl_id = create_published_template(token, customer_template("org-a", uuid.uuid4().hex[:8]))
+    job = start_job(token, tpl_id, multipart_upload(token, DATA / "org-a" / "customers.csv"))
+    checks: list[dict] = []
+    status, body = http("POST", f"{API}/jobs/{job['id']}/retry-failed", token=token, body={})
+    checks.append(exact("retry while the job is pending or running is refused (409)", status, 409))
+
+    job = wait_job(token, job["id"])
+    statuses: list[int] = []
+
+    def fire(path: str) -> None:
+        statuses.append(http("POST", f"{API}{path}", token=token, body={})[0])
+
+    rows = {k: row_by_key(token, job["id"], k) for k in sorted(rejected)}
+    threads = [threading.Thread(target=fire, args=(p,)) for p in (
+        f"/jobs/{job['id']}/retry-failed",
+        f"/jobs/{job['id']}/rows/{rows['A-CUS-0007']['row_index']}/retry")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    checks.append(exact("two concurrent retries: one accepted, one refused (409)", sorted(statuses), [200, 409]))
+    if 200 in statuses:
+        checks.append(exact("the accepted retry completed", wait_retry(job), "WORKFLOW_EXECUTION_STATUS_COMPLETED"))
+    runs = workflow_runs(f"{job['temporal_workflow_id']}-retry")
+    checks.append(exact("exactly one retry workflow ran", len(runs), 1))
+    for k in sorted(rejected):
+        checks.append(exact(f"{k}: still rejected, no effect", receipts_for("org-a", k), 0))
+    return {"passed": all(c["passed"] for c in checks), "checks": checks,
+            "job": {"id": job["id"], "temporal_workflow_id": job["temporal_workflow_id"]}}
+
+
+# ---------------------------------------------------------------- job lifecycle
+
+
+def compose_exec(service: str, *args: str) -> str:
+    cmd = COMPOSE.split() + ["exec", "-T", service, *args]
+    res = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        raise HarnessError(f"{service} {' '.join(args[:3])}: {res.stderr.strip() or res.stdout.strip()}")
+    return res.stdout
+
+
+def mc(script: str) -> str:
+    """Runs an `mc` script inside the MinIO container against the local server."""
+    return compose_exec("minio", "sh", "-c",
+                        'mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"'
+                        f" >/dev/null && {script}")
+
+
+def get_job(token: str, job_id: int) -> dict:
+    return ok(*http("GET", f"{API}/jobs/{job_id}", token=token), "get job")
+
+
+def wait_until(what: str, probe: Callable[[], Any], timeout_s: float, interval_s: float = 1) -> Any:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        value = probe()
+        if value:
+            return value
+        time.sleep(interval_s)
+    raise HarnessError(f"timed out after {timeout_s}s waiting for {what}")
+
+
+def download_rows(token: str, job_id: int, failed: bool = False) -> int:
+    q = "?failed=true" if failed else ""
+    status, body = http("GET", f"{API}/jobs/{job_id}/results{q}", token=token)
+    text = ok(status, body, "download results")
+    return max(0, len([ln for ln in str(text).splitlines() if ln.strip()]) - 1)
+
+
+def persisted_totals(rows: list[dict]) -> dict:
+    count = lambda s: sum(1 for r in rows if r["status"] == s)  # noqa: E731
+    return {"processed": count("succeeded"), "failed": count("failed"),
+            "unresolved": count("unresolved"), "total": len(rows)}
+
+
+def scenario_ingest_failure(_: Scenario) -> dict:
+    """The source object is gone when the job starts: the job fails visibly with the cause."""
+    dest_reset()
+    token = login("org-a")
+    tpl_id = create_published_template(token, customer_template("org-a", uuid.uuid4().hex[:8]))
+    ref = multipart_upload(token, DATA / "org-a" / "customers.csv")
+    mc(f"mc rm local/{ref['bucket']}/{ref['key']}")
+    job = wait_job(token, start_job(token, tpl_id, ref)["id"], 180)
+    checks = [
+        exact("job failed", job["status"], "failed"),
+        {"check": "the job records the ingest failure", "passed": "ingest" in (job.get("last_error") or ""),
+         "detail": job.get("last_error")},
+        exact("nothing was sent to the destination", len(dest_attempts()), 0),
+        exact("job totals agree with persisted rows", job["totals_json"], persisted_totals(job_rows(token, job["id"]))),
+    ]
+    return {"passed": all(c["passed"] for c in checks), "checks": checks,
+            "job": {k: job.get(k) for k in ("id", "status", "last_error", "export_status")}}
+
+
+def scenario_terminated_workflow(_: Scenario) -> dict:
+    """A workflow ends without finalizing (terminated mid-row): the reconciler marks the job failed."""
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5))
+    held = "A-CUS-0003"
+    dest_reset(None, [{"id": "hold", "tenant": "org-a", "external_id": held,
+                       "action": "timeout_before_write", "delay_ms": 45000, "times": 1}])
+    token = login("org-a")
+    tpl_id = create_published_template(token, customer_template("org-a", uuid.uuid4().hex[:8]))
+    job = start_job(token, tpl_id, multipart_upload(token, DATA / "org-a" / "customers.csv"))
+    wait_until(f"{held} to reach the destination", lambda: attempts_for("org-a", held), 60)
+    compose_exec("temporal", "temporal", "workflow", "terminate", "--address", "temporal:7233",
+                 "--workflow-id", job["temporal_workflow_id"], "--reason", "harness: execution lost")
+    terminated = time.monotonic()
+    receipts_at_termination = len(dest_receipts("org-a"))
+    job = wait_job(token, job["id"], 180)
+    repaired_after = round(time.monotonic() - terminated, 1)
+    rows = job_rows(token, job["id"])
+    _, logs = service_logs(started)
+    checks = [
+        exact("job failed", job["status"], "failed"),
+        {"check": "the job says its workflow was terminated", "passed": "terminated" in (job.get("last_error") or ""),
+         "detail": job.get("last_error")},
+        {"check": "repaired by the reconciler within 90s", "passed": repaired_after < 90, "detail": repaired_after},
+        {"check": "the reconciler logged the repair",
+         "passed": "job reconciled" in logs and f'"jobId":{job["id"]}' in logs, "detail": None},
+        exact("job totals agree with persisted rows", job["totals_json"], persisted_totals(rows)),
+        exact(f"{held}: no effect", receipts_for("org-a", held), 0),
+        exact("no destination effects after termination", len(dest_receipts("org-a")), receipts_at_termination),
+    ]
+    return {"passed": all(c["passed"] for c in checks), "checks": checks,
+            "job": {k: job.get(k) for k in ("id", "status", "last_error", "temporal_workflow_id")},
+            "repaired_after_s": repaired_after}
+
+
+def scenario_export_recovery(_: Scenario) -> dict:
+    """The results upload fails: the outcome stands, and an export-only retry makes zero destination calls."""
+    dest_reset()
+    token = login("org-a")
+    tpl_id = create_published_template(token, customer_template("org-a", uuid.uuid4().hex[:8]))
+    ref = multipart_upload(token, DATA / "org-a" / "customers.csv")
+    # A 1-byte hard quota makes MinIO refuse every upload; reads still work.
+    mc(f"mc quota set local/{ref['bucket']} --size 1B")
+    try:
+        job = start_job(token, tpl_id, ref)
+        job = wait_job(token, job["id"])
+        job = wait_until("the export failure to be recorded",
+                         lambda: (j := get_job(token, job["id"]))["export_status"] == "failed" and j, 180)
+    finally:
+        mc(f"mc quota clear local/{ref['bucket']}")
+    source_count = len(read_source("org-a", "customers"))
+    checks = [
+        exact("migration succeeded despite the export failure", job["status"], "succeeded"),
+        {"check": "export failure is visible on the job", "passed": bool(job.get("export_error")),
+         "detail": job.get("export_error")},
+        exact("results still download (from the database)", download_rows(token, job["id"]), source_count),
+    ]
+    attempts, receipts = len(dest_attempts()), len(dest_receipts())
+
+    status, body = http("POST", f"{API}/jobs/{job['id']}/export", token=token)
+    checks.append(exact("export retry accepted (202)", status, 202))
+    checks.append(exact("the export workflow completed", wait_retry(job, suffix="export"),
+                        "WORKFLOW_EXECUTION_STATUS_COMPLETED"))
+    job = get_job(token, job["id"])
+    checks += [
+        exact("export retry succeeded", job["export_status"], "succeeded"),
+        exact("job outcome unchanged", job["status"], "succeeded"),
+        exact("results file covers every row", (job.get("results_ref") or {}).get("rows"), source_count),
+        exact("results download from the exported file", download_rows(token, job["id"]), source_count),
+        exact("export retry made zero destination calls", len(dest_attempts()), attempts),
+        exact("destination effects unchanged", len(dest_receipts()), receipts),
+        exact("one export workflow ran", len(workflow_runs(f"{job['temporal_workflow_id']}-export")), 1),
+    ]
+    return {"passed": all(c["passed"] for c in checks), "checks": checks,
+            "job": {k: job.get(k) for k in ("id", "status", "export_status", "export_error", "results_ref")}}
+
+
 SCENARIOS: dict[str, Scenario] = {
     s.name: s
     for s in [
@@ -542,6 +952,22 @@ SCENARIOS: dict[str, Scenario] = {
                  scenario_forced_failure),
         Scenario("throttle-recovers", "429 twice for one record, retried to exactly one receipt",
                  scenario_throttle_recovers),
+        Scenario("ambiguous-idempotent", "response lost after commit, verified dedup: re-sent once, one effect",
+                 scenario_ambiguous_idempotent),
+        Scenario("ambiguous-lookup", "response lost after commit, lookup by business key: no re-send, one effect",
+                 scenario_ambiguous_lookup),
+        Scenario("ambiguous-manual", "unknown outcomes without a policy are unresolved; only confirmed retries re-send",
+                 scenario_ambiguous_manual),
+        Scenario("destination-auth", "secretRef: missing, other-org, rotated, revoked; values never in history/logs",
+                 scenario_destination_auth),
+        Scenario("retry-serialized", "retry refused while the job runs; concurrent retries start one workflow",
+                 scenario_retry_serialized),
+        Scenario("ingest-failure", "source object missing at start: job fails with the cause, nothing sent",
+                 scenario_ingest_failure),
+        Scenario("terminated-workflow", "workflow terminated mid-row: reconciler marks the job failed",
+                 scenario_terminated_workflow),
+        Scenario("export-recovery", "results upload fails: outcome stands; export-only retry makes zero writes",
+                 scenario_export_recovery),
         Scenario("continue-as-new", "1,250 rows across continue-as-new: one receipt per record, totals carried",
                  scenario_continue_as_new),
     ]

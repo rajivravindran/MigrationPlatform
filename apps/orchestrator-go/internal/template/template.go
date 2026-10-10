@@ -11,10 +11,10 @@ type SourceField struct {
 }
 
 type Source struct {
-	Type        string                 `json:"type"`
-	Schema      []SourceField          `json:"schema,omitempty"`
-	Options     map[string]any         `json:"options,omitempty"`
-	ConnectorID *int64                 `json:"connectorId,omitempty"`
+	Type        string         `json:"type"`
+	Schema      []SourceField  `json:"schema,omitempty"`
+	Options     map[string]any `json:"options,omitempty"`
+	ConnectorID *int64         `json:"connectorId,omitempty"`
 }
 
 type PreprocessStep struct {
@@ -35,15 +35,65 @@ type Auth struct {
 // templated per row using the same `{"$from":"field"}` / `{"$literal":"..."}`
 // sigils as the JSON body mapping.
 type Destination struct {
-	Type              string             `json:"type"`
-	Method            string             `json:"method"`
-	URL               string             `json:"url"`
-	PathParams        map[string]any     `json:"pathParams,omitempty"`
-	QueryParams       map[string]any     `json:"queryParams,omitempty"`
-	Headers           map[string]any     `json:"headers,omitempty"`
-	Auth              *Auth              `json:"auth,omitempty"`
-	IdempotencyKey    json.RawMessage    `json:"idempotencyKey,omitempty"`
-	IdempotencyHeader string             `json:"idempotencyHeader,omitempty"`
+	Type              string          `json:"type"`
+	Method            string          `json:"method"`
+	URL               string          `json:"url"`
+	PathParams        map[string]any  `json:"pathParams,omitempty"`
+	QueryParams       map[string]any  `json:"queryParams,omitempty"`
+	Headers           map[string]any  `json:"headers,omitempty"`
+	Auth              *Auth           `json:"auth,omitempty"`
+	IdempotencyKey    json.RawMessage `json:"idempotencyKey,omitempty"`
+	IdempotencyHeader string          `json:"idempotencyHeader,omitempty"`
+	Delivery          *Delivery       `json:"delivery,omitempty"`
+}
+
+// Delivery modes decide what happens when a call's outcome is unknown
+// (ADR 0003).
+const (
+	DeliveryIdempotent = "idempotent"
+	DeliveryLookup     = "lookup"
+	DeliveryManual     = "manual"
+)
+
+// Delivery declares how the destination can be re-tried safely.
+type Delivery struct {
+	Mode string `json:"mode"`
+	// IdempotencyRetentionHours is how long the destination keeps idempotency
+	// keys; re-sending after it is not safe. Defaults to 24.
+	IdempotencyRetentionHours int     `json:"idempotencyRetentionHours,omitempty"`
+	Lookup                    *Lookup `json:"lookup,omitempty"`
+}
+
+// Lookup finds an already-applied effect by business key. URL, path, query
+// and headers render like a destination.
+type Lookup struct {
+	Method      string         `json:"method,omitempty"`
+	URL         string         `json:"url"`
+	PathParams  map[string]any `json:"pathParams,omitempty"`
+	QueryParams map[string]any `json:"queryParams,omitempty"`
+	Headers     map[string]any `json:"headers,omitempty"`
+	FoundPath   string         `json:"foundPath"`
+}
+
+// EffectiveDeliveryMode is the declared mode, or the default for the HTTP
+// method: methods idempotent by definition re-send, creates stop.
+func (d Destination) EffectiveDeliveryMode() string {
+	if d.Delivery != nil && d.Delivery.Mode != "" {
+		return d.Delivery.Mode
+	}
+	switch d.Method {
+	case "GET", "HEAD", "PUT", "DELETE", "OPTIONS":
+		return DeliveryIdempotent
+	}
+	return DeliveryManual
+}
+
+// RetentionHours is the declared idempotency retention, defaulting to 24.
+func (d Delivery) RetentionHours() int {
+	if d.IdempotencyRetentionHours > 0 {
+		return d.IdempotencyRetentionHours
+	}
+	return 24
 }
 
 type Retry struct {
@@ -84,17 +134,17 @@ func (s *Step) PayloadTemplate() map[string]any {
 }
 
 type RuleTemplate struct {
-	ID          string                 `json:"id"`
-	Version     int                    `json:"version"`
-	Name        string                 `json:"name"`
-	Source      Source                 `json:"source"`
-	Preprocess  []PreprocessStep       `json:"preprocess"`
-	Mapping     map[string]any         `json:"mapping,omitempty"`
-	Destination Destination            `json:"destination,omitempty"`
-	Steps       []Step                 `json:"steps,omitempty"`
-	Retry       *Retry                 `json:"retry,omitempty"`
-	Concurrency int                    `json:"concurrency,omitempty"`
-	Export      *ExportSpec            `json:"export,omitempty"`
+	ID          string           `json:"id"`
+	Version     int              `json:"version"`
+	Name        string           `json:"name"`
+	Source      Source           `json:"source"`
+	Preprocess  []PreprocessStep `json:"preprocess"`
+	Mapping     map[string]any   `json:"mapping,omitempty"`
+	Destination Destination      `json:"destination,omitempty"`
+	Steps       []Step           `json:"steps,omitempty"`
+	Retry       *Retry           `json:"retry,omitempty"`
+	Concurrency int              `json:"concurrency,omitempty"`
+	Export      *ExportSpec      `json:"export,omitempty"`
 }
 
 // ExportSpec is the optional results-CSV column projector.

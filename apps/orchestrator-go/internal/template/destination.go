@@ -106,6 +106,13 @@ func RenderDestination(d Destination, ctx *Context) (Rendered, error) {
 	return rendered, nil
 }
 
+// RenderLookup resolves a delivery lookup request like a destination.
+func RenderLookup(l Lookup, ctx *Context) (Rendered, error) {
+	return RenderDestination(Destination{
+		URL: l.URL, PathParams: l.PathParams, QueryParams: l.QueryParams, Headers: l.Headers,
+	}, ctx)
+}
+
 // RenderPayload materializes a payload mapping template against the render
 // context. $from pulls row fields, $fromResponse pulls JSONPath matches from
 // prior step responses (hard error on no match), $py sigils are passed

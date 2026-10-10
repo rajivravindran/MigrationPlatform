@@ -66,7 +66,32 @@ func (a *Activities) ExportJobResults(ctx context.Context, in ExportJobResultsIn
 		return err
 	}
 	_, err = a.d.DB.Exec(ctx, `
-		UPDATE jobs SET results_ref = $1, updated_at = now() WHERE id = $2`, ref, in.JobID)
+		UPDATE jobs SET results_ref = $1, export_status = 'succeeded', export_error = NULL, updated_at = now()
+		WHERE id = $2`, ref, in.JobID)
+	return err
+}
+
+// RecordExportStarted marks the export in progress. The export workflow owns
+// export_status, so its own ordering keeps pending before the outcome.
+func (a *Activities) RecordExportStarted(ctx context.Context, in ExportJobResultsInput) error {
+	_, err := a.d.DB.Exec(ctx, `
+		UPDATE jobs SET export_status = 'pending', export_error = NULL, updated_at = now() WHERE id = $1`,
+		in.JobID)
+	return err
+}
+
+type RecordExportFailureInput struct {
+	JobID int64  `json:"jobId"`
+	Error string `json:"error"`
+}
+
+// RecordExportFailure makes a failed export visible without changing the
+// migration outcome. A previous results_ref stays but may be stale until an
+// export succeeds.
+func (a *Activities) RecordExportFailure(ctx context.Context, in RecordExportFailureInput) error {
+	_, err := a.d.DB.Exec(ctx, `
+		UPDATE jobs SET export_status = 'failed', export_error = $1, updated_at = now() WHERE id = $2`,
+		in.Error, in.JobID)
 	return err
 }
 
@@ -135,7 +160,7 @@ func (a *Activities) loadExportPage(ctx context.Context, jobID, after int64, fai
 		FROM job_rows
 		WHERE job_id = $1 AND row_index > $2`
 	if failedOnly {
-		q += ` AND status = 'failed'::row_status`
+		q += ` AND status IN ('failed'::row_status, 'unresolved'::row_status)`
 	}
 	q += ` ORDER BY row_index ASC LIMIT $3`
 

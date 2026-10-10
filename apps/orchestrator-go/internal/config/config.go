@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -29,6 +30,11 @@ type Config struct {
 	BridgeAddr     string
 	BridgeToken    string
 	APIInternalURL string
+
+	// Job reconciler: how often it runs, and how long a non-terminal job must
+	// be unchanged before its workflow is checked.
+	ReconcileInterval   time.Duration
+	ReconcileStaleAfter time.Duration
 }
 
 func Load() (Config, error) {
@@ -75,6 +81,13 @@ func Load() (Config, error) {
 		return cfg, errors.New("BRIDGE_TOKEN is required (shared secret between API and orchestrator)")
 	}
 	cfg.APIInternalURL = getenv("API_INTERNAL_URL", "http://api:8080")
+
+	if cfg.ReconcileInterval, err = time.ParseDuration(getenv("RECONCILE_INTERVAL", "1m")); err != nil || cfg.ReconcileInterval <= 0 {
+		return cfg, errors.New("RECONCILE_INTERVAL must be a positive duration")
+	}
+	if cfg.ReconcileStaleAfter, err = time.ParseDuration(getenv("RECONCILE_STALE_AFTER", "5m")); err != nil || cfg.ReconcileStaleAfter <= 0 {
+		return cfg, errors.New("RECONCILE_STALE_AFTER must be a positive duration")
+	}
 	return cfg, nil
 }
 

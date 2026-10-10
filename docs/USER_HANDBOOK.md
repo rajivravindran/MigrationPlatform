@@ -158,6 +158,9 @@ For each batch of rows the Go worker:
 You can **Pause / Resume / Cancel** from the job page. Those hit
 `POST /jobs/{id}/pause|resume|cancel` and become Temporal signals.
 
+When the run ends, however it ends, the worker records the job outcome and
+then uploads the results files. See [§11](#how-a-job-reaches-its-final-status).
+
 ---
 
 ## 4. Screens and roles
@@ -442,11 +445,31 @@ See [url-templating.md](url-templating.md) for path/query/header rules.
 Missing path params **fail the row** (no retry). Missing query/headers
 are omitted.
 
-### Auth types
+### Auth and destination secrets
 
-`bearer`, `basic`, `apiKey`, `oauth2Client` — secret material lives in
-the encrypted secrets store, referenced by `secretRef`. Do not paste
-production tokens into the destination URL.
+`auth.secretRef` names a **destination secret** of your organization. An
+admin creates or rotates it, and nobody can read the value back:
+
+```bash
+curl -s -X PUT http://localhost:8080/secrets/pms_token \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"value":"<token from your PMS>"}'
+curl -s http://localhost:8080/secrets -H "Authorization: Bearer $TOKEN"   # names only
+curl -s -X DELETE http://localhost:8080/secrets/pms_token -H "Authorization: Bearer $TOKEN"  # revoke
+```
+
+| `auth.type` | Request header |
+|---|---|
+| `bearer` | `Authorization: Bearer <value>` |
+| `basic` | `Authorization: Basic …`; the value must be `user:password` |
+| `api_key` | `X-API-Key: <value>`, or the header named by `headerName` |
+
+The secret is looked up on every call, so a rotation applies to the next
+request, even in a running job. If the secret is missing, revoked or
+belongs to another organization, the row fails with "not available" and
+nothing is sent. Connector and LLM credentials can't be referenced from a
+template. `oauth2_client` is not implemented, and templates that use it are
+rejected when saved. Never paste tokens into the URL or headers.
 
 ### Retries
 
@@ -460,17 +483,48 @@ Template-level:
 }
 ```
 
-The HTTP activity **retries** 429 and 5xx (Temporal). **4xx** is treated
-as a deterministic row failure (no retry budget). After retries are
-exhausted the row is `failed`; you can **Retry failed** later.
+A **4xx** (except 408 and 429) fails the row. It uses no retry budget. A
+**429**, or a connection that failed before the request was sent, is
+retried. After retries are used up the row is `failed`, and you can
+**Retry failed** later.
 
-### Idempotency
+A **5xx**, a **408**, a timeout, or a connection dropped after the request
+was sent means the outcome is unknown: the destination may already have
+applied it. What happens next depends on `destination.delivery`.
+
+### Idempotency and delivery policy
 
 The platform computes a stable key from job + row + step + payload and
-sends it if you set `idempotencyHeader` (e.g. `Idempotency-Key`). That
-only helps if the **target API** honours the header. Legacy PMS APIs
-often do not — then design **lookup-then-create** (GET by loyalty id,
-then POST or PUT) so retries do not create duplicates.
+sends it if you set `idempotencyHeader` (e.g. `Idempotency-Key`).
+Setting the header doesn't make re-sending safe. Only the destination's
+own behaviour does. Declare that behaviour:
+
+```json
+"delivery": { "mode": "idempotent", "idempotencyRetentionHours": 24 }
+```
+
+```json
+"delivery": { "mode": "lookup", "lookup": {
+  "url": "https://pms.example.com/v1/guests",
+  "queryParams": { "loyaltyId": { "$from": "loyalty_id" } },
+  "foundPath": "$.data[0].id" } }
+```
+
+| Mode | When the outcome is unknown | Use when |
+|---|---|---|
+| `idempotent` | Re-send with the same key, within the retention window | The API documents idempotency-key support (requires `idempotencyHeader`) |
+| `lookup` | GET the lookup URL first. A match is the result; otherwise re-send | Records have a business key you can search by |
+| `manual` | Stop. The row becomes `unresolved` | Anything else |
+
+Without `delivery`, GET/PUT/DELETE use `idempotent` and POST/PATCH use
+`manual`. A create is never re-sent on a guess.
+
+An **`unresolved`** row may or may not exist at the destination. Its chain
+stops, the job finishes `failed`, and `totals.unresolved` counts it. Check
+the destination. If the record is not there, use **Confirm & retry** on
+the row. That sends `{"confirm_not_applied": true}`, and the decision is
+audited. A retry without the confirmation returns `409`. **Retry failed**
+skips unresolved rows.
 
 ---
 
@@ -519,20 +573,69 @@ Job page (`/jobs/{id}`):
 | Live counters | `GET /jobs/{id}/stream` | Redis SSE |
 | Row table | `GET /jobs/{id}/rows` | Status, error, payload |
 | Step trail | `GET /jobs/{id}/rows/{n}/steps` | Multi-step request/response |
-| Pause / Resume | `POST .../pause` / `resume` | Temporal signals |
-| Cancel | `POST .../cancel` | Cancel workflow |
-| Retry failed | `POST .../retry-failed` | `RetryFailedRowsWorkflow` |
-| Retry one row | `POST .../rows/{n}/retry` | Optional `{ "from_start": true }` |
+| Pause / Resume | `POST .../pause` / `resume` | Temporal signals; pause needs `running`, resume needs `paused`, otherwise `409` |
+| Cancel | `POST .../cancel` | Cancel workflow; allowed while `pending`, `running` or `paused`, otherwise `409` |
+| Retry failed | `POST .../retry-failed` | `RetryFailedRowsWorkflow` (failed rows only) |
+| Retry one row | `POST .../rows/{n}/retry` | Optional `{ "from_start": true }`; `{ "confirm_not_applied": true }` for an unresolved row |
 | Download results | `GET .../results` | CSV of outcomes |
-| Download failures | `GET .../results?failed=true` | Failed rows only |
+| Download failures | `GET .../results?failed=true` | Failed and unresolved rows |
+| Retry export | `POST .../export` | Rebuilds the results files only; no destination calls (`202`) |
 
 Statuses: `pending`, `running`, `paused`, `succeeded`, `failed`,
-`cancelled`. A job can finish with some failed rows (inspect the table;
-totals show `failed`).
+`cancelled`. A job can finish with some failed or unresolved rows. Inspect
+the table; the totals show `failed` and `unresolved`. Row statuses add
+`unresolved` (see [§9](#idempotency-and-delivery-policy)).
 
-If Cancel says **workflow not found**, the Temporal run already ended
-but the job row may still say `running` (known gap — see [§15](#15-what-this-is-not)).
-Use a new job rather than hammering Cancel.
+You can run one retry per job at a time. A retry is refused with `409`
+while the job is still pending, running or paused, or while another retry
+of the same job is running.
+
+### How a job reaches its final status
+
+The worker that runs the job records its outcome. That happens on every
+exit: success, a failed ingest or preprocess, a license refusal, and
+cancellation. Cleanup still runs after a cancel.
+
+| Final status | Meaning |
+|--------------|---------|
+| `succeeded` | Every source record has a row and every row succeeded |
+| `failed` | At least one row failed or is unresolved, no rows were read, or the job stopped early. When it stopped early, the job page shows the cause in red (`last_error` in the API) |
+| `cancelled` | An operator cancelled it. Rows already delivered stay delivered |
+
+A job that stopped early stays `failed` even after you retry its rows.
+Row retries cannot cover source records that were never read. Fix the
+cause and start a new job.
+
+The API never overwrites a finished job. A very fast job that finishes
+before the start request returns keeps its final status.
+
+**Repair.** The orchestrator runs a reconciler every minute. It looks for
+jobs that are still `pending`, `running` or `paused` and haven't changed
+for 5 minutes, then asks Temporal about their workflow:
+
+| Workflow | Job becomes |
+|----------|-------------|
+| Running | Unchanged (a `pending` job is marked `running`) |
+| Completed without recording the outcome | Status from its rows |
+| Cancelled | `cancelled` |
+| Failed, terminated or timed out | `failed`, with the reason |
+| Not found (never started, or history expired) | `failed` |
+
+Tune it with `RECONCILE_INTERVAL` and `RECONCILE_STALE_AFTER` on the
+orchestrator. Repairs show up in the orchestrator log as `job reconciled`
+and in the metric `jobs_reconciled_total`.
+
+If a start request times out, the job stays `pending` until the reconciler
+learns from Temporal whether the workflow exists. The API does not guess.
+
+Cancel works even if the workflow is already gone: nothing is running, so
+the job becomes `cancelled` straight away.
+
+**Results export.** Export is tracked separately from the job outcome
+(`export_status`: `pending`, `succeeded` or `failed`). If the upload
+fails, the job keeps its status and the page offers **Retry export**,
+which rebuilds the files without calling the destination. Until an export
+succeeds, downloads are built from the database, so they are never stale.
 
 ---
 
@@ -670,12 +773,17 @@ UI.
 | Cannot log in | `make seed` ran; API http://localhost:8080/healthz |
 | No published templates | Publish on the template page |
 | `402 license required` | Settings → License, or unset `LICENSE_ENFORCE` |
-| Job stuck `running`, worker log `unknown preprocess fn 'lowercase'` | Use `builtin.lowercase` |
+| Job failed, error `unknown preprocess fn 'lowercase'` | Use `builtin.lowercase` |
+| Job stuck `running` or `pending` | The reconciler settles it within `RECONCILE_STALE_AFTER` plus one interval (about 6 minutes by default). Check the orchestrator log for `job reconciled` |
 | `400 source_ref must be a JSON object` | Send the object returned by upload, not a string |
 | `400 source not found for this organization` | Upload the file again with your own login; uploads are per organization |
 | Job failed with `SourceChanged` | The stored object changed after upload, or was re-uploaded to the same name while the job was reading it; upload it again and start a new job |
 | Job stopped with `InvalidCheckpoint` | The job could not prove where to resume reading (for example a Salesforce read saved by an older version). It stops rather than skip or repeat rows. Rows already delivered are listed on the job; a new job reads the source from the first row again |
-| Cancel 502 workflow not found | Workflow already finished; job row stale |
+| Rows `unresolved` with "outcome unknown" | The destination may have applied them. Check it, then **Confirm & retry** rows that are missing. To let the platform retry on its own, declare `delivery` ([§9](#idempotency-and-delivery-policy)) |
+| Rows fail with "secret … is not available" | Create the destination secret with `PUT /secrets/{name}` (admin), or fix `auth.secretRef`. A revoked secret has to be set again |
+| Retry returns `409` | The job is still running, another retry of the job is running, or the row is unresolved and needs `confirm_not_applied` |
+| Pause, resume or cancel returns `409` | The job is no longer in a state that allows it; the message says which state it is in |
+| Job page says the results export failed | The job's outcome is unaffected. Fix storage (MinIO) and click **Retry export**, or `POST /jobs/{id}/export` |
 | All rows fail connection | URL must be reachable from **orchestrator** container; httpbin needs egress |
 | `localhost` destination fails | That is the container, not your laptop |
 | JSON ingest error `expected_array` | File must start with `[` |

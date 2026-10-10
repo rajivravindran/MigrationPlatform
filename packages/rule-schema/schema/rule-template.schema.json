@@ -133,16 +133,50 @@
           "additionalProperties": { "$ref": "#/$defs/valueExpr" }
         },
         "auth": {
+          "description": "secretRef names an organization secret of kind destination; the value is resolved when the call is made and never stored in the template or job.",
           "type": "object",
           "required": ["type"],
           "properties": {
             "type": { "enum": ["bearer", "basic", "api_key", "oauth2_client"] },
-            "secretRef": { "type": "string" },
+            "secretRef": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$" },
             "headerName": { "type": "string" }
           }
         },
         "idempotencyKey":     {},
-        "idempotencyHeader":  { "type": "string" }
+        "idempotencyHeader":  { "type": "string" },
+        "delivery": { "$ref": "#/$defs/delivery" }
+      }
+    },
+    "delivery": {
+      "description": "What to do when a call's outcome is unknown (ADR 0003). Defaults: GET/PUT/DELETE idempotent, POST/PATCH manual.",
+      "type": "object",
+      "required": ["mode"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["idempotent", "lookup", "manual"] },
+        "idempotencyRetentionHours": { "type": "integer", "minimum": 1, "maximum": 8760 },
+        "lookup": {
+          "type": "object",
+          "required": ["url", "foundPath"],
+          "additionalProperties": false,
+          "properties": {
+            "method": { "enum": ["GET"] },
+            "url": { "type": "string", "format": "uri-reference" },
+            "pathParams": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/valueExpr" }
+            },
+            "queryParams": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/valueExpr" }
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/valueExpr" }
+            },
+            "foundPath": { "type": "string", "pattern": "^\\$" }
+          }
+        }
       }
     },
     "exportColumn": {

@@ -444,10 +444,14 @@ type MarkJobRunningInput struct {
 	RunID string `json:"runId"`
 }
 
-// MarkJobRunning sets status/run id after the child MigrationWorkflow has started.
+// MarkJobRunning records the run id after the child MigrationWorkflow has
+// started. Only a pending job becomes running: a fast child may already have
+// finalized it.
 func (a *Activities) MarkJobRunning(ctx context.Context, in MarkJobRunningInput) error {
 	_, err := a.d.DB.Exec(ctx, `
-		UPDATE jobs SET status = 'running'::job_status, temporal_run_id = $1, started_at = COALESCE(started_at, now()), updated_at = now()
+		UPDATE jobs SET
+			status = CASE WHEN status = 'pending'::job_status THEN 'running'::job_status ELSE status END,
+			temporal_run_id = $1, started_at = COALESCE(started_at, now()), updated_at = now()
 		WHERE id = $2`, in.RunID, in.JobID)
 	return err
 }

@@ -123,6 +123,7 @@ export function statusTone(status?: string): StatusTone {
     case "expired":
       return "fail";
     case "paused":
+    case "unresolved":
     case "partial":
     case "cancelled":
     case "draft":

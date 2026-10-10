@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -19,6 +18,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"github.com/migration-platform/orchestrator/internal/connectors"
+	"github.com/migration-platform/orchestrator/internal/lifecycle"
 	"github.com/migration-platform/orchestrator/internal/metrics"
 	"github.com/migration-platform/orchestrator/internal/redisbus"
 	"github.com/migration-platform/orchestrator/internal/security"
@@ -44,6 +44,8 @@ type Activities struct {
 	d         Deps
 	sftpSlots chan struct{}
 	sources   *sourceAuthorizer
+	ledger    operationLedger
+	secrets   secretResolver
 }
 
 func NewActivities(d Deps) *Activities {
@@ -51,6 +53,8 @@ func NewActivities(d Deps) *Activities {
 		d:         d,
 		sftpSlots: make(chan struct{}, 8),
 		sources:   newSourceAuthorizer(d.DB, d.SecretsMasterKey),
+		ledger:    pgOperationLedger{db: d.DB},
+		secrets:   pgSecretResolver{db: d.DB, masterKey: d.SecretsMasterKey},
 	}
 }
 
@@ -281,100 +285,6 @@ func (a *Activities) Ingest(ctx context.Context, in IngestInput) (IngestOutput, 
 
 // ---------------- CallEndpoint ----------------
 
-// CallEndpointInput carries the per-row, fully-rendered HTTP request. URL,
-// Headers and IdempotencyKey are computed by the workflow (see
-// template.RenderDestination) so the activity is purely an IO sender.
-type CallEndpointInput struct {
-	JobID             int64             `json:"jobId"`
-	RowIndex          int64             `json:"rowIndex"`
-	StepName          string            `json:"stepName,omitempty"`
-	Method            string            `json:"method"`
-	URL               string            `json:"url"`
-	Headers           map[string]string `json:"headers,omitempty"`
-	Payload           map[string]any    `json:"payload"`
-	HasBody           bool              `json:"hasBody,omitempty"`
-	IdempotencyKey    string            `json:"idempotencyKey,omitempty"`
-	IdempotencyHeader string            `json:"idempotencyHeader,omitempty"`
-	RetryAttempts     int               `json:"retryAttempts,omitempty"`
-}
-
-type CallEndpointOutput struct {
-	Status    int             `json:"status"`
-	Body      json.RawMessage `json:"body"`
-	Succeeded bool            `json:"succeeded"`
-	Error     string          `json:"error,omitempty"`
-	LatencyMs int64           `json:"latencyMs"`
-}
-
-func (a *Activities) CallEndpoint(ctx context.Context, in CallEndpointInput) (CallEndpointOutput, error) {
-	started := time.Now()
-
-	var bodyReader io.Reader
-	// GET/DELETE steps typically carry no body; sending "{}" to strict APIs
-	// causes spurious 400s, so only attach a body when the step mapped one.
-	sendBody := in.HasBody || len(in.Payload) > 0
-	if sendBody {
-		body, err := json.Marshal(in.Payload)
-		if err != nil {
-			return CallEndpointOutput{Error: err.Error()}, err
-		}
-		bodyReader = strings.NewReader(string(body))
-	}
-	req, err := http.NewRequestWithContext(ctx, in.Method, in.URL, bodyReader)
-	if err != nil {
-		return CallEndpointOutput{Error: err.Error()}, err
-	}
-	if sendBody {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	for k, v := range in.Headers {
-		req.Header.Set(k, v)
-	}
-	if in.IdempotencyHeader != "" && in.IdempotencyKey != "" {
-		req.Header.Set(in.IdempotencyHeader, in.IdempotencyKey)
-	}
-
-	if a.d.RateLimiter != nil {
-		if err := a.d.RateLimiter.Wait(ctx, req.URL.Host); err != nil {
-			return CallEndpointOutput{Error: err.Error()}, err
-		}
-	}
-
-	resp, err := a.d.HTTP.Do(req)
-	latency := time.Since(started).Milliseconds()
-	if err != nil {
-		metrics.EndpointLatency.WithLabelValues("error").Observe(float64(latency) / 1000)
-		return CallEndpointOutput{Error: err.Error(), LatencyMs: latency}, err
-	}
-	defer resp.Body.Close()
-	maxBytes := a.d.MaxResponseBytes
-	if maxBytes <= 0 {
-		maxBytes = 1 << 20
-	}
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
-
-	statusLabel := fmt.Sprintf("%d", resp.StatusCode/100*100)
-	metrics.EndpointLatency.WithLabelValues(statusLabel).Observe(float64(latency) / 1000)
-
-	safeBody := safeJSON(respBody)
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return CallEndpointOutput{
-			Status: resp.StatusCode, Body: safeBody, LatencyMs: latency,
-			Error: fmt.Sprintf("retryable %d: %s", resp.StatusCode, excerpt(respBody, 300)),
-		}, fmt.Errorf("retryable status %d", resp.StatusCode)
-	}
-	if resp.StatusCode >= 400 {
-		return CallEndpointOutput{
-			Status: resp.StatusCode, Body: safeBody, LatencyMs: latency, Succeeded: false,
-			Error: fmt.Sprintf("status %d: %s", resp.StatusCode, excerpt(respBody, 300)),
-		}, nil
-	}
-
-	return CallEndpointOutput{
-		Status: resp.StatusCode, Body: safeBody, Succeeded: true, LatencyMs: latency,
-	}, nil
-}
-
 // safeJSON returns raw unchanged when it is valid JSON, otherwise wraps it in
 // a JSON string so it survives Temporal payload marshaling and JSONB inserts.
 // Empty bodies become JSON null.
@@ -414,6 +324,9 @@ type PersistOutcomeInput struct {
 	Status         string `json:"status"`
 	LastError      string `json:"lastError,omitempty"`
 	IdempotencyKey string `json:"idempotencyKey,omitempty"`
+	// AttemptID identifies this processing of the row; a redelivery with the
+	// same ID does not count as another attempt.
+	AttemptID string `json:"attemptId,omitempty"`
 	// Row is the raw (preprocessed) source row; persisted so single-row
 	// retries never need to re-read the source file.
 	Row      map[string]any  `json:"row,omitempty"`
@@ -422,24 +335,28 @@ type PersistOutcomeInput struct {
 }
 
 // PersistOutcome upserts the row's final state for this processing attempt.
-// `attempts` counts processing attempts and is incremented server-side so
-// retries accumulate correctly no matter which path dispatched them.
+// `attempts` counts distinct processing attempts: it is incremented
+// server-side when AttemptID changes, so a redelivered call is not counted
+// twice and retries accumulate no matter which path dispatched them.
 func (a *Activities) PersistOutcome(ctx context.Context, in PersistOutcomeInput) error {
 	payload, _ := json.Marshal(in.Payload)
 	rowJSON, _ := json.Marshal(in.Row)
 	_, err := a.d.DB.Exec(ctx, `
-        INSERT INTO job_rows (job_id, row_index, status, attempts, last_error, idempotency_key, row_json, payload_json, response_json)
-        VALUES ($1, $2, $3::row_status, 1, $4, $5, $6, $7, $8)
+        INSERT INTO job_rows (job_id, row_index, status, attempts, last_error, idempotency_key, row_json, payload_json, response_json, last_attempt_id)
+        VALUES ($1, $2, $3::row_status, 1, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (job_id, row_index) DO UPDATE SET
             status = EXCLUDED.status,
-            attempts = job_rows.attempts + 1,
+            attempts = job_rows.attempts + CASE
+                WHEN EXCLUDED.last_attempt_id IS NOT NULL AND EXCLUDED.last_attempt_id = job_rows.last_attempt_id THEN 0
+                ELSE 1 END,
+            last_attempt_id = EXCLUDED.last_attempt_id,
             last_error = EXCLUDED.last_error,
             row_json = COALESCE(EXCLUDED.row_json, job_rows.row_json),
             payload_json = EXCLUDED.payload_json,
             response_json = EXCLUDED.response_json,
             updated_at = now()`,
 		in.JobID, in.RowIndex, in.Status,
-		nullIf(in.LastError), nullIf(in.IdempotencyKey), nullIfJSON(rowJSON), payload, safeJSON(in.Response))
+		nullIf(in.LastError), nullIf(in.IdempotencyKey), nullIfJSON(rowJSON), payload, safeJSON(in.Response), nullIf(in.AttemptID))
 	if err != nil {
 		return err
 	}
@@ -465,6 +382,7 @@ type PersistStepOutcomeInput struct {
 	ResponseStatus int             `json:"responseStatus,omitempty"`
 	Response       json.RawMessage `json:"response,omitempty"`
 	LastError      string          `json:"lastError,omitempty"`
+	AttemptID      string          `json:"attemptId,omitempty"`
 }
 
 // PersistStepOutcome records one step of a multi-step chain. Only invoked for
@@ -473,12 +391,15 @@ type PersistStepOutcomeInput struct {
 func (a *Activities) PersistStepOutcome(ctx context.Context, in PersistStepOutcomeInput) error {
 	reqJSON, _ := json.Marshal(in.Request)
 	_, err := a.d.DB.Exec(ctx, `
-        INSERT INTO job_row_steps (job_id, row_index, step_index, step_name, status, attempts, request_url, request_json, response_status, response_json, last_error)
-        VALUES ($1, $2, $3, $4, $5::row_status, 1, $6, $7, $8, $9, $10)
+        INSERT INTO job_row_steps (job_id, row_index, step_index, step_name, status, attempts, request_url, request_json, response_status, response_json, last_error, last_attempt_id)
+        VALUES ($1, $2, $3, $4, $5::row_status, 1, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (job_id, row_index, step_index) DO UPDATE SET
             step_name = EXCLUDED.step_name,
             status = EXCLUDED.status,
-            attempts = job_row_steps.attempts + 1,
+            attempts = job_row_steps.attempts + CASE
+                WHEN EXCLUDED.last_attempt_id IS NOT NULL AND EXCLUDED.last_attempt_id = job_row_steps.last_attempt_id THEN 0
+                ELSE 1 END,
+            last_attempt_id = EXCLUDED.last_attempt_id,
             request_url = EXCLUDED.request_url,
             request_json = EXCLUDED.request_json,
             response_status = EXCLUDED.response_status,
@@ -486,7 +407,7 @@ func (a *Activities) PersistStepOutcome(ctx context.Context, in PersistStepOutco
             last_error = EXCLUDED.last_error,
             updated_at = now()`,
 		in.JobID, in.RowIndex, in.StepIndex, in.StepName, in.Status,
-		nullIf(in.RequestURL), reqJSON, zeroToNil(in.ResponseStatus), safeJSON(in.Response), nullIf(in.LastError))
+		nullIf(in.RequestURL), reqJSON, zeroToNil(in.ResponseStatus), safeJSON(in.Response), nullIf(in.LastError), nullIf(in.AttemptID))
 	return err
 }
 
@@ -621,68 +542,23 @@ func (a *Activities) PublishProgress(ctx context.Context, in PublishProgressInpu
 type FinalizeJobInput struct {
 	JobID     int64 `json:"jobId"`
 	Cancelled bool  `json:"cancelled,omitempty"`
+	// Error records an execution failure outside a row; the job is failed.
+	Error string `json:"error,omitempty"`
 }
 
-// FinalizeJob marks a job complete: recomputes totals from job_rows (source of
-// truth) and sets status + finished_at. Skips jobs already cancelled.
+// FinalizeJob recomputes totals from job_rows and writes the terminal status
+// (see lifecycle.Finalize for the rules).
 func (a *Activities) FinalizeJob(ctx context.Context, in FinalizeJobInput) error {
-	var processed, failed, total int64
-	err := a.d.DB.QueryRow(ctx, `
-        SELECT
-            count(*) FILTER (WHERE status = 'succeeded'::row_status),
-            count(*) FILTER (WHERE status = 'failed'::row_status),
-            count(*)
-        FROM job_rows WHERE job_id = $1`, in.JobID).Scan(&processed, &failed, &total)
-	if err != nil {
-		return err
-	}
-
-	status := "succeeded"
-	switch {
-	case in.Cancelled:
-		status = "cancelled"
-	case failed > 0:
-		status = "failed"
-	case total == 0:
-		status = "failed"
-	}
-
-	totals, err := json.Marshal(map[string]any{
-		"processed": processed,
-		"failed":    failed,
-		"total":     total,
-	})
-	if err != nil {
-		return err
-	}
-
-	_, err = a.d.DB.Exec(ctx, `
-        UPDATE jobs SET
-            status = $1::job_status,
-            totals_json = $2,
-            finished_at = now(),
-            updated_at = now()
-        WHERE id = $3 AND status <> 'cancelled'::job_status`,
-		status, totals, in.JobID)
+	_, err := lifecycle.Finalize(ctx, a.d.DB, in.JobID, lifecycle.Outcome{Cancelled: in.Cancelled, Error: in.Error})
 	return err
 }
 
 func (a *Activities) syncJobTotals(ctx context.Context, jobID int64) error {
-	var processed, failed, total int64
-	err := a.d.DB.QueryRow(ctx, `
-        SELECT
-            count(*) FILTER (WHERE status = 'succeeded'::row_status),
-            count(*) FILTER (WHERE status = 'failed'::row_status),
-            count(*)
-        FROM job_rows WHERE job_id = $1`, jobID).Scan(&processed, &failed, &total)
+	t, err := lifecycle.CountRows(ctx, a.d.DB, jobID)
 	if err != nil {
 		return err
 	}
-	totals, err := json.Marshal(map[string]any{
-		"processed": processed,
-		"failed":    failed,
-		"total":     total,
-	})
+	totals, err := json.Marshal(t)
 	if err != nil {
 		return err
 	}
