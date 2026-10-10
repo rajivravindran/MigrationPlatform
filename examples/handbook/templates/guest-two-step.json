@@ -1,0 +1,69 @@
+{
+  "template_key": "guest-two-step",
+  "name": "Handbook guest create then attach stay",
+  "schema_json": {
+    "id": "guest-two-step",
+    "version": 1,
+    "name": "Handbook guest create then attach stay",
+    "source": {
+      "type": "csv",
+      "schema": [
+        { "name": "email", "type": "string" },
+        { "name": "first_name", "type": "string" },
+        { "name": "last_name", "type": "string" },
+        { "name": "country", "type": "string" },
+        { "name": "loyalty_id", "type": "string" },
+        { "name": "check_in", "type": "string" },
+        { "name": "amount", "type": "number" }
+      ],
+      "options": { "header": true, "delimiter": "," }
+    },
+    "preprocess": [
+      { "id": "lc_email", "field": "email", "fn": "builtin.lowercase" }
+    ],
+    "steps": [
+      {
+        "name": "createGuest",
+        "description": "Create the guest profile",
+        "onFailure": "stop",
+        "mapping": {
+          "payload": {
+            "email": { "$from": "email" },
+            "firstName": { "$from": "first_name" },
+            "lastName": { "$from": "last_name" },
+            "loyaltyId": { "$from": "loyalty_id" }
+          }
+        },
+        "destination": {
+          "type": "http",
+          "method": "POST",
+          "url": "https://httpbin.org/post",
+          "idempotencyHeader": "Idempotency-Key"
+        }
+      },
+      {
+        "name": "createStay",
+        "description": "Create a stay using the previous response echo",
+        "onFailure": "stop",
+        "mapping": {
+          "payload": {
+            "checkIn": { "$from": "check_in" },
+            "total": { "$from": "amount" },
+            "guestEmail": { "$fromResponse": "createGuest", "path": "$.json.email" }
+          }
+        },
+        "destination": {
+          "type": "http",
+          "method": "POST",
+          "url": "https://httpbin.org/post",
+          "idempotencyHeader": "Idempotency-Key"
+        }
+      }
+    ],
+    "retry": {
+      "maxAttempts": 5,
+      "backoff": "exponential",
+      "initialIntervalMs": 1000
+    }
+  }
+}

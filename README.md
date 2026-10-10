@@ -109,6 +109,10 @@ Grafana/Prometheus are on the full `make up` stack, not the slim demo pack.
 3. **Jobs → Start a job**, upload a small CSV (`email,country,amount`), start
 4. Open the job: row list, request/response, **Download results** (CSV)
 
+**Full operator guide** (screens, configuration, JSON/XML, multi-step, batches,
+and ready-made sample files): **[docs/USER_HANDBOOK.md](docs/USER_HANDBOOK.md)**.
+Samples: [`examples/handbook/`](examples/handbook/).
+
 ---
 
 ## What you just installed
@@ -136,6 +140,7 @@ Browser  →  Next.js UI (:3000)
 
 | Doc | Contents |
 |-----|----------|
+| [docs/USER_HANDBOOK.md](docs/USER_HANDBOOK.md) | Operator handbook + sample files |
 | [docs/install.md](docs/install.md) | Commercial/trial license install |
 | [docs/architecture.md](docs/architecture.md) | Components and job data flow |
 | [docs/api.md](docs/api.md) | REST API |

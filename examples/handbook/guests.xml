@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<guests>
+  <record>
+    <email>alice@acme.com</email>
+    <first_name>Alice</first_name>
+    <last_name>Ng</last_name>
+    <country>usa</country>
+    <loyalty_id>LOY-1001</loyalty_id>
+    <check_in>2026-09-01</check_in>
+    <amount>240</amount>
+  </record>
+  <record>
+    <email>bob@acme.com</email>
+    <first_name>Bob</first_name>
+    <last_name>Singh</last_name>
+    <country>USA</country>
+    <loyalty_id>LOY-1002</loyalty_id>
+    <check_in>2026-09-02</check_in>
+    <amount>180</amount>
+  </record>
+  <record>
+    <email>carol@acme.com</email>
+    <first_name>Carol</first_name>
+    <last_name>Diaz</last_name>
+    <country>canada</country>
+    <loyalty_id>LOY-1003</loyalty_id>
+    <check_in>2026-09-03</check_in>
+    <amount>95</amount>
+  </record>
+</guests>

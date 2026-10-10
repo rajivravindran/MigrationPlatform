@@ -1,0 +1,34 @@
+{
+  "template_key": "room-type-upsert",
+  "name": "Handbook room-type upsert",
+  "schema_json": {
+    "id": "room-type-upsert",
+    "version": 1,
+    "name": "Handbook room-type upsert",
+    "source": {
+      "type": "csv",
+      "schema": [
+        { "name": "property_code", "type": "string" },
+        { "name": "room_code", "type": "string" },
+        { "name": "name", "type": "string" },
+        { "name": "beds", "type": "integer" }
+      ],
+      "options": { "header": true, "delimiter": "," }
+    },
+    "preprocess": [],
+    "mapping": {
+      "payload": {
+        "propertyCode": { "$from": "property_code" },
+        "code": { "$from": "room_code" },
+        "name": { "$from": "name" },
+        "beds": { "$from": "beds" }
+      }
+    },
+    "destination": {
+      "type": "http",
+      "method": "POST",
+      "url": "https://httpbin.org/post",
+      "idempotencyHeader": "Idempotency-Key"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "template_key": "property-upsert",
+  "name": "Handbook property upsert",
+  "schema_json": {
+    "id": "property-upsert",
+    "version": 1,
+    "name": "Handbook property upsert",
+    "source": {
+      "type": "csv",
+      "schema": [
+        { "name": "property_code", "type": "string" },
+        { "name": "name", "type": "string" },
+        { "name": "city", "type": "string" },
+        { "name": "country", "type": "string" }
+      ],
+      "options": { "header": true, "delimiter": "," }
+    },
+    "preprocess": [],
+    "mapping": {
+      "payload": {
+        "code": { "$from": "property_code" },
+        "name": { "$from": "name" },
+        "city": { "$from": "city" },
+        "country": { "$from": "country" }
+      }
+    },
+    "destination": {
+      "type": "http",
+      "method": "POST",
+      "url": "https://httpbin.org/post",
+      "idempotencyHeader": "Idempotency-Key"
+    }
+  }
+}

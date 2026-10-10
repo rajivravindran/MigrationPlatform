@@ -1,0 +1,57 @@
+{
+  "template_key": "guest-httpbin",
+  "name": "Handbook guest → HTTP echo",
+  "schema_json": {
+    "id": "guest-httpbin",
+    "version": 1,
+    "name": "Handbook guest → HTTP echo",
+    "source": {
+      "type": "csv",
+      "schema": [
+        { "name": "email", "type": "string" },
+        { "name": "first_name", "type": "string" },
+        { "name": "last_name", "type": "string" },
+        { "name": "country", "type": "string" },
+        { "name": "loyalty_id", "type": "string" },
+        { "name": "check_in", "type": "string" },
+        { "name": "amount", "type": "number" }
+      ],
+      "options": { "header": true, "delimiter": "," }
+    },
+    "preprocess": [
+      { "id": "lc_email", "field": "email", "fn": "builtin.lowercase" },
+      { "id": "lc_country", "field": "country", "fn": "builtin.lowercase" },
+      {
+        "id": "iso_country",
+        "field": "country",
+        "fn": "builtin.lookup",
+        "args": {
+          "table": { "usa": "US", "canada": "CA", "uk": "GB", "india": "IN" },
+          "default": "XX"
+        }
+      }
+    ],
+    "mapping": {
+      "payload": {
+        "email": { "$from": "email" },
+        "firstName": { "$from": "first_name" },
+        "lastName": { "$from": "last_name" },
+        "country": { "$from": "country" },
+        "loyaltyId": { "$from": "loyalty_id" },
+        "checkIn": { "$from": "check_in" },
+        "total": { "$from": "amount" }
+      }
+    },
+    "destination": {
+      "type": "http",
+      "method": "POST",
+      "url": "https://httpbin.org/post",
+      "idempotencyHeader": "Idempotency-Key"
+    },
+    "retry": {
+      "maxAttempts": 5,
+      "backoff": "exponential",
+      "initialIntervalMs": 1000
+    }
+  }
+}

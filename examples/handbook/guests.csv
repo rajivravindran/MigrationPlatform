@@ -1,0 +1,6 @@
+email,first_name,last_name,country,loyalty_id,check_in,amount
+alice@acme.com,Alice,Ng,usa,LOY-1001,2026-09-01,240
+bob@acme.com,Bob,Singh,USA,LOY-1002,2026-09-02,180
+carol@acme.com,Carol,Diaz,canada,LOY-1003,2026-09-03,95
+dave@acme.com,Dave,Chen,UK,LOY-1004,2026-09-04,410
+eve@acme.com,Eve,Khan,india,LOY-1005,2026-09-05,55

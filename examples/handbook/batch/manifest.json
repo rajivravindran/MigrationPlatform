@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "batchId": "handbook-property-cutover",
+  "onStageFailure": "stop",
+  "stages": [
+    {
+      "id": "properties",
+      "file": "properties.csv",
+      "templateKey": "property-upsert"
+    },
+    {
+      "id": "room-types",
+      "file": "room-types.csv",
+      "templateKey": "room-type-upsert",
+      "dependsOn": ["properties"]
+    }
+  ]
+}

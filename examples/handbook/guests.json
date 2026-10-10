@@ -1,0 +1,29 @@
+[
+  {
+    "email": "alice@acme.com",
+    "first_name": "Alice",
+    "last_name": "Ng",
+    "country": "usa",
+    "loyalty_id": "LOY-1001",
+    "check_in": "2026-09-01",
+    "amount": 240
+  },
+  {
+    "email": "bob@acme.com",
+    "first_name": "Bob",
+    "last_name": "Singh",
+    "country": "USA",
+    "loyalty_id": "LOY-1002",
+    "check_in": "2026-09-02",
+    "amount": 180
+  },
+  {
+    "email": "carol@acme.com",
+    "first_name": "Carol",
+    "last_name": "Diaz",
+    "country": "canada",
+    "loyalty_id": "LOY-1003",
+    "check_in": "2026-09-03",
+    "amount": 95
+  }
+]
