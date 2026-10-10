@@ -440,9 +440,11 @@ type RetryFailedRowsInput struct {
 	JobID               int64 `json:"jobId"`
 	RuleTemplateID      int64 `json:"ruleTemplateId"`
 	RuleTemplateVersion int32 `json:"ruleTemplateVersion"`
-	// After is the row_index cursor for continue-as-new.
-	After     int64 `json:"after,omitempty"`
-	FromStart bool  `json:"fromStart,omitempty"`
+	// After is the exclusive row_index cursor carried across continue-as-new.
+	// nil means "start before the first row"; row indexes are zero-based, so a
+	// zero value cannot double as the initial cursor.
+	After     *int64 `json:"after,omitempty"`
+	FromStart bool   `json:"fromStart,omitempty"`
 }
 
 // RetryFailedRowsWorkflow re-processes every currently-failed row of a job
@@ -481,7 +483,7 @@ func RetryFailedRowsWorkflow(ctx workflow.Context, in RetryFailedRowsInput) (*Mi
 			break
 		}
 		for _, rowIndex := range page.RowIndexes {
-			cursor = rowIndex
+			cursor = &rowIndex
 			if err := retryPersistedRow(ctx, in.JobID, tplOut.Template, rowIndex, in.FromStart, result); err != nil {
 				return result, err
 			}

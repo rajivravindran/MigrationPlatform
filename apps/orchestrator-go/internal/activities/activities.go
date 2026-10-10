@@ -508,8 +508,9 @@ func (a *Activities) LoadRowState(ctx context.Context, in LoadRowStateInput) (Lo
 
 type ListFailedRowsInput struct {
 	JobID int64 `json:"jobId"`
-	After int64 `json:"after"` // exclusive row_index cursor
-	Limit int   `json:"limit"`
+	// After is an exclusive row_index cursor; nil starts before row zero.
+	After *int64 `json:"after,omitempty"`
+	Limit int    `json:"limit"`
 }
 
 type ListFailedRowsOutput struct {
@@ -525,7 +526,8 @@ func (a *Activities) ListFailedRows(ctx context.Context, in ListFailedRowsInput)
 	}
 	rows, err := a.d.DB.Query(ctx, `
         SELECT row_index FROM job_rows
-        WHERE job_id = $1 AND status = 'failed'::row_status AND row_index > $2
+        WHERE job_id = $1 AND status = 'failed'::row_status
+          AND ($2::bigint IS NULL OR row_index > $2::bigint)
         ORDER BY row_index ASC LIMIT $3`,
 		in.JobID, in.After, in.Limit)
 	if err != nil {
