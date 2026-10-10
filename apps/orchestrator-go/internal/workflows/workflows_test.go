@@ -23,7 +23,7 @@ func (s *stubActivities) LoadTemplate(_ any, _ activities.LoadTemplateInput) (ac
 	return activities.LoadTemplateOutput{Template: s.tpl}, nil
 }
 func (s *stubActivities) Ingest(_ any, in activities.IngestInput) (activities.IngestOutput, error) {
-	return activities.IngestOutput{Rows: s.rows, Done: true}, nil
+	return activities.IngestOutput{Rows: s.rows, NewOffset: connectors.Offset{Items: int64(len(s.rows))}, Done: true}, nil
 }
 func (s *stubActivities) CallEndpoint(_ any, _ activities.CallEndpointInput) (activities.CallEndpointOutput, error) {
 	return activities.CallEndpointOutput{Status: 200, Succeeded: true}, nil

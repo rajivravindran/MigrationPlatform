@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 type salesforceBuilder struct{ cfg Config }
@@ -49,58 +48,106 @@ func (b *salesforceBuilder) Open(ctx context.Context, offset Offset) (RowIterato
 		return nil, err
 	}
 
-	jobID, err := sfCreateQueryJob(ctx, client, instanceURL, token, soql)
-	if err != nil {
-		return nil, err
-	}
-	if err := sfWaitJobComplete(ctx, client, instanceURL, token, jobID); err != nil {
-		return nil, err
-	}
-
-	return &sfIter{
+	it := &sfIter{
 		http:     client,
 		instance: instanceURL,
 		token:    token,
-		jobID:    jobID,
+		jobID:    offset.SalesforceJobID,
 		locator:  offset.SalesforceLocator,
-	}, nil
+		skip:     offset.SalesforceSkip,
+		idx:      offset.Items,
+	}
+	if it.jobID == "" {
+		// Offsets written before the job id was recorded point into a query
+		// job that no longer exists; resuming would silently restart.
+		if offset.Items > 0 || offset.SalesforceLocator != "" || offset.SalesforceSkip > 0 {
+			return nil, fmt.Errorf("%w: salesforce offset at row %d has no query job", ErrInvalidOffset, offset.Items)
+		}
+		if it.jobID, err = sfCreateQueryJob(ctx, client, instanceURL, token, soql); err != nil {
+			return nil, err
+		}
+	} else {
+		it.ready = offset.Items > 0 || offset.SalesforceLocator != "" || offset.SalesforceSkip > 0
+	}
+	return it, nil
 }
 
+// sfPageSize is the maxRecords requested per Bulk API results page.
+var sfPageSize = 2000
+
+// sfIter reads one Bulk API 2.0 query job. Every offset it emits names the
+// job, the page being consumed and the rows already taken from that page, so
+// a later Open resumes at exactly the next record.
 type sfIter struct {
-	http      *http.Client
-	instance  string
-	token     string
-	jobID     string
-	locator   string
-	buffered  []map[string]any
-	idx       int64
-	bufCursor int
-	done      bool
+	http     *http.Client
+	instance string
+	token    string
+	jobID    string
+	ready    bool
+
+	locator  string // page being consumed; "" is the first page
+	next     string // locator of the page after it; "" when it is the last
+	skip     int64  // rows of the current page delivered before this iterator
+	buffered []map[string]any
+	loaded   bool
+	cursor   int
+	idx      int64
+	done     bool
+}
+
+func (it *sfIter) offset() Offset {
+	o := Offset{Items: it.idx, SalesforceJobID: it.jobID, SalesforceLocator: it.locator, SalesforceSkip: int64(it.cursor)}
+	if !it.loaded {
+		o.SalesforceSkip = it.skip
+	} else if it.cursor >= len(it.buffered) && it.next != "" {
+		o.SalesforceLocator, o.SalesforceSkip = it.next, 0
+	}
+	return o
 }
 
 func (it *sfIter) Next(ctx context.Context) (Row, Offset, bool, error) {
-	if it.bufCursor >= len(it.buffered) {
-		if it.done {
-			return Row{}, Offset{Items: it.idx, SalesforceLocator: ""}, false, nil
-		}
-		rows, nextLocator, err := sfFetchResults(ctx, it.http, it.instance, it.token, it.jobID, it.locator, 2000)
+	if !it.ready {
+		state, err := sfJobState(ctx, it.http, it.instance, it.token, it.jobID)
 		if err != nil {
-			return Row{}, Offset{Items: it.idx, SalesforceLocator: it.locator}, false, err
+			return Row{}, it.offset(), false, err
 		}
-		if len(rows) == 0 || nextLocator == "null" || nextLocator == "" {
-			it.done = true
-			if len(rows) == 0 {
-				return Row{}, Offset{Items: it.idx}, false, nil
-			}
+		switch state {
+		case "JobComplete":
+			it.ready = true
+		case "Failed", "Aborted":
+			return Row{}, it.offset(), false, fmt.Errorf("sf job %s: %s", it.jobID, state)
+		default:
+			return Row{}, it.offset(), false, ErrSourceNotReady
 		}
-		it.buffered = rows
-		it.bufCursor = 0
-		it.locator = nextLocator
 	}
-	row := Row{Index: it.idx, Data: it.buffered[it.bufCursor]}
-	it.bufCursor++
+	for !it.loaded || it.cursor >= len(it.buffered) {
+		if it.done {
+			return Row{}, it.offset(), false, nil
+		}
+		if it.loaded {
+			if it.next == "" {
+				it.done = true
+				return Row{}, it.offset(), false, nil
+			}
+			it.locator, it.skip = it.next, 0
+		}
+		rows, next, err := sfFetchResults(ctx, it.http, it.instance, it.token, it.jobID, it.locator, sfPageSize)
+		if err != nil {
+			return Row{}, it.offset(), false, err
+		}
+		if next == "null" {
+			next = ""
+		}
+		if it.skip > int64(len(rows)) {
+			return Row{}, it.offset(), false, fmt.Errorf("%w: page %q has %d rows, offset skips %d",
+				ErrInvalidOffset, it.locator, len(rows), it.skip)
+		}
+		it.buffered, it.next, it.cursor, it.loaded = rows, next, int(it.skip), true
+	}
+	row := Row{Index: it.idx, Data: it.buffered[it.cursor]}
+	it.cursor++
 	it.idx++
-	return row, Offset{Items: it.idx, SalesforceLocator: it.locator}, true, nil
+	return row, it.offset(), true, nil
 }
 
 func (it *sfIter) Close() error { return nil }
@@ -161,39 +208,39 @@ func sfCreateQueryJob(ctx context.Context, client *http.Client, instance, token,
 	return out.ID, nil
 }
 
-func sfWaitJobComplete(ctx context.Context, client *http.Client, instance, token, jobID string) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(2 * time.Second):
-		}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, instance+"/services/data/v58.0/jobs/query/"+jobID, nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		var out struct {
-			State string `json:"state"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&out)
-		_ = resp.Body.Close()
-		switch out.State {
-		case "JobComplete":
-			return nil
-		case "Failed", "Aborted":
-			return fmt.Errorf("sf job %s: %s", jobID, out.State)
-		}
+func sfJobState(ctx context.Context, client *http.Client, instance, token, jobID string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, instance+"/services/data/v58.0/jobs/query/"+url.PathEscape(jobID), nil)
+	if err != nil {
+		return "", err
 	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("sf job state: %s %s", resp.Status, string(raw))
+	}
+	var out struct {
+		State string `json:"state"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("sf job state: %w", err)
+	}
+	return out.State, nil
 }
 
 func sfFetchResults(ctx context.Context, client *http.Client, instance, token, jobID, locator string, limit int) ([]map[string]any, string, error) {
-	u := fmt.Sprintf("%s/services/data/v58.0/jobs/query/%s/results?maxRecords=%d", instance, jobID, limit)
+	u := fmt.Sprintf("%s/services/data/v58.0/jobs/query/%s/results?maxRecords=%d", instance, url.PathEscape(jobID), limit)
 	if locator != "" {
 		u += "&locator=" + url.QueryEscape(locator)
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", err
+	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := client.Do(req)
 	if err != nil {

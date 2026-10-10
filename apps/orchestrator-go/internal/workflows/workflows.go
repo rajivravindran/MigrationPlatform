@@ -36,6 +36,8 @@ type MigrationWorkflowInput struct {
 	ScheduledTime       time.Time      `json:"scheduledTime,omitempty"`
 	RetryRow            *RetryRowRef   `json:"retryRow,omitempty"`
 	Shards              int            `json:"shards,omitempty"`
+	// Checkpoint is set by continue-as-new; nil starts at the first row.
+	Checkpoint *Checkpoint `json:"checkpoint,omitempty"`
 }
 
 type RetryRowRef struct {
@@ -104,11 +106,17 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 		}
 	})
 
-	result := &MigrationWorkflowResult{}
-	var offsetRaw []byte = []byte("{}")
+	cp, err := startingCheckpoint(in)
+	if err != nil {
+		return nil, err
+	}
+	result := &MigrationWorkflowResult{Processed: cp.Processed, Failed: cp.Failed}
 	const batchSize = 500
 	batchIdx := 0
-
+	pendingPolls := 0
+	checkpointed := workflow.GetVersion(ctx, checkpointedIngestChange, workflow.DefaultVersion,
+		checkpointedIngestVersion) >= checkpointedIngestVersion
+	info := workflow.GetInfo(ctx)
 	source := extractConnector(in.SourceRef)
 
 	for {
@@ -118,20 +126,58 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 				return result, err
 			}
 		}
+		startEvents, startBytes := info.GetCurrentHistoryLength(), info.GetCurrentHistorySize()
+		continueAsNew := func() error {
+			if !checkpointed {
+				return nil
+			}
+			if !shouldContinueAsNew(historySnapshot{
+				Events: info.GetCurrentHistoryLength(), Bytes: info.GetCurrentHistorySize(),
+				Suggested:  info.GetContinueAsNewSuggested(),
+				LastEvents: info.GetCurrentHistoryLength() - startEvents,
+				LastBytes:  info.GetCurrentHistorySize() - startBytes,
+			}) {
+				return nil
+			}
+			return continueMigrationAsNew(ctx, in, cp, tplOut.Version)
+		}
 
+		offsetRaw, err := json.Marshal(cp.Offset)
+		if err != nil {
+			return result, err
+		}
 		var ingest activities.IngestOutput
-		err := workflow.ExecuteActivity(ctx, "Ingest", activities.IngestInput{
-			JobID:           in.JobID,
-			OrgID:           in.OrgID,
-			ConnectorKind:   source.Kind,
-			ConnectorConfig: source.Config,
-			SourceID:        source.SourceID,
-			ConnectorID:     source.ConnectorID,
-			Offset:          offsetRaw,
-			BatchSize:       batchSize,
+		err = workflow.ExecuteActivity(ctx, "Ingest", activities.IngestInput{
+			JobID:                 in.JobID,
+			OrgID:                 in.OrgID,
+			ConnectorKind:         source.Kind,
+			ConnectorConfig:       source.Config,
+			SourceID:              source.SourceID,
+			ConnectorID:           source.ConnectorID,
+			Offset:                offsetRaw,
+			BatchSize:             batchSize,
+			ExpectedSourceVersion: cp.SourceVersion,
 		}).Get(ctx, &ingest)
 		if err != nil {
 			return result, fmt.Errorf("ingest: %w", err)
+		}
+
+		if ingest.Pending {
+			pendingPolls++
+			cp.Offset = ingest.NewOffset
+			if err := workflow.Sleep(ctx, pendingBackoff(pendingPolls)); err != nil {
+				return result, err
+			}
+			if err := continueAsNew(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		pendingPolls = 0
+		if checkpointed {
+			if err := checkRowContinuity(cp.NextRowIndex, ingest.Rows, ingest.NewOffset, ingest.Done); err != nil {
+				return result, err
+			}
 		}
 
 		rows, err := preprocessRows(ctx, tplOut.Template, ingest.Rows)
@@ -145,29 +191,51 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 			}
 		}
 
+		cp.Offset, cp.NextRowIndex = ingest.NewOffset, ingest.NewOffset.Items
+		cp.Processed, cp.Failed = result.Processed, result.Failed
+		if cp.SourceVersion == "" {
+			cp.SourceVersion = ingest.SourceVersion
+		}
+
 		// Publish aggregate progress once per batch.
 		_ = workflow.ExecuteActivity(ctx, "PublishProgress", activities.PublishProgressInput{
 			JobID: in.JobID, Processed: result.Processed, Failed: result.Failed,
-			Pending: 0, LastRow: int64(len(ingest.Rows)),
+			Pending: 0, LastRow: cp.NextRowIndex,
 		}).Get(ctx, nil)
 
-		offsetRaw, _ = ingest.NewOffset.Marshal()
 		batchIdx++
 		if ingest.Done {
 			break
 		}
-
-		// Bound history via continue-as-new every 100 batches.
-		if batchIdx%100 == 0 {
-			nextIn := in
-			nextIn.SourceRef["_offset"] = string(offsetRaw)
-			return nil, workflow.NewContinueAsNewError(ctx, MigrationWorkflow, nextIn)
+		if checkpointed {
+			if err := continueAsNew(); err != nil {
+				return nil, err
+			}
+		} else if batchIdx%100 == 0 {
+			return nil, continueMigrationAsNew(ctx, in, cp, tplOut.Version)
 		}
 	}
 
 	log.Info("MigrationWorkflow done", "processed", result.Processed, "failed", result.Failed)
 	finalizeAndExport(ctx, in.JobID, result.Cancelled)
 	return result, nil
+}
+
+// continueMigrationAsNew hands the checkpoint to a fresh run. The template
+// version is pinned so a run started on "latest" keeps the same rules.
+func continueMigrationAsNew(ctx workflow.Context, in MigrationWorkflowInput, cp Checkpoint, templateVersion int32) error {
+	next := in
+	next.Checkpoint = &cp
+	next.SourceRef = make(map[string]any, len(in.SourceRef))
+	for k, v := range in.SourceRef {
+		if k != legacyOffsetKey {
+			next.SourceRef[k] = v
+		}
+	}
+	if next.RuleTemplateVersion == 0 && templateVersion > 0 {
+		next.RuleTemplateVersion = templateVersion
+	}
+	return workflow.NewContinueAsNewError(ctx, MigrationWorkflow, next)
 }
 
 func finalizeAndExport(ctx workflow.Context, jobID int64, cancelled bool) {

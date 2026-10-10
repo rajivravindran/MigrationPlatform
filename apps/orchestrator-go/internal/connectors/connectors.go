@@ -24,13 +24,18 @@ type Row struct {
 	Data  map[string]any
 }
 
-// Offset is an opaque resume token that the orchestrator persists between
-// activity invocations. CSV/JSON pass a byte offset; XML passes an element
-// count; Salesforce/S3 use the native cursor (jobId+locator / continuation).
+// Offset is the resume token the orchestrator persists between activity
+// invocations. Items is always the number of rows already delivered, which is
+// also the absolute index of the next row. Salesforce additionally pins the
+// Bulk query job (the snapshot being read), the locator of the result page
+// being consumed ("" is the first page) and how many rows of that page were
+// already delivered.
 type Offset struct {
 	Bytes             int64  `json:"bytes,omitempty"`
 	Items             int64  `json:"items,omitempty"`
+	SalesforceJobID   string `json:"sf_job,omitempty"`
 	SalesforceLocator string `json:"sf_locator,omitempty"`
+	SalesforceSkip    int64  `json:"sf_skip,omitempty"`
 	S3Continuation    string `json:"s3_cont,omitempty"`
 }
 
@@ -60,6 +65,13 @@ type RowIterator interface {
 // Common errors.
 var (
 	ErrUnsupportedKind = errors.New("unsupported connector kind")
+	// ErrSourceNotReady means the source accepted the request but has no
+	// rows yet (a Salesforce Bulk query still running). The offset returned
+	// alongside it must be passed back on the next attempt.
+	ErrSourceNotReady = errors.New("source not ready")
+	// ErrInvalidOffset means a resume offset cannot belong to this source.
+	// Resuming from it would skip or repeat rows, so callers must not retry.
+	ErrInvalidOffset = errors.New("invalid resume offset")
 )
 
 // Factory builds a connector by kind with the config/secret from the DB.
@@ -74,6 +86,9 @@ type Config struct {
 	// HTTP serves url sources and Salesforce calls; nil uses the
 	// SSRF-guarded egress client.
 	HTTP *http.Client
+	// Version identifies the content being read (an object ETag) when the
+	// source has one; resumed reads must see the same value.
+	Version string
 }
 
 var defaultEgressClient = sync.OnceValue(func() *http.Client {

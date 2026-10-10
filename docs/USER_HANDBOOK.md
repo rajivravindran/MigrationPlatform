@@ -673,7 +673,8 @@ UI.
 | Job stuck `running`, worker log `unknown preprocess fn 'lowercase'` | Use `builtin.lowercase` |
 | `400 source_ref must be a JSON object` | Send the object returned by upload, not a string |
 | `400 source not found for this organization` | Upload the file again with your own login; uploads are per organization |
-| Job failed with `SourceChanged` | The stored object changed after upload; upload it again and start a new job |
+| Job failed with `SourceChanged` | The stored object changed after upload, or was re-uploaded to the same name while the job was reading it; upload it again and start a new job |
+| Job stopped with `InvalidCheckpoint` | The job could not prove where to resume reading (for example a Salesforce read saved by an older version). It stops rather than skip or repeat rows. Rows already delivered are listed on the job; a new job reads the source from the first row again |
 | Cancel 502 workflow not found | Workflow already finished; job row stale |
 | All rows fail connection | URL must be reachable from **orchestrator** container; httpbin needs egress |
 | `localhost` destination fails | That is the container, not your laptop |

@@ -51,12 +51,15 @@ The platform ships six first-class implementations.
 
 ## Salesforce
 
-- OAuth2 Web Server flow; refresh token stored in `secrets` (AES-GCM).
-- Uses Bulk API 2.0 for queries > 2k rows; REST otherwise.
-- Incremental mode: tracks `SystemModstamp` (or template-specified field)
-  in `connectors.config_json.cursor`.
-- Rate limiting: respects Salesforce daily API limits; degrades gracefully
-  via retry-after.
+- OAuth2 client-credentials flow; the client secret is stored encrypted on
+  the connector (AES-GCM) and loaded by the `Ingest` activity, never passed
+  through workflow input.
+- Every query runs as a Bulk API 2.0 query job, read in 2,000-record result
+  pages and resumable mid-page (see Offsets below).
+- Incremental mode: `cursorField` and `cursor` add `cursorField >= cursor`
+  to the SOQL. The cursor is not advanced automatically.
+- Rate limiting: not implemented. API-limit errors fail the `Ingest`
+  activity and are retried by its Temporal retry policy.
 
 Config:
 ```json
@@ -162,10 +165,23 @@ Config:
 
 ## Offsets + resumability
 
-Every connector emits an `Offset` bytes blob alongside each row. The
-orchestrator persists the latest offset per shard in Temporal workflow
-state (and in `job_rows.ingest_offset` for visibility). On replay,
-`Open(ctx, ref, offset)` is called and the connector fast-forwards.
+Every connector returns an `Offset` with each row. `Offset.items` is the
+number of rows already delivered, which is also the absolute index of the
+next row. Each `Ingest` call opens the connector at the offset recorded by
+the previous batch, and the connector fast-forwards to it.
+
+- File sources (CSV, JSON, XML) re-read the object and skip `items` rows.
+- Salesforce records the Bulk query job, the result page being consumed and
+  the rows already taken from it (`sf_job`, `sf_locator`, `sf_skip`). The
+  query is created once. While it runs, `Ingest` reports `pending` and the
+  workflow waits with durable timers.
+
+The workflow carries the offset, the next row index, the source version and
+the running totals as a typed checkpoint through continue-as-new, and it
+continues as new based on history size rather than a fixed batch count. A
+batch that does not start at the checkpoint, or a source whose version
+changed, fails the job instead of skipping or repeating rows. See
+[ADR 0002](adr/0002-ingest-checkpoint.md).
 
 ## Writing a new connector
 

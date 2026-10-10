@@ -218,3 +218,27 @@ func TestSourceFormat(t *testing.T) {
 	require.Equal(t, "json", sourceFormat("a.ndjson"))
 	require.Equal(t, "csv", sourceFormat("noext"))
 }
+
+// A re-upload to the same key updates the registry row, so authorization
+// alone would accept the new content; the job's recorded version must not.
+func TestIngestRefusesSourceVersionChangeBetweenBatches(t *testing.T) {
+	auth := newTestAuthorizer(func(context.Context, string, string) (connectors.ObjectInfo, error) {
+		return connectors.ObjectInfo{ETag: "e2", Size: 120}, nil
+	})
+	auth.store.(fakeSourceStore).sources[10] = registeredSource{ID: 10, Bucket: "migration", Key: "uploads/1/ab/abc", ETag: "e2", Size: 120}
+	a := &Activities{sources: auth}
+
+	in := objectInput(orgA, 10)
+	in.Offset = []byte(`{"items":500}`)
+	in.ExpectedSourceVersion = "e1"
+	_, err := a.Ingest(context.Background(), in)
+	requireErrType(t, err, ErrTypeSourceChanged)
+}
+
+func TestIngestRefusesUndecodableOffset(t *testing.T) {
+	a := &Activities{sources: newTestAuthorizer(nil)}
+	in := objectInput(orgA, 10)
+	in.Offset = []byte(`{"items":"five hundred"}`)
+	_, err := a.Ingest(context.Background(), in)
+	requireErrType(t, err, ErrTypeInvalidCheckpoint)
+}

@@ -33,6 +33,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -47,6 +48,7 @@ OUT = HERE / "out"
 API = os.environ.get("HARNESS_API", "http://localhost:8080")
 DEST_ADMIN = os.environ.get("HARNESS_DEST_ADMIN", "http://localhost:18099")
 DEST_INTERNAL = os.environ.get("HARNESS_DEST_INTERNAL", "http://destination-fixture:8099")
+TEMPORAL_HTTP = os.environ.get("HARNESS_TEMPORAL_HTTP", "http://localhost:8233")
 COMPOSE = os.environ.get(
     "HARNESS_COMPOSE",
     "docker compose -f infra/docker-compose.yml -f infra/docker-compose.harness.yml",
@@ -370,25 +372,29 @@ def run_customer_migration(*, tenant: str, faults: list[dict], expect_failed: se
                            expect_ambiguous: set[str] | None = None, dest_config: dict | None = None,
                            retry: dict | None = None,
                            customize: Callable[[dict], None] | None = None,
-                           extra_checks: Callable[[list[dict], list[dict]], list[dict]] | None = None) -> dict:
+                           extra_checks: Callable[[list[dict], list[dict]], list[dict]] | None = None,
+                           job_checks: Callable[[dict], list[dict]] | None = None,
+                           source_path: Path | None = None, job_timeout_s: int = JOB_TIMEOUT_S) -> dict:
     run_id = uuid.uuid4().hex[:8]
     dest_reset(dest_config, faults)
     token = login(tenant)
-    source_path = DATA / tenant / "customers.csv"
-    source = read_source(tenant, "customers")
+    source_path = source_path or DATA / tenant / "customers.csv"
+    with source_path.open(newline="", encoding="utf-8") as f:
+        source = list(csv.DictReader(f))
     source_ref = multipart_upload(token, source_path)
     tpl = customer_template(tenant, run_id, retry)
     if customize:
         customize(tpl["schema_json"])
     tpl_id = create_published_template(token, tpl)
     job = start_job(token, tpl_id, source_ref)
-    job = wait_job(token, job["id"])
+    job = wait_job(token, job["id"], job_timeout_s)
     rows = job_rows(token, job["id"])
     receipts = dest_receipts(tenant)
     rec = reconcile(tenant=tenant, source=source, rows=rows, receipts=receipts,
                     all_receipts=dest_receipts(), job=job, expect_failed=expect_failed,
                     expect_ambiguous=expect_ambiguous)
     checks = rec.checks + (extra_checks(source, receipts) if extra_checks else [])
+    checks += job_checks(job) if job_checks else []
     return {
         "passed": all(c["passed"] for c in checks),
         "job": {k: job.get(k) for k in ("id", "status", "totals_json", "temporal_workflow_id")},
@@ -447,6 +453,43 @@ def scenario_python_transforms(_: Scenario) -> dict:
                                   customize=customize, extra_checks=payload_checks)
 
 
+def generated_customers(tenant: str, count: int) -> Path:
+    """Deterministic synthetic customers, larger than one ingest batch."""
+    prefix = tenant[-1].upper()
+    path = OUT / "generated" / f"{tenant}-customers-{count}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(["external_id", "email", "name", "country"])
+        for i in range(count):
+            w.writerow([f"{prefix}-GEN-{i:05d}", f"gen{i:05d}@{tenant}.example.test",
+                        f"Generated Customer {prefix}{i:05d}", ("US", "IN", "DE", "GB")[i % 4]])
+    return path
+
+
+def workflow_runs(workflow_id: str) -> list[dict]:
+    q = urllib.parse.quote(f'WorkflowId="{workflow_id}"')
+    payload = ok(*http("GET", f"{TEMPORAL_HTTP}/api/v1/namespaces/default/workflows?query={q}&pageSize=100"),
+                 "list workflow runs")
+    return payload.get("executions") or []
+
+
+def scenario_continue_as_new(_: Scenario) -> dict:
+    """1,250 rows span three ingest batches and at least one continue-as-new (MP-02)."""
+    def job_checks(job: dict) -> list[dict]:
+        runs = workflow_runs(job["temporal_workflow_id"])
+        statuses = sorted(r.get("status", "") for r in runs)
+        return [{"check": "job continued as new at least once and its last run completed",
+                 "passed": len(runs) >= 2 and statuses.count("WORKFLOW_EXECUTION_STATUS_COMPLETED") == 1
+                 and all(s in ("WORKFLOW_EXECUTION_STATUS_COMPLETED", "WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW")
+                         for s in statuses),
+                 "detail": {"runs": len(runs), "statuses": statuses}}]
+
+    return run_customer_migration(tenant="org-a", faults=[], expect_failed=set(), job_checks=job_checks,
+                                  source_path=generated_customers("org-a", 1250),
+                                  job_timeout_s=max(JOB_TIMEOUT_S, 900))
+
+
 def latest_job_id(token: str) -> int | None:
     items = ok(*http("GET", f"{API}/jobs?limit=1", token=token), "list jobs")["items"]
     return items[0]["id"] if items else None
@@ -499,6 +542,8 @@ SCENARIOS: dict[str, Scenario] = {
                  scenario_forced_failure),
         Scenario("throttle-recovers", "429 twice for one record, retried to exactly one receipt",
                  scenario_throttle_recovers),
+        Scenario("continue-as-new", "1,250 rows across continue-as-new: one receipt per record, totals carried",
+                 scenario_continue_as_new),
     ]
 }
 

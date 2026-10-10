@@ -182,7 +182,7 @@ func (s *sourceAuthorizer) objectSource(ctx context.Context, in IngestInput, buc
 			fmt.Sprintf("source %d changed since registration (size %d, now %d)", src.ID, src.Size, info.Size),
 			ErrTypeSourceChanged, nil)
 	}
-	return connectors.Config{Kind: in.ConnectorKind, Config: in.ConnectorConfig}, nil
+	return connectors.Config{Kind: in.ConnectorKind, Config: in.ConnectorConfig, Version: info.ETag}, nil
 }
 
 func (s *sourceAuthorizer) connectorSource(ctx context.Context, in IngestInput) (connectors.Config, error) {

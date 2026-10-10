@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/temporal"
 
 	"github.com/migration-platform/orchestrator/internal/connectors"
 	"github.com/migration-platform/orchestrator/internal/metrics"
@@ -93,21 +94,24 @@ type LoadTemplateInput struct {
 
 type LoadTemplateOutput struct {
 	Template template.RuleTemplate `json:"template"`
+	// Version is the rule_templates.version row that was loaded.
+	Version int32 `json:"version,omitempty"`
 }
 
 func (a *Activities) LoadTemplate(ctx context.Context, in LoadTemplateInput) (LoadTemplateOutput, error) {
 	var raw []byte
+	var version int32
 	var err error
 	if in.TemplateVersion > 0 {
 		err = a.d.DB.QueryRow(ctx,
-			`SELECT schema_json FROM rule_templates WHERE id = $1 AND org_id = $2 AND version = $3`,
+			`SELECT schema_json, version FROM rule_templates WHERE id = $1 AND org_id = $2 AND version = $3`,
 			in.RuleTemplateID, in.OrgID, in.TemplateVersion,
-		).Scan(&raw)
+		).Scan(&raw, &version)
 	} else {
 		err = a.d.DB.QueryRow(ctx,
-			`SELECT schema_json FROM rule_templates WHERE id = $1 AND org_id = $2 ORDER BY version DESC LIMIT 1`,
+			`SELECT schema_json, version FROM rule_templates WHERE id = $1 AND org_id = $2 ORDER BY version DESC LIMIT 1`,
 			in.RuleTemplateID, in.OrgID,
-		).Scan(&raw)
+		).Scan(&raw, &version)
 	}
 	if err != nil {
 		return LoadTemplateOutput{}, fmt.Errorf("load template: %w", err)
@@ -116,7 +120,7 @@ func (a *Activities) LoadTemplate(ctx context.Context, in LoadTemplateInput) (Lo
 	if err := json.Unmarshal(raw, &tpl); err != nil {
 		return LoadTemplateOutput{}, fmt.Errorf("parse template: %w", err)
 	}
-	return LoadTemplateOutput{Template: tpl}, nil
+	return LoadTemplateOutput{Template: tpl, Version: version}, nil
 }
 
 // ---------------- BootstrapScheduledJob ----------------
@@ -195,21 +199,44 @@ type IngestInput struct {
 	ConnectorID int64           `json:"connectorId,omitempty"`
 	Offset      json.RawMessage `json:"offset"`
 	BatchSize   int             `json:"batchSize"`
+	// ExpectedSourceVersion is the version earlier batches of this job read;
+	// empty on the first batch or for sources without a version.
+	ExpectedSourceVersion string `json:"expectedSourceVersion,omitempty"`
 }
 
 type IngestOutput struct {
 	Rows      []connectors.Row  `json:"rows"`
 	NewOffset connectors.Offset `json:"newOffset"`
 	Done      bool              `json:"done"`
+	// Pending means the source has no rows yet (a Salesforce query still
+	// running); call again later with NewOffset.
+	Pending       bool   `json:"pending,omitempty"`
+	SourceVersion string `json:"sourceVersion,omitempty"`
+}
+
+// ErrTypeInvalidCheckpoint marks a resume position that cannot belong to the
+// source; resuming from it would skip or repeat rows.
+const ErrTypeInvalidCheckpoint = "InvalidCheckpoint"
+
+func invalidCheckpoint(err error) error {
+	return temporal.NewNonRetryableApplicationError(err.Error(), ErrTypeInvalidCheckpoint, err)
 }
 
 func (a *Activities) Ingest(ctx context.Context, in IngestInput) (IngestOutput, error) {
-	offset, _ := connectors.UnmarshalOffset(in.Offset)
+	offset, err := connectors.UnmarshalOffset(in.Offset)
+	if err != nil {
+		return IngestOutput{}, invalidCheckpoint(fmt.Errorf("decode ingest offset: %w", err))
+	}
 	cfg, err := a.sources.authorize(ctx, in)
 	if err != nil {
 		activity.GetLogger(ctx).Warn("ingest source refused", "jobId", in.JobID, "orgId", in.OrgID,
 			"sourceId", in.SourceID, "connectorId", in.ConnectorID, "error", err)
 		return IngestOutput{}, err
+	}
+	if in.ExpectedSourceVersion != "" && cfg.Version != in.ExpectedSourceVersion {
+		return IngestOutput{}, temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("source changed during the job (read version %s, now %s)", in.ExpectedSourceVersion, cfg.Version),
+			ErrTypeSourceChanged, nil)
 	}
 	cfg.HTTP = a.d.HTTP
 	conn, err := connectors.Factory{}.Build(cfg)
@@ -217,6 +244,9 @@ func (a *Activities) Ingest(ctx context.Context, in IngestInput) (IngestOutput, 
 		return IngestOutput{}, err
 	}
 	iter, err := conn.Open(ctx, offset)
+	if errors.Is(err, connectors.ErrInvalidOffset) {
+		return IngestOutput{}, invalidCheckpoint(err)
+	}
 	if err != nil {
 		return IngestOutput{}, err
 	}
@@ -225,10 +255,17 @@ func (a *Activities) Ingest(ctx context.Context, in IngestInput) (IngestOutput, 
 	if in.BatchSize <= 0 {
 		in.BatchSize = 500
 	}
-	out := IngestOutput{Rows: make([]connectors.Row, 0, in.BatchSize)}
+	out := IngestOutput{Rows: make([]connectors.Row, 0, in.BatchSize), NewOffset: offset, SourceVersion: cfg.Version}
 	for len(out.Rows) < in.BatchSize {
 		activity.RecordHeartbeat(ctx, len(out.Rows))
 		row, newOffset, more, err := iter.Next(ctx)
+		if errors.Is(err, connectors.ErrSourceNotReady) && len(out.Rows) == 0 {
+			out.NewOffset, out.Pending = newOffset, true
+			return out, nil
+		}
+		if errors.Is(err, connectors.ErrInvalidOffset) {
+			return out, invalidCheckpoint(err)
+		}
 		if err != nil {
 			return out, err
 		}
