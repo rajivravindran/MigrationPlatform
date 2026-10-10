@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir \
     pydantic==2.9.2
 
 COPY apps/transform-worker /app
+# Every sandbox call starts a fresh interpreter and PYTHONDONTWRITEBYTECODE
+# prevents caching at runtime, so precompile once at build time.
+RUN python -m compileall -q -j0 /usr/local/lib/python3.12 /app/migration_worker
 USER app
 EXPOSE 9464
 CMD ["python", "-m", "migration_worker.worker"]
