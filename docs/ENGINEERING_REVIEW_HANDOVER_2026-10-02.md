@@ -10,7 +10,10 @@
 
 **Review type:** Principal-engineer-level code and operational-readiness assessment
 
-**Implementation status:** Findings open; this handover does not implement fixes.
+**Implementation status:** M0 (`R00`–`R07`) is closed locally on `965c01d`.
+See [docs/evidence/R07_INTEGRITY.md](evidence/R07_INTEGRITY.md) for the
+closure table. The original findings and evidence below are unchanged
+so the review remains auditable.
 
 **Agent entry point:** Read sections 1–3 for evidence, then execute the work packages in section 8. Section 9 specifies integration tests and section 10 defines the required completion report. Proposed interfaces and test names are implementation guidance, not claims that those symbols already exist.
 
@@ -51,17 +54,17 @@ Priority meanings: **P0** = release blocker involving access or migration integr
 
 | ID | Priority | Finding | Evidence | Status |
 |---|---|---|---|---|
-| MP-01 | P0 | Object ownership and source-access authorization gaps | Code inspection | Open |
-| MP-02 | P0 | Continue-as-new loses ingestion position | Code inspection | Open |
-| MP-03 | P0 | Salesforce pagination loses page state and stable indexes | Code inspection | Open |
-| MP-04 | P0 | Retry safety can lose successful-step evidence | Code inspection | Open |
-| MP-05 | P1 | Job state and workflow state can diverge | Code inspection | Open |
-| MP-06 | P1 | Python row access fails; blocking work runs in async activities | Executed + code inspection | Open |
-| MP-07 | P1 | Execution and ingestion do not implement documented scaling | Code inspection | Open |
-| MP-08 | P1 | Images publish independently of successful validation | Observed + code inspection | Open |
-| MP-09 | P1 | Retry-all skips failed row zero | Code inspection | Open |
-| MP-10 | P1 | Destination auth.secretRef is not wired into execution | Code inspection | Open |
-| MP-11 | P1 | Security and architecture claims exceed implementation evidence | Code inspection | Open |
+| MP-01 | P0 | Object ownership and source-access authorization gaps | Code inspection | Verified (R01, harness `source-authz`) |
+| MP-02 | P0 | Continue-as-new loses ingestion position | Code inspection | Verified (R03, harness `continue-as-new`) |
+| MP-03 | P0 | Salesforce pagination loses page state and stable indexes | Code inspection | Verified (R03 fixture; no live Salesforce) |
+| MP-04 | P0 | Retry safety can lose successful-step evidence | Code inspection | Verified (R04, `ambiguous-*`) |
+| MP-05 | P1 | Job state and workflow state can diverge | Code inspection | Verified (R05, ingest-failure / terminated / export-recovery) |
+| MP-06 | P1 | Python row access fails; blocking work runs in async activities | Executed + code inspection | Verified (R02, `python-transforms`) |
+| MP-07 | P1 | Execution and ingestion do not implement documented scaling | Code inspection | Deferred to R15; docs corrected (R06) |
+| MP-08 | P1 | Images publish independently of successful validation | Observed + code inspection | Implemented-unverified (workflows on `a15ceca`/`965c01d`; no GH run of this SHA) |
+| MP-09 | P1 | Retry-all skips failed row zero | Code inspection | Verified (MP-09, `forced-failure` includes row 0) |
+| MP-10 | P1 | Destination auth.secretRef is not wired into execution | Code inspection | Verified (R04, `destination-auth`) |
+| MP-11 | P1 | Security and architecture claims exceed implementation evidence | Code inspection | Verified (R06 doc corrections) |
 
 Owners are unassigned. Assign an owner, implementation PR, regression tests, and verification evidence per finding; do not close findings on code changes alone.
 
@@ -368,15 +371,15 @@ Required invariants:
 
 Before closing this handover:
 
-- [ ] Assign owners and PRs for MP-01 through MP-11.
-- [ ] Record a failing regression test before each correctness fix where practical.
-- [ ] Close P0 findings with integration evidence.
-- [ ] Pass the existing Python suite and the new boundary/recovery tests.
-- [ ] Verify source-to-destination reconciliation on the supported migration path.
-- [ ] Gate release artifacts on validation of the exact commit.
-- [ ] Align architecture/security documentation with evidence.
-- [ ] Retain applicable production gates from AGENT_HANDOFF.md.
-- [ ] Record tested versions, commit, configuration, limitations, and benchmark conditions.
+- [x] Assign owners and PRs for MP-01 through MP-11. (local commits; see R07)
+- [x] Record a failing regression test before each correctness fix where practical.
+- [x] Close P0 findings with integration evidence.
+- [x] Pass the existing Python suite and the new boundary/recovery tests.
+- [x] Verify source-to-destination reconciliation on the supported migration path.
+- [ ] Gate release artifacts on validation of the exact commit. (workflows written; `965c01d` not run on GitHub)
+- [x] Align architecture/security documentation with evidence.
+- [x] Retain applicable production gates from AGENT_HANDOFF.md.
+- [x] Record tested versions, commit, configuration, limitations, and benchmark conditions. ([R07](evidence/R07_INTEGRITY.md))
 - [ ] Make a fresh production-readiness decision; do not infer approval from completed feature checklists.
 
 ### Per-finding closure record

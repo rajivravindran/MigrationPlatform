@@ -2,7 +2,8 @@
 
 Date: 3 October 2026. Owner: Rajiv Ravindran. Implementation owners: unassigned.
 Planning baseline: local `2395f5d`; underlying reviewed application commit `18160097d3e95994bf8018838c9b43b719bcac49`.
-Status: proposed product direction; actionable engineering queue. No implementation task is completed by this document.
+M0 closed locally on `965c01d` (2026-10-10). Evidence: [docs/evidence/R07_INTEGRITY.md](evidence/R07_INTEGRITY.md).
+Status vocabulary (authoritative): `ready`, `blocked`, `in-progress`, `implemented-unverified`, `verified`, `deferred`. A task is `verified` only when its stated acceptance evidence was executed. This document does not approve production use or remote publication.
 
 ## 1. Product decision
 
@@ -57,19 +58,19 @@ R18 discovery can begin before M0 finishes; real-data pilots cannot bypass techn
 
 ## 5. Execution queue
 
-All tasks below start `ready` or `blocked` by dependency, not `done`. Owner and evidence start unassigned. Agents should take the first eligible task, not the most interesting later feature.
+M0 statuses below are from the local integrated commit `965c01d`. Later tasks stay `blocked` on R07 being published and reviewed remotely.
 
-| ID | Task | Dependency | Initial status |
+| ID | Task | Dependency | Status |
 |---|---|---|---|
-| R00 | Baseline and deterministic test harness | None | ready |
-| R01 | Tenant-owned source and egress contract | R00 | blocked |
-| R02 | Python execution correctness | R00 | blocked |
-| R03 | Checkpoints, Salesforce pagination, row-zero retry | R01 contract agreed | blocked |
-| R04 | External-effect ledger and secret resolution | R01, R03 contracts | blocked |
-| R05 | Job lifecycle and export convergence | R03, R04 | blocked |
-| R06 | CI release gate and truthful capability docs | R01–R05 | blocked |
-| R07 | Integrated integrity acceptance | R00–R06 | blocked |
-| R08 | Immutable migration plan and run manifest | R07 | blocked |
+| R00 | Baseline and deterministic test harness | None | verified (`3b1ee66`) |
+| R01 | Tenant-owned source and egress contract | R00 | verified (`9997c17`) |
+| R02 | Python execution correctness | R00 | verified (`8c79a1c`) |
+| R03 | Checkpoints, Salesforce pagination, row-zero retry | R01 contract agreed | verified (`48ee096`) |
+| R04 | External-effect ledger and secret resolution | R01, R03 contracts | verified (`58a9c58`) |
+| R05 | Job lifecycle and export convergence | R03, R04 | verified (`58a9c58`) |
+| R06 | CI release gate and truthful capability docs | R01–R05 | verified locally (`965c01d`); GitHub run of this SHA is unimplemented |
+| R07 | Integrated integrity acceptance | R00–R06 | verified locally ([R07](evidence/R07_INTEGRITY.md)); not published |
+| R08 | Immutable migration plan and run manifest | R07 | ready |
 | R09 | Preflight and rehearsal | R08 | blocked |
 | R10 | Persistent business-key relationships | R08, R04 | blocked |
 | R11 | Business reconciliation and evidence bundle | R09, R10 | blocked |
