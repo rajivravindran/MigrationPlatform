@@ -118,8 +118,9 @@ Full restore runbook (with Temporal resetworkflow guidance) lives in
 
 ## Cost controls
 
-- HPA scales on CPU + `orchestrator_shard_queue_depth` custom metric.
-- `DestinationRule`/timeout ensures stalled endpoints don't consume
-  orchestrator slots indefinitely.
+- Replica counts are set in Helm / Compose. There is no shard-queue
+  custom metric and no HPA on it: one job is one sequential workflow.
+- `DESTINATION_RPS` / activity timeouts bound how long a stalled
+  destination holds a worker slot.
 - `job_rows` hot columns are indexed; cold audit data is pruned after 180d.
 - Set `storage.retention.daysInput=30` and `daysResults=90` in values.yaml.

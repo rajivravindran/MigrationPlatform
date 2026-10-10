@@ -1,7 +1,8 @@
 # Load & smoke test plan
 
-Two tiers — a laptop smoke suite for iteration and a full 10M-row burn test
-for production readiness sign-off.
+Two tiers — a laptop smoke suite for iteration and a planned 10M-row burn.
+The 10M targets below are **design goals, not measured results**. The
+worker is sequential per row; do not treat these numbers as capacity.
 
 ## Tier 1 — Laptop smoke (Docker Compose)
 

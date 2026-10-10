@@ -27,6 +27,7 @@ test("round-trips JSON losslessly", () => {
 
 test("url-templating fixture parses + round-trips", () => {
   const parsed = RuleTemplateSchema.parse(goldenUrlTpl);
+  if (!("destination" in parsed)) throw new Error("expected a single-destination template");
   expect(parsed.destination.pathParams?.userId).toEqual({ $from: "id" });
   expect(parsed.destination.queryParams?.tags).toHaveLength(3);
   const again = RuleTemplateSchema.parse(JSON.parse(JSON.stringify(parsed)));

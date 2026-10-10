@@ -27,9 +27,10 @@ services; the API keeps this off its public `8080` listener):
 | API              | `http_request_duration_seconds{route,method,status}`    | Histogram  |
 | API              | `migration_jobs_total{status}`                          | Counter    |
 | API              | `migration_sse_subscribers`                             | Gauge      |
-| Orchestrator (Go)| `migration_workflow_started_total{workflow}`            | Counter    |
-| Orchestrator     | `migration_activity_duration_seconds{activity,status}`  | Histogram  |
-| Orchestrator     | `migration_shard_queue_depth`                           | Gauge      |
+| Orchestrator (Go)| `rows_processed_total` / `rows_failed_total`            | Counter    |
+| Orchestrator     | `endpoint_call_seconds`                                 | Histogram  |
+| Orchestrator     | `jobs_reconciled_total{workflow_status,job_status}`     | Counter    |
+| Orchestrator     | `job_reconcile_errors_total`                            | Counter    |
 | Transform worker | `migration_transform_batch_latency_seconds`             | Histogram  |
 | Transform worker | `migration_transform_sandbox_kills_total{reason}`       | Counter    |
 | All              | `process_*`, `go_*`, `tokio_*`                          | Std        |
@@ -58,10 +59,9 @@ services; the API keeps this off its public `8080` listener):
 
 Provisioned dashboards in Grafana:
 
-1. **Migration / Overview** — jobs per status, rows/sec, shard backlog,
-   p95 endpoint latency, SSE subscribers.
-2. **Migration / Jobs** — drill-down by `job_id`, per-shard progress,
-   transform vs call latency split.
+1. **Migration / Overview** — jobs per status, rows processed/failed,
+   p95 endpoint latency, jobs reconciled.
+2. **Migration / Jobs** — drill-down by `job_id`, transform vs call latency.
 3. **Migration / Schedules** — last run status, catch-up queue, next fires.
 4. **Infra / API** — http_request_duration heatmap, error rate, SSE connects.
 5. **Infra / Postgres** — connections, long queries, table sizes.
@@ -74,7 +74,7 @@ Defined in `infra/grafana/provisioning/alerts/migration.yaml`:
 | ------------------------------- | ---- | ---------------------------------------------------------------- |
 | `MigrationHighFailureRate`      | 10m  | `failed/total_rows > 0.5%` on any running job                    |
 | `MigrationStalled`              | 5m   | `rate(migration_rows_processed_total[5m]) == 0` while `status=running` |
-| `MigrationShardBacklog`         | 15m  | `migration_shard_queue_depth > 50` per shard                     |
+| `MigrationReconcileErrors`      | 15m  | `rate(job_reconcile_errors_total[15m]) > 0`                      |
 | `MigrationSandboxKills`         | 10m  | `rate(migration_transform_sandbox_kills_total[5m]) > 0.1`        |
 | `APIHighErrorRate`              | 5m   | `rate(http_requests_total{status=~"5.."}[5m]) > 0.02`            |
 | `TemporalWorkerDown`            | 2m   | `up{job="orchestrator-go"} == 0`                                 |

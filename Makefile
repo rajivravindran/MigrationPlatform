@@ -5,7 +5,7 @@ PROJECT := migration-platform
 HUB_IMAGE_PREFIX ?= rajivravindran
 IMAGE_TAG ?= demo
 
-.PHONY: harness-up harness-setup harness harness-unit help up hub-up hub-pull demo-pack down logs ps build rebuild seed smoke test test-rust test-go test-py test-web lint fmt clean keys
+.PHONY: harness-up harness-setup harness harness-ci harness-unit help up hub-up hub-pull demo-pack down logs ps build rebuild seed smoke test test-rust test-go test-py test-web test-schema lint fmt clean keys
 
 help:
 	@echo "Migration Platform — laptop developer targets"
@@ -98,7 +98,7 @@ smoke:
 	ROWS=$${ROWS:-100000} BASE_URL=$${BASE_URL:-http://localhost:8080} \
 	  k6 run tests/load/smoke-compose.js
 
-test: test-rust test-go test-py test-web
+test: test-rust test-go test-py test-web test-schema
 
 test-rust:
 	cargo test --manifest-path apps/api/Cargo.toml
@@ -110,7 +110,10 @@ test-py:
 	cd apps/transform-worker && python -m pytest
 
 test-web:
-	cd apps/web && npm test || true
+	cd apps/web && npm ci && npm run lint && npm run build
+
+test-schema:
+	cd packages/rule-schema && npm ci && npm test && npm run build
 
 HARNESS_COMPOSE := docker compose -f infra/docker-compose.yml -f infra/docker-compose.harness.yml
 
@@ -120,8 +123,16 @@ harness-up: keys
 harness-setup:
 	python3 tests/harness/harness.py setup
 
+# Same scenario set as the compose-smoke job (continue-as-new is on demand).
+HARNESS_CI_SCENARIOS := source-authz ordinary python-transforms forced-failure throttle-recovers \
+	ambiguous-idempotent ambiguous-lookup ambiguous-manual destination-auth \
+	retry-serialized ingest-failure terminated-workflow export-recovery
+
 harness:
 	python3 tests/harness/harness.py run
+
+harness-ci:
+	python3 tests/harness/harness.py run $(HARNESS_CI_SCENARIOS)
 
 harness-unit:
 	cd tests/harness/destination && go test -race ./...

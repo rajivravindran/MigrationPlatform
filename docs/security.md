@@ -57,28 +57,31 @@ remote sources through the SSRF-guarded egress client.
 - `AES_MASTER_KEY_PREV` supports rolling key rotation: reads attempt current
   then previous; writes always use current. After `migration-admin rotate-secrets`
   re-wraps all rows, remove the previous key from the Secret.
-- Secrets **never** leave the API: connectors return `config_json` with
-  sensitive fields redacted (`"refresh_token":"<redacted>"`).
-- Audit log + structured logs go through a redaction layer (`security/audit.rs`)
-  that scrubs known secret-shaped fields (regex on suffix `_token`, `_key`,
-  `password`, `secret`).
+- Connector secrets are encrypted at rest. Destination secrets
+  (`PUT /secrets/{name}`) are write-only: list/get return metadata, never
+  the value. `CallEndpoint` decrypts `auth.secretRef` at send time; the
+  value does not enter workflow history, job rows or the audit log.
+- `record_audit` stores the `before_json` / `after_json` it is given. Callers
+  must not pass secret values. There is no automatic redaction layer.
 
 ## Python sandbox (`$py`)
 
-User-written expressions run in a sidecar Python worker:
+User-written expressions run in a sidecar Python worker. RestrictedPython
+is a guard, not the isolation boundary; the child process and container are.
 
-- `RestrictedPython` compiles AST to disallow `import`, `open`, attribute
-  access on dunder names, `exec`, `eval`, etc.
-- A per-invocation subprocess runs with `resource.setrlimit`:
-  - `RLIMIT_CPU = 1s`
-  - `RLIMIT_AS = 256 MiB`
-  - `RLIMIT_NOFILE = 16`
-  - `RLIMIT_NPROC = 0` (cannot fork)
-- Network syscalls are blocked via seccomp in the Dockerfile.
-- The worker process is killed and respawned if a single invocation exceeds
-  a hard wall clock of 2s (activity heartbeat detects it).
-- Escape-fuzz suite (`tests/test_sandbox.py`) asserts over 40 known escape
-  patterns (`().__class__`, `getattr(__builtins__, ...)`, etc.) are blocked.
+- Each call is `python -I sandbox_child.py` in its own process group, with
+  an empty environment. The parent always kills and reaps the group.
+- `RestrictedPython` plus a custom policy: no `import` / `open` / `getattr`
+  / `__import__`; no walking into module objects (closes `re.enum.bltns`);
+  `_getitem_` only on dict/list/tuple/str/range/`re.Match`.
+- Child rlimits (defaults, overridable): `RLIMIT_CPU = 2s`,
+  `RLIMIT_AS = 256 MiB`, `RLIMIT_NOFILE = 16`, `RLIMIT_FSIZE = 0`.
+  There is no `RLIMIT_NPROC=0` and no seccomp in the Dockerfile.
+- Wall clock `SANDBOX_TIMEOUT_S` (default 2s) and output cap
+  `SANDBOX_MAX_OUTPUT_BYTES` (default 1 MiB).
+- Tests in `apps/transform-worker/tests/test_sandbox*.py` cover indexing,
+  known escapes and process cleanup. Do not claim "40+ patterns" or
+  network-blocking seccomp.
 
 ## Destination endpoints
 

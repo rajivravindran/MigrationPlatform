@@ -26,7 +26,7 @@ The shipped MVP already matches a real buyer job: ingest CSV/JSON/XML (and Sales
 |------------|----------|
 | File ingest CSV/JSON/XML; Salesforce source (Bulk API 2.0 for large queries) | [connectors.md](../connectors.md), [README.md](../README.md) |
 | Rule templates: preprocess + payload map + HTTP destination; designer UI | [architecture.md](../architecture.md) |
-| Temporal job orchestration, shards, retry/backoff, pause/cancel, row idempotency | [architecture.md](../architecture.md) |
+| Temporal job orchestration, retry/backoff, pause/cancel, delivery policy | [architecture.md](../architecture.md) (no shard fan-out today) |
 | Schedules (cron, overlap policies, incremental connectors) | [scheduling.md](../scheduling.md) |
 | Watched MinIO/S3 prefix → per-file jobs or batch archives | [AGENT_HANDOFF.md](../AGENT_HANDOFF.md) P1–P2 |
 | Watched SFTP (poll, host-key pin, stage to MinIO) | [AGENT_HANDOFF.md](../AGENT_HANDOFF.md) P3 |

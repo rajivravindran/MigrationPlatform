@@ -758,7 +758,9 @@ Be accurate with stakeholders:
 | Event-driven S3 | Watches **poll**; object-created events are deferred |
 | Exactly-once into any PMS | Only as strong as the target’s idempotency / natural keys |
 | High-availability license server | Single SQLite process |
-| “Shard fan-out” / circuit breaker | Described in architecture notes; **not** how the worker runs today |
+| “Shard fan-out” / circuit breaker | Not implemented. One job is one sequential workflow; retries follow the template policy |
+| Isolated `$py` sandbox | RestrictedPython plus a killed child process; no seccomp, no `NPROC=0`. See `docs/security.md` |
+| High throughput / 10M-row jobs | Not measured. Sequential HTTP calls; history bounds a single run to low tens of thousands of rows |
 
 Realistic: demos, POCs, and carefully watched hotel cutovers of thousands
 of rows. The bottleneck is usually the **target API rate limit**, not the

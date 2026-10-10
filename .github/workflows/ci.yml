@@ -20,6 +20,8 @@ jobs:
       - run: cargo test --manifest-path apps/api/Cargo.toml
       - run: cargo test --manifest-path apps/api/Cargo.toml --test integration_db -- --ignored
       - run: cargo test --manifest-path apps/api/Cargo.toml --test source_authz -- --ignored
+      - run: cargo test --manifest-path apps/api/Cargo.toml --test operations_api -- --ignored
+      - run: cargo test --manifest-path apps/api/Cargo.toml --test job_lifecycle -- --ignored
 
   go:
     runs-on: ubuntu-latest
@@ -35,6 +37,9 @@ jobs:
         with:
           version: v1.61
           working-directory: apps/orchestrator-go
+      - name: Destination fixture
+        working-directory: tests/harness/destination
+        run: go test -race ./...
 
   python:
     runs-on: ubuntu-latest
@@ -43,9 +48,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install ruff pytest temporalio orjson RestrictedPython pydantic prometheus-client
-      - run: ruff check migration_worker
-      - run: pytest -q
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check migration_worker tests
+      - run: PYTHONPATH=. pytest -q
+      - name: Harness reconciler unit tests
+        working-directory: .
+        run: python3 -m unittest discover -s tests/harness -p 'test_*.py'
 
   web:
     runs-on: ubuntu-latest
@@ -53,30 +61,63 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
-      - run: npm ci || npm install
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
       - run: npm run lint --if-present
+      - run: npm run build
+
+  schema:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: packages/rule-schema } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: packages/rule-schema/package-lock.json
+      - run: npm ci
+      - run: npm test
       - run: npm run build
 
   compose-smoke:
     runs-on: ubuntu-latest
-    needs: [rust, go, python, web]
+    needs: [rust, go, python, web, schema]
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
       - run: helm dependency build infra/k8s/helm
       - run: helm lint infra/k8s/helm --set secrets.bridgeToken=ci-bridge-token-at-least-32-characters --set secrets.masterKey=ci-master-key-change-me-32-bytes
-      - run: docker compose -f infra/docker-compose.yml config --quiet
+      - run: docker compose -f infra/docker-compose.yml -f infra/docker-compose.harness.yml config --quiet
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build + start stack
         run: |
-          docker compose -f infra/docker-compose.yml up -d --build
+          docker compose -f infra/docker-compose.yml -f infra/docker-compose.harness.yml up -d --build
           for i in $(seq 1 60); do
             curl -fsS http://localhost:8080/healthz && break || sleep 3
           done
+          curl -fsS http://localhost:18099/_admin/healthz
       - name: Seed demo org + template
         run: ./scripts/seed.sh
+      - name: Integrity harness
+        run: |
+          python3 tests/harness/harness.py setup
+          # continue-as-new is ~4 minutes and is run locally / on demand.
+          python3 -u tests/harness/harness.py run \
+            source-authz ordinary python-transforms forced-failure throttle-recovers \
+            ambiguous-idempotent ambiguous-lookup ambiguous-manual destination-auth \
+            retry-serialized ingest-failure terminated-workflow export-recovery
+      - name: Upload harness evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-out
+          path: tests/harness/out
+          if-no-files-found: ignore
       - name: Install k6
         run: |
           curl -fsSL https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6.gpg
@@ -98,7 +139,7 @@ jobs:
       - name: Install Playwright + deps
         working-directory: apps/web
         run: |
-          npm ci || npm install
+          npm ci
           npx playwright install --with-deps chromium
       - name: Run Playwright e2e
         working-directory: apps/web
@@ -117,4 +158,4 @@ jobs:
           if-no-files-found: ignore
       - name: Dump logs on failure
         if: failure()
-        run: docker compose -f infra/docker-compose.yml logs --no-color | tail -n 500
+        run: docker compose -f infra/docker-compose.yml -f infra/docker-compose.harness.yml logs --no-color | tail -n 500
