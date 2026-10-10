@@ -1,15 +1,70 @@
 name: images
+
+# Approved images are published only after the `ci` workflow has succeeded for
+# the exact commit being built. This workflow never runs on pull requests and
+# never builds code from forks: workflow_run executes with repository secrets,
+# so the guard below checks event type, repository, branch/tag and conclusion
+# before checking out `head_sha`.
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
 
 permissions:
   contents: read
   packages: write
+  actions: read
+
+concurrency:
+  group: images-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.head_branch == 'main' ||
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+      release_tag: ${{ steps.verify.outputs.release_tag }}
+    steps:
+      - name: Verify CI run for the exact commit
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          # Re-read the run from the API instead of trusting the event payload alone.
+          run_json=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}")
+          conclusion=$(jq -r .conclusion <<<"$run_json")
+          sha=$(jq -r .head_sha <<<"$run_json")
+          if [[ "$conclusion" != "success" || "$sha" != "$HEAD_SHA" ]]; then
+            echo "::error::CI run ${RUN_ID} is '${conclusion}' for ${sha}; expected success for ${HEAD_SHA}"
+            exit 1
+          fi
+          # Every job in the CI run must have succeeded (no skipped required jobs).
+          bad=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.conclusion != "success")] | map("\(.name)=\(.conclusion)") | join(", ")')
+          if [[ -n "$bad" ]]; then
+            echo "::error::CI jobs not successful for ${HEAD_SHA}: ${bad}"
+            exit 1
+          fi
+          release_tag=""
+          if [[ "$HEAD_BRANCH" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
+            release_tag="$HEAD_BRANCH"
+          fi
+          echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: gate
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -22,6 +77,11 @@ jobs:
           - { name: web,              dockerfile: apps/web/Dockerfile }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - name: Confirm checkout matches the validated commit
+        run: test "$(git rev-parse HEAD)" = "${{ needs.gate.outputs.sha }}"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -33,10 +93,15 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}/${{ matrix.name }}
           tags: |
-            type=sha
-            type=ref,event=branch
-            type=semver,pattern={{version}}
+            type=raw,value=sha-${{ needs.gate.outputs.sha }}
+            type=raw,value=main,enable=${{ needs.gate.outputs.release_tag == '' }}
+            type=raw,value=${{ needs.gate.outputs.release_tag }},enable=${{ needs.gate.outputs.release_tag != '' }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.gate.outputs.sha }}
+            io.migration-platform.ci-run=${{ github.event.workflow_run.html_url }}
+            io.migration-platform.release=approved
       - uses: docker/build-push-action@v6
+        id: push
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -44,3 +109,12 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+      - name: Record digest, commit and checks
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo "- commit: \`${{ needs.gate.outputs.sha }}\`"
+            echo "- digest: \`${{ steps.push.outputs.digest }}\`"
+            echo "- validated by: ${{ github.event.workflow_run.html_url }}"
+            echo "- tags: ${{ join(fromJSON(steps.meta.outputs.json).tags, ', ') }}"
+          } >> "$GITHUB_STEP_SUMMARY"

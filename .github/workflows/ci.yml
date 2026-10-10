@@ -2,6 +2,8 @@ name: ci
 on:
   push:
     branches: [main]
+    # Release tags must pass CI too: images.yml promotes only CI-validated SHAs.
+    tags: ["v*"]
   pull_request:
 
 jobs:

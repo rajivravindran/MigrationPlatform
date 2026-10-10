@@ -207,7 +207,12 @@ curl -s -X POST localhost:8090/v1/heartbeat -H "$T" -H 'Content-Type: applicatio
 
 ## Release checklist (vendor)
 
-- [ ] Tag `v*` and publish images via CI (`.github/workflows/images.yml`)
+- [ ] Tag `v*`; `ci.yml` runs on the tag and `.github/workflows/images.yml` publishes
+      only after every CI job succeeded for that exact SHA (`workflow_run` gate).
+      Approved images carry `sha-<commit>`, the release tag, and the label
+      `io.migration-platform.release=approved`; the run summary records digest,
+      commit and validating CI run. Locally built images (`make build`) are
+      development builds, not releases.
 - [ ] Confirm customer images contain **only** the public verify key
 - [ ] Confirm `dev_license_signing_key.pem` / any `*signing_key*.pem` is **not** in the image
 - [ ] License service deployed with offline-held signing key + durable `trials` DB
