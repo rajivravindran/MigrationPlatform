@@ -20,7 +20,7 @@ dependencies = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["migration_worker", "tests"]
+src = ["."]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "C90"]
@@ -28,3 +28,4 @@ select = ["E", "F", "I", "UP", "B", "C90"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

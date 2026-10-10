@@ -101,7 +101,7 @@ class RuleTemplate(BaseModel):
     export: ExportSpec | None = None
 
     @model_validator(mode="after")
-    def _one_shape(self) -> "RuleTemplate":
+    def _one_shape(self) -> RuleTemplate:
         has_single = self.mapping is not None and self.destination is not None
         has_steps = self.steps is not None
         if has_single == has_steps:
