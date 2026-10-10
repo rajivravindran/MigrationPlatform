@@ -97,7 +97,7 @@ export default function NewJobPage() {
             <Textarea
               className="font-mono text-xs"
               rows={6}
-              placeholder='{"type":"salesforce","connectorId":3,"extra":{"soql":"SELECT Id FROM Account"}}'
+              placeholder='{"type":"connector","connector_id":3,"extra":{"soql":"SELECT Id FROM Account"}}'
               value={connectorOverride}
               onChange={(e) => setConnectorOverride(e.target.value)}
             />

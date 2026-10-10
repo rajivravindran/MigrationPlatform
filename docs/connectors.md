@@ -22,9 +22,9 @@ The platform ships six first-class implementations.
 - Resume: byte-offset + record index; partial uploads continue from the
   last flushed boundary.
 
-`source_ref` (upload):
+`source_ref` (upload, as returned by `POST /files`; see `docs/api.md`):
 ```json
-"sha256:ae3f…:orders.csv"
+{ "source_id": 17 }
 ```
 
 `rule_template.source`:
@@ -83,12 +83,14 @@ Bootstrap:
   `manifest.json`). Idempotency is keyed by `key+etag`.
 - Configurable sort (`lexical` or `mtime`) and glob (`*.csv`, `*`, `*.tar.gz`, …).
 - Cursor: `config_json.cursor.seen` map of object key → etag.
+- `prefix` must start with `orgs/{org_id}/`, in `MINIO_BUCKET` or a bucket
+  listed in `WATCH_ALLOWED_BUCKETS` (ADR 0001).
 
 Config:
 ```json
 {
   "bucket":"migration",
-  "prefix":"incoming/",
+  "prefix":"orgs/1/incoming/",
   "glob":"*",
   "sort":"mtime"
 }

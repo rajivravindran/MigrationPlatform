@@ -83,6 +83,17 @@ async fn create_schedule(
     }
     let catchup = req.catchup_window_seconds.unwrap_or(3600).max(0);
     let enabled = req.enabled.unwrap_or(true);
+    crate::sources::require_connector(&state.db, claims.org, req.connector_id).await?;
+    let template_owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM rule_templates WHERE id = $1 AND org_id = $2)",
+    )
+    .bind(req.rule_template_id)
+    .bind(claims.org)
+    .fetch_one(&state.db)
+    .await?;
+    if !template_owned {
+        return Err(ApiError::BadRequest("template not found".into()));
+    }
 
     let schedule_id_str = format!("sch-{}-{}", claims.org, uuid::Uuid::new_v4().simple());
     let created_by: i64 = claims.sub.parse().map_err(|_| ApiError::Unauthorized)?;

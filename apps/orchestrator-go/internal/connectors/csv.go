@@ -22,7 +22,7 @@ type csvBuilder struct {
 func (b *csvBuilder) Kind() string { return "csv" }
 
 func (b *csvBuilder) Open(ctx context.Context, offset Offset) (RowIterator, error) {
-	src, err := openSource(ctx, b.cfg.Config)
+	src, err := openSource(ctx, b.cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +125,8 @@ func hasHeader(cfg map[string]any) bool {
 	return true
 }
 
-func openSource(ctx context.Context, cfg map[string]any) (io.ReadCloser, error) {
+func openSource(ctx context.Context, c Config) (io.ReadCloser, error) {
+	cfg := c.Config
 	if bucket, ok := cfg["s3_bucket"].(string); ok && bucket != "" {
 		if key, ok := cfg["s3_key"].(string); ok && key != "" {
 			return openObjectStore(ctx, bucket, key)
@@ -136,7 +137,7 @@ func openSource(ctx context.Context, cfg map[string]any) (io.ReadCloser, error) 
 		if err != nil {
 			return nil, err
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := c.httpClient().Do(req)
 		if err != nil {
 			return nil, err
 		}

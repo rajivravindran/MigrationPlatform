@@ -20,6 +20,9 @@ pub struct Config {
     pub minio_access_key: String,
     pub minio_secret_key: String,
     pub minio_bucket: String,
+    /// Extra buckets (besides `minio_bucket`) that watched/staging connectors
+    /// may use; the platform's own credentials read and write there.
+    pub watch_allowed_buckets: Vec<String>,
     pub master_key: String,
     pub jwt_private_key_path: Option<String>,
     pub jwt_public_key_path: Option<String>,
@@ -49,6 +52,13 @@ impl Config {
             minio_access_key: env_default("MINIO_ACCESS_KEY", "minio"),
             minio_secret_key: env_default("MINIO_SECRET_KEY", "minio123"),
             minio_bucket: env_default("MINIO_BUCKET", "migration"),
+            watch_allowed_buckets: env::var("WATCH_ALLOWED_BUCKETS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(str::to_string)
+                .collect(),
             master_key: env::var("MASTER_KEY").context(
                 "MASTER_KEY env var (base64 32 bytes) is required for secret encryption",
             )?,

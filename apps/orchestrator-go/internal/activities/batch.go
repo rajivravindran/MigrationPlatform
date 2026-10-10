@@ -47,25 +47,35 @@ func BatchWorkflowID(orgID int64, bucket, key, etag string) string {
 
 // StartBatch inserts a batches row for a watched archive. Idempotent on workflow id.
 func (a *Activities) StartBatch(ctx context.Context, in StartBatchInput) (StartBatchOutput, error) {
-	workflowID := BatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag)
-	source := map[string]any{
-		"type":     "minio",
-		"bucket":   in.Bucket,
-		"key":      in.Key,
-		"filename": path.Base(in.Key),
-		"size":     in.Size,
-		"etag":     in.ETag,
-	}
-	srcJSON, err := json.Marshal(source)
-	if err != nil {
+	if err := a.sources.checkOrgLocation(in.OrgID, in.Bucket, in.Key); err != nil {
 		return StartBatchOutput{}, err
 	}
-
+	workflowID := BatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag)
 	tx, err := a.d.DB.Begin(ctx)
 	if err != nil {
 		return StartBatchOutput{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	sourceID, err := registerSource(ctx, tx, newSource{
+		OrgID: in.OrgID, Bucket: in.Bucket, Key: in.Key, Filename: path.Base(in.Key),
+		ETag: in.ETag, Size: in.Size, Provenance: "watched",
+	})
+	if err != nil {
+		return StartBatchOutput{}, err
+	}
+	srcJSON, err := json.Marshal(map[string]any{
+		"type":      "minio",
+		"source_id": sourceID,
+		"bucket":    in.Bucket,
+		"key":       in.Key,
+		"filename":  path.Base(in.Key),
+		"size":      in.Size,
+		"etag":      in.ETag,
+	})
+	if err != nil {
+		return StartBatchOutput{}, err
+	}
 
 	var batchID int64
 	existed := false
@@ -172,6 +182,12 @@ func unpackLimitsFromEnv() batch.UnpackLimits {
 // UnpackAndStageArchive downloads, safely unpacks, validates manifest.json, and
 // re-uploads each stage file under batches/{batchId}/stages/...
 func (a *Activities) UnpackAndStageArchive(ctx context.Context, in UnpackAndStageArchiveInput) (UnpackAndStageArchiveOutput, error) {
+	if _, err := a.sources.store.SourceByObject(ctx, in.OrgID, in.Bucket, in.Key); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return UnpackAndStageArchiveOutput{}, notAuthorized("archive %s/%s is not registered for org %d", in.Bucket, in.Key, in.OrgID)
+		}
+		return UnpackAndStageArchiveOutput{}, fmt.Errorf("load archive source: %w", err)
+	}
 	lim := unpackLimitsFromEnv()
 	tmpRoot, err := os.MkdirTemp("", fmt.Sprintf("batch-%d-*", in.BatchID))
 	if err != nil {
@@ -425,6 +441,7 @@ type StartBatchStageJobOutput struct {
 	JobID      int64  `json:"jobId"`
 	WorkflowID string `json:"workflowId"`
 	Created    bool   `json:"created"`
+	SourceID   int64  `json:"sourceId"`
 }
 
 // StageWorkflowID is the Temporal child id for one batch stage job.
@@ -436,25 +453,39 @@ func StageWorkflowID(batchID int64, stageKey string) string {
 // StartBatchStageJob creates a jobs row linked to the batch stage.
 func (a *Activities) StartBatchStageJob(ctx context.Context, in StartBatchStageJobInput) (StartBatchStageJobOutput, error) {
 	workflowID := StageWorkflowID(in.BatchID, in.StageKey)
-	source := map[string]any{
-		"type":     "minio",
-		"bucket":   in.Bucket,
-		"key":      in.Key,
-		"filename": in.Filename,
-		"size":     in.Size,
-		"batchId":  in.BatchID,
-		"stageKey": in.StageKey,
-	}
-	srcJSON, err := json.Marshal(source)
-	if err != nil {
-		return StartBatchStageJobOutput{}, err
-	}
-
 	tx, err := a.d.DB.Begin(ctx)
 	if err != nil {
 		return StartBatchStageJobOutput{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	var batchOrg int64
+	if err := tx.QueryRow(ctx, `SELECT org_id FROM batches WHERE id = $1`, in.BatchID).Scan(&batchOrg); err != nil {
+		return StartBatchStageJobOutput{}, fmt.Errorf("load batch %d: %w", in.BatchID, err)
+	}
+	if batchOrg != in.OrgID || !strings.HasPrefix(in.Key, fmt.Sprintf("batches/%d/stages/", in.BatchID)) {
+		return StartBatchStageJobOutput{}, notAuthorized("stage object %s is not part of batch %d for org %d", in.Key, in.BatchID, in.OrgID)
+	}
+	sourceID, err := registerSource(ctx, tx, newSource{
+		OrgID: in.OrgID, Bucket: in.Bucket, Key: in.Key, Filename: in.Filename,
+		Size: in.Size, Provenance: "batch_stage",
+	})
+	if err != nil {
+		return StartBatchStageJobOutput{}, err
+	}
+	srcJSON, err := json.Marshal(map[string]any{
+		"type":      "minio",
+		"source_id": sourceID,
+		"bucket":    in.Bucket,
+		"key":       in.Key,
+		"filename":  in.Filename,
+		"size":      in.Size,
+		"batchId":   in.BatchID,
+		"stageKey":  in.StageKey,
+	})
+	if err != nil {
+		return StartBatchStageJobOutput{}, err
+	}
 
 	var jobID int64
 	existed := false
@@ -486,7 +517,7 @@ func (a *Activities) StartBatchStageJob(ctx context.Context, in StartBatchStageJ
 	if err = tx.Commit(ctx); err != nil {
 		return StartBatchStageJobOutput{}, err
 	}
-	return StartBatchStageJobOutput{JobID: jobID, WorkflowID: workflowID, Created: !existed}, nil
+	return StartBatchStageJobOutput{JobID: jobID, WorkflowID: workflowID, Created: !existed, SourceID: sourceID}, nil
 }
 
 // ---------------- FinalizeBatchStage ----------------

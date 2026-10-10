@@ -264,11 +264,12 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 				ScheduleID:          in.ScheduleID,
 				ScheduledTime:       in.ScheduledTime,
 				SourceRef: map[string]any{
-					"type":     "minio",
-					"bucket":   st.Bucket,
-					"key":      st.Key,
-					"filename": st.Filename,
-					"size":     st.Size,
+					"type":      "minio",
+					"source_id": started.SourceID,
+					"bucket":    st.Bucket,
+					"key":       st.Key,
+					"filename":  st.Filename,
+					"size":      st.Size,
 				},
 			})
 
@@ -401,11 +402,12 @@ func runOneStage(ctx workflow.Context, in BatchWorkflowInput, st activities.Reso
 		ScheduleID:          in.ScheduleID,
 		ScheduledTime:       in.ScheduledTime,
 		SourceRef: map[string]any{
-			"type":     "minio",
-			"bucket":   st.Bucket,
-			"key":      st.Key,
-			"filename": st.Filename,
-			"size":     st.Size,
+			"type":      "minio",
+			"source_id": started.SourceID,
+			"bucket":    st.Bucket,
+			"key":       st.Key,
+			"filename":  st.Filename,
+			"size":      st.Size,
 		},
 	})
 

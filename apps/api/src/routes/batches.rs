@@ -11,6 +11,7 @@ use sqlx::FromRow;
 use crate::error::{ApiError, ApiResult};
 use crate::middleware::auth::{require_role, AuthUser};
 use crate::security::audit::record_audit;
+use crate::sources;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -150,50 +151,18 @@ async fn create_batch(
     require_role(&claims, &["admin", "editor", "operator"])?;
     crate::security::license::require_licensed()?;
 
-    let src_type = req
-        .source_ref
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if src_type != "minio" {
-        return Err(ApiError::BadRequest(
-            "source_ref.type must be minio for batch packages".into(),
-        ));
-    }
-    let bucket = req
-        .source_ref
-        .get("bucket")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let key = req
-        .source_ref
-        .get("key")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if bucket.is_empty() || key.is_empty() {
-        return Err(ApiError::BadRequest(
-            "source_ref.bucket and source_ref.key are required".into(),
-        ));
-    }
-    let lower = key.to_ascii_lowercase();
-    if !(lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip")) {
+    let source_req = sources::parse_source_request(&req.source_ref)?;
+    let source = sources::resolve_object(&state.db, claims.org, &source_req).await?;
+    let archive_name = source.filename.as_deref().unwrap_or(&source.object_key);
+    if sources::format_from_filename(archive_name) != "archive" {
         return Err(ApiError::BadRequest(
             "batch source must be .tar.gz, .tgz, or .zip".into(),
         ));
     }
-    let etag = req
-        .source_ref
-        .get("etag")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let size = req
-        .source_ref
-        .get("size")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    if let Some(connector_id) = req.connector_id {
+        sources::require_connector(&state.db, claims.org, connector_id).await?;
+    }
+    let source_ref = source.source_ref();
 
     let workflow_id = format!("batch-{}-{}", claims.org, uuid::Uuid::new_v4().simple());
 
@@ -204,7 +173,7 @@ async fn create_batch(
     ))
     .bind(claims.org)
     .bind(req.connector_id)
-    .bind(&req.source_ref)
+    .bind(&source_ref)
     .bind(&workflow_id)
     .fetch_one(&state.db)
     .await?;
@@ -218,10 +187,11 @@ async fn create_batch(
                 "orgId": claims.org,
                 "batchId": row.id,
                 "connectorId": req.connector_id,
-                "bucket": bucket,
-                "key": key,
-                "etag": etag,
-                "size": size,
+                "sourceId": source.id,
+                "bucket": source.bucket,
+                "key": source.object_key,
+                "etag": source.etag.clone().unwrap_or_default(),
+                "size": source.size_bytes.unwrap_or(0),
             }),
         )
         .await;

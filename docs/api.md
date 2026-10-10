@@ -66,25 +66,43 @@ and `destination.headers` fields support per-row templating — see
 
 ### `source_ref`
 
-Either an upload reference (string returned by `POST /files`) or a JSON blob:
+A JSON object that *names* a source owned by the caller's organization
+(ADR 0001). Exactly three shapes are accepted:
 
 ```json
-{ "kind":"connector", "connector_id":42, "overrides":{"since":"2026-01-01"} }
+{ "source_id": 17 }
+{ "type": "minio", "bucket": "migration", "key": "uploads/1/ab/ab…", "filename": "orders.csv" }
+{ "type": "connector", "connector_id": 3, "extra": { "soql": "SELECT Id FROM Account" } }
 ```
+
+- The first two come from `POST /files`; the object must be registered to
+  your organization.
+- `extra` may only set `soql`, `cursorField` and `cursor`. Endpoints and
+  credentials always come from the stored connector.
+- `path`, `url`, inline `secret`, JSON strings and unknown types are refused
+  with `400` before any job row is written. Another organization's source is
+  indistinguishable from a missing one.
+
+The stored and dispatched reference is canonical:
+`{type, source_id, bucket, key, filename, size, sha256, etag}`. The worker
+re-checks ownership and the object's ETag/size before reading; a changed
+object fails the job with `SourceChanged` instead of reading different bytes.
 
 ## Files
 
 ### `POST /files`
 
-Multipart upload. Stores in MinIO under `uploads/<sha256>/<filename>`,
-returns `{ source_ref, bytes, sha256 }`. Client-side proxy at
-`/api/files` fronts this for browser uploads.
+Multipart upload. Stores in MinIO under `uploads/<org>/<sha[..2]>/<sha256>`,
+registers the object for the caller's organization and returns
+`{ source_id, source_ref }`. Client-side proxy at `/api/files` fronts this
+for browser uploads.
 
 ### `POST /files/sample`
 
 Reads the first 8 MiB of a previously uploaded object via an S3 Range request
 and returns up to 25 typed columns + 25 preview rows. Powers the Designer's
-"Sample input file" button. Supports CSV, JSON, NDJSON, and XML. See
+"Sample input file" button. Pass `source_id`, or `bucket`/`key` of an upload
+registered to your organization. Supports CSV, JSON, NDJSON, and XML. See
 [`docs/sampling.md`](./sampling.md) for the request/response shape, type
 inference rules, and limits.
 

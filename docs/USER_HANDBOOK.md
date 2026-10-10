@@ -540,8 +540,8 @@ under **Connectors**.
 
 | Kind | When to use | Config highlights |
 |------|-------------|-------------------|
-| **watched_prefix** | New files land in MinIO/S3 | `bucket`, `prefix`, `glob` (`*.csv` or `*`), `sort` |
-| **watched_sftp** | Hotel drops files on SFTP | host, user, path, **staging bucket**, host key (or insecure flag in dev) |
+| **watched_prefix** | New files land in MinIO/S3 | `bucket`, `prefix` (must start with `orgs/<org id>/`), `glob` (`*.csv` or `*`), `sort` |
+| **watched_sftp** | Hotel drops files on SFTP | host, user, path, **staging bucket** (files land in `orgs/<org id>/sftp-landing/`), host key (or insecure flag in dev) |
 | **salesforce** | CRM extract | instance URL, OAuth consumer, SOQL; Bulk API for large queries |
 | **custom** | HTTP list APIs | base URL + pagination (limited; UI test is SFTP-only today) |
 
@@ -554,16 +554,20 @@ points at it. One-off uploads do **not** need a connector.
 
 ### Advanced source on Start job
 
-The “Advanced source reference” box sends a JSON `source_ref` unchanged,
-e.g.:
+The “Advanced source reference” box sends a JSON `source_ref` that must name
+a source your organization owns, e.g. a stored Salesforce connector:
 
 ```json
 {
-  "type": "salesforce",
-  "connectorId": 3,
+  "type": "connector",
+  "connector_id": 3,
   "extra": { "soql": "SELECT Id, Email FROM Account" }
 }
 ```
+
+`extra` may only set `soql`, `cursorField` and `cursor`; the endpoint and
+credentials come from the connector. `{"source_id": N}` from an upload also
+works. File paths, URLs and inline secrets are refused with `400`.
 
 ---
 
@@ -611,8 +615,9 @@ zip handbook-batch.zip manifest.json properties.csv room-types.csv
 - `onStageFailure`: `stop` or `continue`.
 
 Drop the zip into the watched prefix (MinIO console → bucket
-`migration` → `incoming/`) or configure a schedule on that prefix with
-`glob: *` or `*.zip`.
+`migration` → `orgs/<org id>/incoming/`) or configure a schedule on that
+prefix with `glob: *` or `*.zip`. Watched prefixes outside your
+organization's `orgs/<org id>/` namespace are refused.
 
 Bad archives go to `{prefix}/failed/yyyy/mm/dd/` and show as
 **quarantined** on **Batches**.
@@ -663,7 +668,9 @@ UI.
 | No published templates | Publish on the template page |
 | `402 license required` | Settings → License, or unset `LICENSE_ENFORCE` |
 | Job stuck `running`, worker log `unknown preprocess fn 'lowercase'` | Use `builtin.lowercase` |
-| Job stuck, Temporal “cannot unmarshal string” | `source_ref` must be a JSON **object**, not a string |
+| `400 source_ref must be a JSON object` | Send the object returned by upload, not a string |
+| `400 source not found for this organization` | Upload the file again with your own login; uploads are per organization |
+| Job failed with `SourceChanged` | The stored object changed after upload; upload it again and start a new job |
 | Cancel 502 workflow not found | Workflow already finished; job row stale |
 | All rows fail connection | URL must be reachable from **orchestrator** container; httpbin needs egress |
 | `localhost` destination fails | That is the container, not your laptop |

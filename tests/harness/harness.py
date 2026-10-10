@@ -397,9 +397,51 @@ def scenario_throttle_recovers(_: Scenario) -> dict:
     return run_customer_migration(tenant="org-a", faults=faults, expect_failed=set())
 
 
+def latest_job_id(token: str) -> int | None:
+    items = ok(*http("GET", f"{API}/jobs?limit=1", token=token), "list jobs")["items"]
+    return items[0]["id"] if items else None
+
+
+def scenario_source_authz(_: Scenario) -> dict:
+    """Org B names org A's upload (by ref, id and key) plus local/URL sources."""
+    dest_reset()
+    token_a, token_b = login("org-a"), login("org-b")
+    a_ref = multipart_upload(token_a, DATA / "org-a" / "customers.csv")
+    tpl_b = create_published_template(token_b, customer_template("org-b", uuid.uuid4().hex[:8]))
+    before = latest_job_id(token_b)
+
+    attempts = {
+        "job: org A source_ref": ("/jobs", {"rule_template_id": tpl_b, "source_ref": a_ref}),
+        "job: org A source_id": ("/jobs", {"rule_template_id": tpl_b, "source_ref": {"source_id": a_ref["source_id"]}}),
+        "job: local path": ("/jobs", {"rule_template_id": tpl_b, "source_ref": {"type": "csv", "path": "/etc/passwd"}}),
+        "job: metadata url": ("/jobs", {"rule_template_id": tpl_b,
+                                        "source_ref": {"type": "csv", "url": "http://169.254.169.254/latest/meta-data/"}}),
+        "job: JSON string": ("/jobs", {"rule_template_id": tpl_b, "source_ref": json.dumps(a_ref)}),
+        "sample: org A key": ("/files/sample", {"bucket": a_ref["bucket"], "key": a_ref["key"], "format": "csv"}),
+        "sample: org A source_id": ("/files/sample", {"source_id": a_ref["source_id"]}),
+        "batch: org A source_id": ("/batches", {"source_ref": {"source_id": a_ref["source_id"]}}),
+        "watched connector over org A uploads": ("/connectors", {
+            "name": f"harness-watch-{uuid.uuid4().hex[:6]}", "connector_kind": "watched_prefix",
+            "config_json": {"bucket": a_ref["bucket"], "prefix": a_ref["key"].rsplit("/", 2)[0] + "/"}}),
+    }
+    checks: list[dict] = []
+    for name, (path, body) in attempts.items():
+        status, payload = http("POST", f"{API}{path}", token=token_b, body=body)
+        checks.append({"check": name, "passed": 400 <= status < 500, "status": status,
+                       "detail": payload if isinstance(payload, str) else (payload or {}).get("error")})
+    after = latest_job_id(token_b)
+    checks.append({"check": "no org B job row created", "passed": after == before,
+                   "before": before, "after": after})
+    receipts = dest_receipts("org-b")
+    checks.append({"check": "no org B destination receipts", "passed": not receipts, "receipts": len(receipts)})
+    return {"passed": all(c["passed"] for c in checks), "checks": checks, "org_a_source_id": a_ref["source_id"]}
+
+
 SCENARIOS: dict[str, Scenario] = {
     s.name: s
     for s in [
+        Scenario("source-authz", "org B cannot start, sample or batch org A's source; path/url refs refused",
+                 scenario_source_authz),
         Scenario("ordinary", "40 customers, no faults: one receipt per record", scenario_ordinary),
         Scenario("forced-failure", "destination rejects row 0 and row 7: failed rows have no receipts",
                  scenario_forced_failure),

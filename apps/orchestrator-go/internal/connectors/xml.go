@@ -14,7 +14,7 @@ func NewXML(cfg Config) (SourceConnector, error) { return &xmlBuilder{cfg: cfg},
 func (b *xmlBuilder) Kind() string { return "xml" }
 
 func (b *xmlBuilder) Open(ctx context.Context, offset Offset) (RowIterator, error) {
-	src, err := openSource(ctx, b.cfg.Config)
+	src, err := openSource(ctx, b.cfg)
 	if err != nil {
 		return nil, err
 	}

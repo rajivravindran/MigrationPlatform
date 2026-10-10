@@ -66,6 +66,15 @@ async fn create_connector(
         other => other,
     };
 
+    let mut allowed_buckets = vec![state.cfg.minio_bucket.as_str()];
+    allowed_buckets.extend(state.cfg.watch_allowed_buckets.iter().map(String::as_str));
+    crate::sources::check_connector_locations(
+        connector_kind,
+        &req.config_json,
+        claims.org,
+        &allowed_buckets,
+    )?;
+
     let mut tx = state.db.begin().await?;
     let secret_id: Option<i64> = if let Some(secret) = req.secret {
         let (ct, nonce) = state.master_key.encrypt(secret.as_bytes())?;

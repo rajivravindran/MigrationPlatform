@@ -43,20 +43,22 @@ func (b *salesforceBuilder) Open(ctx context.Context, offset Offset) (RowIterato
 		}
 	}
 
-	token, err := sfOAuthToken(ctx, tokUrl, clientID, b.cfg.Secret)
+	client := b.cfg.httpClient()
+	token, err := sfOAuthToken(ctx, client, tokUrl, clientID, b.cfg.Secret)
 	if err != nil {
 		return nil, err
 	}
 
-	jobID, err := sfCreateQueryJob(ctx, instanceURL, token, soql)
+	jobID, err := sfCreateQueryJob(ctx, client, instanceURL, token, soql)
 	if err != nil {
 		return nil, err
 	}
-	if err := sfWaitJobComplete(ctx, instanceURL, token, jobID); err != nil {
+	if err := sfWaitJobComplete(ctx, client, instanceURL, token, jobID); err != nil {
 		return nil, err
 	}
 
 	return &sfIter{
+		http:     client,
 		instance: instanceURL,
 		token:    token,
 		jobID:    jobID,
@@ -65,6 +67,7 @@ func (b *salesforceBuilder) Open(ctx context.Context, offset Offset) (RowIterato
 }
 
 type sfIter struct {
+	http      *http.Client
 	instance  string
 	token     string
 	jobID     string
@@ -80,7 +83,7 @@ func (it *sfIter) Next(ctx context.Context) (Row, Offset, bool, error) {
 		if it.done {
 			return Row{}, Offset{Items: it.idx, SalesforceLocator: ""}, false, nil
 		}
-		rows, nextLocator, err := sfFetchResults(ctx, it.instance, it.token, it.jobID, it.locator, 2000)
+		rows, nextLocator, err := sfFetchResults(ctx, it.http, it.instance, it.token, it.jobID, it.locator, 2000)
 		if err != nil {
 			return Row{}, Offset{Items: it.idx, SalesforceLocator: it.locator}, false, err
 		}
@@ -104,7 +107,7 @@ func (it *sfIter) Close() error { return nil }
 
 // --- internal HTTP helpers ---
 
-func sfOAuthToken(ctx context.Context, tokenUrl, clientID, clientSecret string) (string, error) {
+func sfOAuthToken(ctx context.Context, client *http.Client, tokenUrl, clientID, clientSecret string) (string, error) {
 	form := url.Values{}
 	form.Set("grant_type", "client_credentials")
 	form.Set("client_id", clientID)
@@ -114,7 +117,7 @@ func sfOAuthToken(ctx context.Context, tokenUrl, clientID, clientSecret string) 
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -132,7 +135,7 @@ func sfOAuthToken(ctx context.Context, tokenUrl, clientID, clientSecret string) 
 	return payload.AccessToken, nil
 }
 
-func sfCreateQueryJob(ctx context.Context, instance, token, soql string) (string, error) {
+func sfCreateQueryJob(ctx context.Context, client *http.Client, instance, token, soql string) (string, error) {
 	body, _ := json.Marshal(map[string]any{"operation": "query", "query": soql})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, instance+"/services/data/v58.0/jobs/query", strings.NewReader(string(body)))
 	if err != nil {
@@ -140,7 +143,7 @@ func sfCreateQueryJob(ctx context.Context, instance, token, soql string) (string
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -158,7 +161,7 @@ func sfCreateQueryJob(ctx context.Context, instance, token, soql string) (string
 	return out.ID, nil
 }
 
-func sfWaitJobComplete(ctx context.Context, instance, token, jobID string) error {
+func sfWaitJobComplete(ctx context.Context, client *http.Client, instance, token, jobID string) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -167,7 +170,7 @@ func sfWaitJobComplete(ctx context.Context, instance, token, jobID string) error
 		}
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, instance+"/services/data/v58.0/jobs/query/"+jobID, nil)
 		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return err
 		}
@@ -185,14 +188,14 @@ func sfWaitJobComplete(ctx context.Context, instance, token, jobID string) error
 	}
 }
 
-func sfFetchResults(ctx context.Context, instance, token, jobID, locator string, limit int) ([]map[string]any, string, error) {
+func sfFetchResults(ctx context.Context, client *http.Client, instance, token, jobID, locator string, limit int) ([]map[string]any, string, error) {
 	u := fmt.Sprintf("%s/services/data/v58.0/jobs/query/%s/results?maxRecords=%d", instance, jobID, limit)
 	if locator != "" {
 		u += "&locator=" + url.QueryEscape(locator)
 	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", err
 	}

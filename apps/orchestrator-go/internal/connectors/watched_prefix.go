@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"errors"
 	"io"
+	"net/http"
 )
 
 // watchedPrefix streams rows out of every object under a bucket+prefix. For the
@@ -34,12 +35,13 @@ func (b *watchedPrefixBuilder) Open(ctx context.Context, offset Offset) (RowIter
 			urls = append(urls, s)
 		}
 	}
-	return &watchedIter{urls: urls, offset: offset}, nil
+	return &watchedIter{urls: urls, offset: offset, http: b.cfg.HTTP}, nil
 }
 
 type watchedIter struct {
 	urls    []string
 	offset  Offset
+	http    *http.Client
 	current *csvObjIter
 	cursor  int
 	idx     int64
@@ -50,7 +52,7 @@ func (it *watchedIter) advance(ctx context.Context) error {
 		return io.EOF
 	}
 	next := &csvObjIter{}
-	if err := next.open(ctx, it.urls[it.cursor]); err != nil {
+	if err := next.open(ctx, it.http, it.urls[it.cursor]); err != nil {
 		return err
 	}
 	it.current = next
@@ -96,8 +98,8 @@ type csvObjIter struct {
 	header []string
 }
 
-func (c *csvObjIter) open(ctx context.Context, url string) error {
-	rc, err := openSource(ctx, map[string]any{"url": url})
+func (c *csvObjIter) open(ctx context.Context, client *http.Client, url string) error {
+	rc, err := openSource(ctx, Config{Config: map[string]any{"url": url}, HTTP: client})
 	if err != nil {
 		return err
 	}

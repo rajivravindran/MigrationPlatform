@@ -511,21 +511,30 @@ func TestRetryRowResumesAtFailedStep(t *testing.T) {
 }
 
 func TestExtractConnectorFromSourceRef(t *testing.T) {
-	cfg, secret := extractConnector(map[string]any{
-		"type":   "salesforce",
-		"secret": "oauth-token",
-		"extra":  map[string]any{"soql": "SELECT Id FROM Account"},
+	sf := extractConnector(map[string]any{
+		"type":         "connector",
+		"connector_id": float64(3),
+		"secret":       "oauth-token",
+		"extra":        map[string]any{"soql": "SELECT Id FROM Account"},
 	})
-	require.Equal(t, "salesforce", cfg.Kind)
-	require.Equal(t, "SELECT Id FROM Account", cfg.Config["soql"])
-	require.Equal(t, "oauth-token", secret)
+	require.Equal(t, "salesforce", sf.Kind)
+	require.Equal(t, int64(3), sf.ConnectorID)
+	require.Equal(t, "SELECT Id FROM Account", sf.Config["soql"])
+	for _, v := range sf.Config {
+		require.NotEqual(t, "oauth-token", v, "inline secrets never reach Ingest")
+	}
 
-	minioCfg, _ := extractConnector(map[string]any{
-		"type":     "minio",
-		"bucket":   "migration",
-		"key":      "uploads/1/ab/file.csv",
-		"filename": "blog_migration.csv",
+	legacy := extractConnector(map[string]any{"type": "salesforce", "connectorId": float64(4)})
+	require.Equal(t, int64(4), legacy.ConnectorID)
+
+	minioCfg := extractConnector(map[string]any{
+		"type":      "minio",
+		"source_id": float64(9),
+		"bucket":    "migration",
+		"key":       "uploads/1/ab/file.csv",
+		"filename":  "blog_migration.csv",
 	})
+	require.Equal(t, int64(9), minioCfg.SourceID)
 	require.Equal(t, "csv", minioCfg.Kind)
 	require.Equal(t, "migration", minioCfg.Config["s3_bucket"])
 	require.Equal(t, "uploads/1/ab/file.csv", minioCfg.Config["s3_key"])

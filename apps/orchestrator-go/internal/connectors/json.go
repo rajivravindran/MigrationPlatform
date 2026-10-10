@@ -14,7 +14,7 @@ func NewJSON(cfg Config) (SourceConnector, error) { return &jsonBuilder{cfg: cfg
 func (b *jsonBuilder) Kind() string { return "json" }
 
 func (b *jsonBuilder) Open(ctx context.Context, offset Offset) (RowIterator, error) {
-	src, err := openSource(ctx, b.cfg.Config)
+	src, err := openSource(ctx, b.cfg)
 	if err != nil {
 		return nil, err
 	}

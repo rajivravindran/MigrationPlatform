@@ -85,7 +85,7 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 		}
 		var listed activities.ListPrefixObjectsOutput
 		if err := workflow.ExecuteActivity(ctx, "ListPrefixObjects", activities.ListPrefixObjectsInput{
-			Bucket: bucket, Prefix: prefix, Glob: glob, Sort: sortBy,
+			OrgID: in.OrgID, Bucket: bucket, Prefix: prefix, Glob: glob, Sort: sortBy,
 		}).Get(ctx, &listed); err != nil {
 			return result, fmt.Errorf("list objects: %w", err)
 		}
@@ -256,12 +256,13 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 			ScheduleID:          in.ScheduleID,
 			ScheduledTime:       scheduled,
 			SourceRef: map[string]any{
-				"type":     "minio",
-				"bucket":   obj.bucket,
-				"key":      obj.key,
-				"filename": path.Base(obj.remoteKey),
-				"size":     obj.size,
-				"etag":     obj.etag,
+				"type":      "minio",
+				"source_id": started.SourceID,
+				"bucket":    obj.bucket,
+				"key":       obj.key,
+				"filename":  path.Base(obj.remoteKey),
+				"size":      obj.size,
+				"etag":      obj.etag,
 			},
 		})
 

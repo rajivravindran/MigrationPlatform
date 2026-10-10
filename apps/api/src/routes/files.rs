@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{ApiError, ApiResult};
 use crate::middleware::auth::{require_role, AuthUser};
 use crate::sampling::{self, DEFAULT_BYTE_CAP, DEFAULT_ROW_CAP, MAX_ROW_CAP};
+use crate::sources;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -29,6 +30,7 @@ pub fn router() -> Router<AppState> {
 pub struct FileRef {
     #[serde(rename = "type")]
     pub kind: &'static str,
+    pub source_id: i64,
     pub bucket: String,
     pub key: String,
     pub size: i64,
@@ -65,7 +67,7 @@ async fn upload_file(
         let sha = hex::encode(digest);
         let key = format!("uploads/{}/{}/{}", claims.org, &sha[..2], sha);
 
-        state
+        let put = state
             .s3
             .put_object()
             .bucket(&state.cfg.minio_bucket)
@@ -77,9 +79,32 @@ async fn upload_file(
             .await
             .map_err(|e| ApiError::External(format!("s3 put: {e}")))?;
 
+        let source = sources::register_upload(
+            &state.db,
+            sources::NewUpload {
+                org: claims.org,
+                created_by: claims.sub.parse().ok(),
+                bucket: &state.cfg.minio_bucket,
+                key: &key,
+                sha256: &sha,
+                etag: put.e_tag().map(|e| e.trim_matches('"')),
+                size: bytes.len() as i64,
+                filename: &filename,
+            },
+        )
+        .await?;
+        tracing::info!(
+            org = claims.org,
+            source_id = source.id,
+            size = bytes.len(),
+            "source registered"
+        );
+
         return Ok(Json(json!({
+            "source_id": source.id,
             "source_ref": FileRef {
                 kind: "minio",
+                source_id: source.id,
                 bucket: state.cfg.minio_bucket.clone(),
                 key,
                 size: bytes.len() as i64,
@@ -93,9 +118,12 @@ async fn upload_file(
 
 #[derive(Debug, Deserialize)]
 pub struct SampleRequest {
-    /// Bucket the object lives in. Defaults to the configured upload bucket
-    /// so callers can pass just `key` for the common case.
+    /// Registered source to sample. Alternatively pass `bucket`/`key` of an
+    /// upload owned by the caller's organization.
+    pub source_id: Option<i64>,
+    /// Defaults to the configured upload bucket.
     pub bucket: Option<String>,
+    #[serde(default)]
     pub key: String,
     /// `csv | json | xml`. If omitted we sniff from the key suffix.
     pub format: Option<String>,
@@ -121,6 +149,7 @@ pub struct SampleResponse {
 
 #[derive(Debug, Serialize)]
 pub struct SourceEcho {
+    pub source_id: i64,
     pub bucket: String,
     pub key: String,
 }
@@ -132,18 +161,28 @@ async fn sample_file(
 ) -> ApiResult<impl IntoResponse> {
     require_role(&claims, &["admin", "editor", "operator", "viewer"])?;
 
-    if req.key.trim().is_empty() {
-        return Err(ApiError::BadRequest("key is required".into()));
-    }
-    let bucket = req
-        .bucket
-        .clone()
-        .unwrap_or_else(|| state.cfg.minio_bucket.clone());
+    let source_req = match req.source_id {
+        Some(id) => sources::SourceRequest::ById(id),
+        None if req.key.trim().is_empty() => {
+            return Err(ApiError::BadRequest("source_id or key is required".into()))
+        }
+        None => sources::SourceRequest::Object {
+            bucket: req
+                .bucket
+                .clone()
+                .unwrap_or_else(|| state.cfg.minio_bucket.clone()),
+            key: req.key.clone(),
+        },
+    };
+    let source = sources::resolve_object(&state.db, claims.org, &source_req).await?;
+    let bucket = source.bucket.clone();
+    let key = source.object_key.clone();
     let row_cap = req.rows.unwrap_or(DEFAULT_ROW_CAP).clamp(1, MAX_ROW_CAP);
     let format = req
         .format
         .clone()
-        .or_else(|| sniff_format_from_key(&req.key))
+        .or_else(|| source.filename.as_deref().and_then(sniff_format_from_key))
+        .or_else(|| sniff_format_from_key(&key))
         .ok_or_else(|| {
             ApiError::BadRequest("could not determine format; pass `format` (csv|json|xml)".into())
         })?;
@@ -156,7 +195,7 @@ async fn sample_file(
         .s3
         .get_object()
         .bucket(&bucket)
-        .key(&req.key)
+        .key(&key)
         .range(range)
         .send()
         .await
@@ -202,8 +241,9 @@ async fn sample_file(
         truncated: result.truncated,
         bytes_read: result.bytes_read,
         source: SourceEcho {
+            source_id: source.id,
             bucket,
-            key: req.key,
+            key,
         },
     }))
 }

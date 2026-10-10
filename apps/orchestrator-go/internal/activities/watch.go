@@ -58,6 +58,7 @@ func (a *Activities) LoadConnector(ctx context.Context, in LoadConnectorInput) (
 // ---------------- ListPrefixObjects ----------------
 
 type ListPrefixObjectsInput struct {
+	OrgID  int64  `json:"orgId"`
 	Bucket string `json:"bucket"`
 	Prefix string `json:"prefix"`
 	Glob   string `json:"glob"`
@@ -69,6 +70,9 @@ type ListPrefixObjectsOutput struct {
 }
 
 func (a *Activities) ListPrefixObjects(ctx context.Context, in ListPrefixObjectsInput) (ListPrefixObjectsOutput, error) {
+	if err := a.sources.checkOrgLocation(in.OrgID, in.Bucket, in.Prefix); err != nil {
+		return ListPrefixObjectsOutput{}, err
+	}
 	objs, err := connectors.ListPrefixObjects(ctx, in.Bucket, in.Prefix, in.Glob, in.Sort)
 	if err != nil {
 		return ListPrefixObjectsOutput{}, err
@@ -158,6 +162,9 @@ func (a *Activities) StageSftpObject(ctx context.Context, in StageSftpObjectInpu
 		return StageSftpObjectOutput{}, err
 	}
 	stagingKey := connectors.StagingObjectKey(cfg.StagingPrefix, in.ConnectorID, in.RemoteKey)
+	if err := a.sources.checkOrgLocation(in.OrgID, cfg.StagingBucket, stagingKey); err != nil {
+		return StageSftpObjectOutput{}, err
+	}
 	tmp, err := os.MkdirTemp("", "sftp-stage-*")
 	if err != nil {
 		return StageSftpObjectOutput{}, err
@@ -209,6 +216,12 @@ func (a *Activities) loadSftpConnector(ctx context.Context, orgID, connectorID i
 	}
 	cfg, err := connectors.ParseSftpConfig(cfgMap)
 	if err != nil {
+		return connectors.SftpConfig{}, connectors.SftpAuth{}, err
+	}
+	if p := strings.Trim(cfg.StagingPrefix, "/"); p == "" || p == "sftp-landing" {
+		cfg.StagingPrefix = OrgObjectPrefix(orgID) + "sftp-landing/"
+	}
+	if err := a.sources.checkOrgLocation(orgID, cfg.StagingBucket, cfg.StagingPrefix); err != nil {
 		return connectors.SftpConfig{}, connectors.SftpAuth{}, err
 	}
 	if secretID == nil {
@@ -344,6 +357,7 @@ type StartWatchObjectJobOutput struct {
 	JobID      int64  `json:"jobId"`
 	WorkflowID string `json:"workflowId"`
 	Created    bool   `json:"created"` // false if idempotent conflict (already exists)
+	SourceID   int64  `json:"sourceId"`
 }
 
 // WatchWorkflowID builds a stable Temporal workflow id for a watched object.
@@ -355,26 +369,36 @@ func WatchWorkflowID(orgID int64, bucket, key, etag string) string {
 // StartWatchObjectJob inserts a jobs (+ schedule_runs) row for one discovered
 // object. Idempotent on temporal_workflow_id so redeliveries reuse the same job.
 func (a *Activities) StartWatchObjectJob(ctx context.Context, in StartWatchObjectJobInput) (StartWatchObjectJobOutput, error) {
-	filename := path.Base(in.Key)
-	workflowID := WatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag)
-	source := map[string]any{
-		"type":     "minio",
-		"bucket":   in.Bucket,
-		"key":      in.Key,
-		"filename": filename,
-		"size":     in.Size,
-		"etag":     in.ETag,
-	}
-	srcJSON, err := json.Marshal(source)
-	if err != nil {
+	if err := a.sources.checkOrgLocation(in.OrgID, in.Bucket, in.Key); err != nil {
 		return StartWatchObjectJobOutput{}, err
 	}
-
+	filename := path.Base(in.Key)
+	workflowID := WatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag)
 	tx, err := a.d.DB.Begin(ctx)
 	if err != nil {
 		return StartWatchObjectJobOutput{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	sourceID, err := registerSource(ctx, tx, newSource{
+		OrgID: in.OrgID, Bucket: in.Bucket, Key: in.Key, Filename: filename,
+		ETag: in.ETag, Size: in.Size, Provenance: "watched",
+	})
+	if err != nil {
+		return StartWatchObjectJobOutput{}, err
+	}
+	srcJSON, err := json.Marshal(map[string]any{
+		"type":      "minio",
+		"source_id": sourceID,
+		"bucket":    in.Bucket,
+		"key":       in.Key,
+		"filename":  filename,
+		"size":      in.Size,
+		"etag":      in.ETag,
+	})
+	if err != nil {
+		return StartWatchObjectJobOutput{}, err
+	}
 
 	var jobID int64
 	existed := false
@@ -411,7 +435,7 @@ func (a *Activities) StartWatchObjectJob(ctx context.Context, in StartWatchObjec
 	if err = tx.Commit(ctx); err != nil {
 		return StartWatchObjectJobOutput{}, err
 	}
-	return StartWatchObjectJobOutput{JobID: jobID, WorkflowID: workflowID, Created: !existed}, nil
+	return StartWatchObjectJobOutput{JobID: jobID, WorkflowID: workflowID, Created: !existed, SourceID: sourceID}, nil
 }
 
 // MarkJobRunningInput marks a pending watch job as running after child start.

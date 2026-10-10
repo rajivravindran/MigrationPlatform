@@ -22,6 +22,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::job_source::job_json_with_source;
 use crate::middleware::auth::{require_role, AuthUser};
 use crate::security::audit::record_audit;
+use crate::sources;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -88,6 +89,10 @@ async fn create_job(
     .ok_or_else(|| ApiError::BadRequest("template not found or not published".to_string()))?;
 
     let created_by: i64 = claims.sub.parse().map_err(|_| ApiError::Unauthorized)?;
+    let source_req = sources::parse_source_request(&req.source_ref)?;
+    let source_ref = sources::resolve(&state.db, claims.org, &source_req)
+        .await?
+        .source_ref();
     let workflow_id = format!("mig-{}-{}", claims.org, uuid::Uuid::new_v4());
 
     // Insert the job first so the workflow input can carry the real job id
@@ -100,7 +105,7 @@ async fn create_job(
     .bind(claims.org)
     .bind(req.rule_template_id)
     .bind(tpl_version)
-    .bind(&req.source_ref)
+    .bind(&source_ref)
     .bind(&workflow_id)
     .bind(created_by)
     .fetch_one(&state.db)
@@ -115,7 +120,7 @@ async fn create_job(
                 "jobId": row.id,
                 "ruleTemplateId": req.rule_template_id,
                 "ruleTemplateVersion": tpl_version,
-                "sourceRef": req.source_ref,
+                "sourceRef": source_ref,
             }),
         )
         .await;

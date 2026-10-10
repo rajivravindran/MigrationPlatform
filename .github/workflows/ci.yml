@@ -19,6 +19,7 @@ jobs:
       - run: cargo clippy --manifest-path apps/api/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path apps/api/Cargo.toml
       - run: cargo test --manifest-path apps/api/Cargo.toml --test integration_db -- --ignored
+      - run: cargo test --manifest-path apps/api/Cargo.toml --test source_authz -- --ignored
 
   go:
     runs-on: ubuntu-latest

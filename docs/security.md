@@ -32,6 +32,22 @@ Roles (least → most privileged):
 Enforced by an `axum` middleware that inspects the JWT `role` claim and
 rejects with `403 forbidden.insufficient_role`.
 
+### Source ownership
+
+Jobs, samples, batches and schedules can only name sources owned by the
+caller's organization ([ADR 0001](adr/0001-source-identity.md)): uploads are
+registered in `sources`, connectors are looked up by `(id, org_id)`, and
+watched or staged object locations must start with `orgs/{org_id}/`.
+The worker re-checks ownership and object version before every read, loads
+connector credentials itself (they never enter workflow history) and fetches
+remote sources through the SSRF-guarded egress client.
+
+| Setting (orchestrator) | Default | Effect |
+| ---------------------- | ------- | ------ |
+| `ALLOW_LOCAL_SOURCE_PATHS` | `false` | `true` lets ingest read worker-local `path` sources. Never set in shared deployments. |
+| `WATCH_ALLOWED_BUCKETS` (API and orchestrator) | empty | Buckets besides `MINIO_BUCKET` that watched/SFTP-staging connectors may use. Prefixes must still start with `orgs/{org_id}/`. |
+| `ALLOW_PRIVATE_DESTINATIONS` | `false` | `true` disables the private-address egress block for destinations and remote sources (dev compose only). |
+
 ## Secret handling
 
 - User-provided secrets (Salesforce refresh tokens, custom API keys, etc.)

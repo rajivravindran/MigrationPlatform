@@ -42,10 +42,15 @@ type Deps struct {
 type Activities struct {
 	d         Deps
 	sftpSlots chan struct{}
+	sources   *sourceAuthorizer
 }
 
 func NewActivities(d Deps) *Activities {
-	return &Activities{d: d, sftpSlots: make(chan struct{}, 8)}
+	return &Activities{
+		d:         d,
+		sftpSlots: make(chan struct{}, 8),
+		sources:   newSourceAuthorizer(d.DB, d.SecretsMasterKey),
+	}
 }
 
 func (a *Activities) acquireSFTP(ctx context.Context) (func(), error) {
@@ -178,13 +183,18 @@ func (a *Activities) BootstrapScheduledJob(ctx context.Context, in BootstrapSche
 // ---------------- Ingest ----------------
 
 type IngestInput struct {
-	JobID           int64           `json:"jobId"`
-	OrgID           int64           `json:"orgId"`
-	ConnectorKind   string          `json:"connectorKind"`
-	ConnectorConfig map[string]any  `json:"connectorConfig"`
-	ConnectorSecret string          `json:"connectorSecret"`
-	Offset          json.RawMessage `json:"offset"`
-	BatchSize       int             `json:"batchSize"`
+	JobID           int64          `json:"jobId"`
+	OrgID           int64          `json:"orgId"`
+	ConnectorKind   string         `json:"connectorKind"`
+	ConnectorConfig map[string]any `json:"connectorConfig"`
+	// ConnectorSecret is never honoured; a non-empty value (from workflows
+	// started before ADR 0001) fails authorization.
+	ConnectorSecret string `json:"connectorSecret,omitempty"`
+	// SourceID names the registered object; ConnectorID a stored connector.
+	SourceID    int64           `json:"sourceId,omitempty"`
+	ConnectorID int64           `json:"connectorId,omitempty"`
+	Offset      json.RawMessage `json:"offset"`
+	BatchSize   int             `json:"batchSize"`
 }
 
 type IngestOutput struct {
@@ -195,12 +205,14 @@ type IngestOutput struct {
 
 func (a *Activities) Ingest(ctx context.Context, in IngestInput) (IngestOutput, error) {
 	offset, _ := connectors.UnmarshalOffset(in.Offset)
-	factory := connectors.Factory{}
-	conn, err := factory.Build(connectors.Config{
-		Kind:   in.ConnectorKind,
-		Config: in.ConnectorConfig,
-		Secret: in.ConnectorSecret,
-	})
+	cfg, err := a.sources.authorize(ctx, in)
+	if err != nil {
+		activity.GetLogger(ctx).Warn("ingest source refused", "jobId", in.JobID, "orgId", in.OrgID,
+			"sourceId", in.SourceID, "connectorId", in.ConnectorID, "error", err)
+		return IngestOutput{}, err
+	}
+	cfg.HTTP = a.d.HTTP
+	conn, err := connectors.Factory{}.Build(cfg)
 	if err != nil {
 		return IngestOutput{}, err
 	}

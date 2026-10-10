@@ -52,7 +52,7 @@ function kindLabel(kind: string) {
 
 const DEFAULTS: Record<Kind, Record<string, unknown>> = {
   salesforce: { instance_url: "", client_id: "", username: "" },
-  watched_prefix: { bucket: "", prefix: "incoming/", glob: "*.csv", sort: "key" },
+  watched_prefix: { bucket: "", prefix: "", glob: "*.csv", sort: "key" },
   watched_sftp: {
     host: "", port: 22, username: "", path: "/incoming", glob: "*", sort: "mtime",
     staging_bucket: "", staging_prefix: "sftp-landing/", insecure_ignore_host_key: false
@@ -69,6 +69,7 @@ function validate(kind: Kind, name: string, config: Record<string, unknown>, sec
     if (!String(config.username ?? "").includes("@")) errors.username = "Enter a valid Salesforce username.";
   } else if (kind === "watched_prefix") {
     if (!String(config.bucket ?? "").trim()) errors.bucket = "Bucket is required.";
+    if (!/^\/?orgs\/\d+\//.test(String(config.prefix ?? ""))) errors.prefix = "Prefix must start with orgs/<your organization id>/.";
   } else if (kind === "watched_sftp") {
     if (!String(config.host ?? "").trim()) errors.host = "Host is required.";
     if (!String(config.username ?? "").trim()) errors.username = "Username is required.";
@@ -271,7 +272,7 @@ export default function ConnectorsPage() {
 
         {kind === "watched_prefix" ? <>
           <FormField label="Bucket" required error={errors.bucket}><Input value={String(config.bucket)} onChange={(e) => setField("bucket", e.target.value)} placeholder="migration-inbound" /></FormField>
-          <FormField label="Prefix" hint="Only objects under this path are watched."><Input value={String(config.prefix)} onChange={(e) => setField("prefix", e.target.value)} /></FormField>
+          <FormField label="Prefix" error={errors.prefix} hint="Only objects under this path are watched. Must be inside your organization's namespace, e.g. orgs/1/incoming/."><Input value={String(config.prefix)} onChange={(e) => setField("prefix", e.target.value)} placeholder="orgs/1/incoming/" /></FormField>
           <div className="grid grid-cols-2 gap-3">
             <FormField label="File pattern"><Input value={String(config.glob)} onChange={(e) => setField("glob", e.target.value)} /></FormField>
             <FormField label="Sort order"><Select value={String(config.sort)} onChange={(e) => setField("sort", e.target.value)}><option value="key">Object key</option><option value="mtime">Modified time</option></Select></FormField>
@@ -285,7 +286,7 @@ export default function ConnectorsPage() {
           </div>
           <FormField label="Username" required error={errors.username}><Input value={String(config.username)} onChange={(e) => setField("username", e.target.value)} /></FormField>
           <FormField label="Remote path"><Input value={String(config.path)} onChange={(e) => setField("path", e.target.value)} /></FormField>
-          <FormField label="Staging bucket" required error={errors.staging_bucket} hint="Downloaded files are staged here before processing."><Input value={String(config.staging_bucket)} onChange={(e) => setField("staging_bucket", e.target.value)} /></FormField>
+          <FormField label="Staging bucket" required error={errors.staging_bucket} hint="Downloaded files are staged under orgs/<your organization id>/sftp-landing/ in this bucket before processing."><Input value={String(config.staging_bucket)} onChange={(e) => setField("staging_bucket", e.target.value)} /></FormField>
           <FormField label="SSH host key" error={errors.host_key} hint="Recommended for production to prevent machine-in-the-middle attacks."><Input value={String(config.host_key ?? "")} onChange={(e) => setField("host_key", e.target.value)} placeholder="ssh-ed25519 AAAA…" /></FormField>
           <label className="flex items-start gap-2 text-sm text-slate-700"><input className="mt-1" type="checkbox" checked={Boolean(config.insecure_ignore_host_key)} onChange={(e) => setField("insecure_ignore_host_key", e.target.checked)} /><span>Skip host-key verification <span className="block text-xs text-rose-700">Development only. This weakens connection security.</span></span></label>
         </> : null}

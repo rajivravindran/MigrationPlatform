@@ -10,6 +10,7 @@ pub mod routes;
 pub mod rule_template_types;
 pub mod sampling;
 pub mod security;
+pub mod sources;
 pub mod state;
 pub mod telemetry;
 pub mod temporal;

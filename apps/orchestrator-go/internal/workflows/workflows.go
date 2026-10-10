@@ -109,7 +109,7 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 	const batchSize = 500
 	batchIdx := 0
 
-	connCfg, secret := extractConnector(in.SourceRef)
+	source := extractConnector(in.SourceRef)
 
 	for {
 		// Cooperative pause: spin with a short sleep while paused.
@@ -123,9 +123,10 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 		err := workflow.ExecuteActivity(ctx, "Ingest", activities.IngestInput{
 			JobID:           in.JobID,
 			OrgID:           in.OrgID,
-			ConnectorKind:   connCfg.Kind,
-			ConnectorConfig: connCfg.Config,
-			ConnectorSecret: secret,
+			ConnectorKind:   source.Kind,
+			ConnectorConfig: source.Config,
+			SourceID:        source.SourceID,
+			ConnectorID:     source.ConnectorID,
 			Offset:          offsetRaw,
 			BatchSize:       batchSize,
 		}).Get(ctx, &ingest)
@@ -602,44 +603,73 @@ func defaultActivityOptions(r *template.Retry) workflow.ActivityOptions {
 	}
 }
 
-func extractConnector(sourceRef map[string]any) (connectors.Config, string) {
-	cfg := connectors.Config{Kind: "csv", Config: map[string]any{}}
+// ingestSource is what the workflow forwards to Ingest. It names a source;
+// the activity re-authorizes it and loads any credentials (ADR 0001).
+type ingestSource struct {
+	Kind        string
+	Config      map[string]any
+	SourceID    int64
+	ConnectorID int64
+}
+
+func extractConnector(sourceRef map[string]any) ingestSource {
+	src := ingestSource{Kind: "csv", Config: map[string]any{}}
 	if sourceRef == nil {
-		return cfg, ""
+		return src
 	}
-	if kind, ok := sourceRef["type"].(string); ok {
-		cfg.Kind = kind
-	}
-	// Browser uploads land in MinIO with type=minio. Map to csv/json/xml and
-	// pass bucket+key so the ingest connector can stream the object.
-	if cfg.Kind == "minio" {
+	kind, _ := sourceRef["type"].(string)
+	src.SourceID = int64Field(sourceRef, "source_id")
+	switch kind {
+	case "minio":
 		bucket, _ := sourceRef["bucket"].(string)
 		key, _ := sourceRef["key"].(string)
 		filename, _ := sourceRef["filename"].(string)
-		cfg.Kind = connectors.FormatFromFilename(filename)
-		cfg.Config["s3_bucket"] = bucket
-		cfg.Config["s3_key"] = key
-		if cfg.Kind == "csv" {
-			cfg.Config["header"] = true
-			cfg.Config["delimiter"] = ","
+		src.Kind = connectors.FormatFromFilename(filename)
+		src.Config["s3_bucket"] = bucket
+		src.Config["s3_key"] = key
+		if src.Kind == "csv" {
+			src.Config["header"] = true
+			src.Config["delimiter"] = ","
 		}
-		secret, _ := sourceRef["secret"].(string)
-		return cfg, secret
+		return src
+	case "connector", "salesforce":
+		src.Kind = "salesforce"
+		src.ConnectorID = int64Field(sourceRef, "connector_id")
+		if src.ConnectorID == 0 {
+			src.ConnectorID = int64Field(sourceRef, "connectorId")
+		}
+	default:
+		// Legacy shapes are passed through so Ingest can refuse them with a
+		// clear, non-retryable error instead of the workflow guessing.
+		if kind != "" {
+			src.Kind = kind
+		}
+		for _, k := range []string{"url", "path"} {
+			if v, ok := sourceRef[k].(string); ok {
+				src.Config[k] = v
+			}
+		}
 	}
 	if extra, ok := sourceRef["extra"].(map[string]any); ok {
 		for k, v := range extra {
-			cfg.Config[k] = v
+			src.Config[k] = v
 		}
 	}
-	if key, ok := sourceRef["key"].(string); ok {
-		cfg.Config["url"] = key
+	return src
+}
+
+// int64Field reads a JSON number that may have decoded as float64.
+func int64Field(m map[string]any, key string) int64 {
+	switch v := m[key].(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return n
 	}
-	if url, ok := sourceRef["url"].(string); ok {
-		cfg.Config["url"] = url
-	}
-	if path, ok := sourceRef["path"].(string); ok {
-		cfg.Config["path"] = path
-	}
-	secret, _ := sourceRef["secret"].(string)
-	return cfg, secret
+	return 0
 }

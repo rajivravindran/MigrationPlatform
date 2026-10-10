@@ -9,6 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/migration-platform/orchestrator/internal/security"
 )
 
 // Row is one ingested record plus its stable index (0-based). The index is
@@ -22,8 +28,8 @@ type Row struct {
 // activity invocations. CSV/JSON pass a byte offset; XML passes an element
 // count; Salesforce/S3 use the native cursor (jobId+locator / continuation).
 type Offset struct {
-	Bytes     int64  `json:"bytes,omitempty"`
-	Items     int64  `json:"items,omitempty"`
+	Bytes             int64  `json:"bytes,omitempty"`
+	Items             int64  `json:"items,omitempty"`
 	SalesforceLocator string `json:"sf_locator,omitempty"`
 	S3Continuation    string `json:"s3_cont,omitempty"`
 }
@@ -65,6 +71,20 @@ type Config struct {
 	Kind   string
 	Config map[string]any
 	Secret string
+	// HTTP serves url sources and Salesforce calls; nil uses the
+	// SSRF-guarded egress client.
+	HTTP *http.Client
+}
+
+var defaultEgressClient = sync.OnceValue(func() *http.Client {
+	return security.NewEgressHTTPClient(60*time.Second, os.Getenv("ALLOW_PRIVATE_DESTINATIONS") == "true")
+})
+
+func (c Config) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	return defaultEgressClient()
 }
 
 // Build dispatches on Config.Kind.
