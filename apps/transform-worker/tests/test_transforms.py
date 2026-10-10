@@ -1,5 +1,5 @@
 from migration_worker.template import PreprocessStep, RuleTemplate
-from migration_worker.transforms import build_payload, preprocess_row
+from migration_worker.transforms import build_payload, preprocess_row, render_py_expressions
 
 
 def test_preprocess_builtin_chain():
@@ -22,6 +22,15 @@ def test_build_payload_simple_mapping():
     out = build_payload({"email": "a@b", "country": "usa"}, template)
     assert out["email"] == "a@b"
     assert out["country_code"] == "US"
+
+
+def test_render_py_expressions_with_indexing():
+    payload = {
+        "id": "fixed",
+        "tags": [{"$py": "[t.strip() for t in row['tags'].split(',')][:2]"}],
+    }
+    out = render_py_expressions(payload, {"tags": "a, b, c"})
+    assert out == {"id": "fixed", "tags": [["a", "b"]]}
 
 
 def test_rule_template_apply_end_to_end():
