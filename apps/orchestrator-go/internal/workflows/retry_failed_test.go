@@ -2,6 +2,7 @@ package workflows
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"sync"
@@ -85,7 +86,26 @@ func TestRetryFailedRowsIncludesRowZero(t *testing.T) {
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
 	require.Equal(t, []int64{0, 3}, store.retried)
-	require.Nil(t, store.cursors[0], "first page must start before row zero")
+	require.NotNil(t, store.cursors[0])
+	require.EqualValues(t, -1, *store.cursors[0], "first page must start before row zero")
+}
+
+// A worker built before MP-09 decodes ListFailedRowsInput.After as a plain
+// int64, where an omitted cursor means 0 and skips row zero. The first page
+// request must keep meaning "before row zero" for that decoder too.
+func TestRetryFailedRowsFirstPageIsSafeForPreMP09Workers(t *testing.T) {
+	store := &failedRowStore{failed: []int64{0}}
+	env := newRetryEnv(t, store)
+	env.ExecuteWorkflow(RetryFailedRowsWorkflow, RetryFailedRowsInput{OrgID: 1, JobID: 2, RuleTemplateID: 3})
+	require.NoError(t, env.GetWorkflowError())
+
+	raw, err := json.Marshal(activities.ListFailedRowsInput{JobID: 2, After: store.cursors[0], Limit: 200})
+	require.NoError(t, err)
+	var legacy struct {
+		After int64 `json:"after"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &legacy))
+	require.Less(t, legacy.After, int64(0), "legacy SQL is row_index > after")
 }
 
 func TestRetryFailedRowsMultiplePagesRetryEachRowOnce(t *testing.T) {

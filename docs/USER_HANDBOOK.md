@@ -408,9 +408,12 @@ Python preprocess example:
   "id": "upper_country",
   "field": "country",
   "fn": "python",
-  "code": "return value.upper() if value else ''"
+  "code": "result = value.upper() if value else ''"
 }
 ```
+
+The snippet sees `value` (this field) and `row`, and must assign `result`;
+a bare `return` is a syntax error.
 
 `$py` in the **payload** is evaluated later, with `row` in scope. Use it
 when a builtin is not enough. Keep snippets small; this is not a place

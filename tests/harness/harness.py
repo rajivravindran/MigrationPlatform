@@ -309,8 +309,12 @@ def reconcile(*, tenant: str, source: list[dict], rows: list[dict], receipts: li
         n = len(receipts_by_key.get(key, []))
         rec.dispositions[key] = {"row_index": row.get("row_index"), "platform": status, "receipts": n}
         if key in expect_ambiguous:
+            # Zero or one effect is acceptable, but the platform may only
+            # claim success when the effect exists.
             if n > 1:
                 bad.append({"key": key, "why": "ambiguous write produced duplicate effects", "receipts": n})
+            if status == "succeeded" and n != 1:
+                bad.append({"key": key, "why": f"succeeded with {n} destination receipts"})
             continue
         want = "failed" if key in expect_failed else "succeeded"
         if status != want:
@@ -332,10 +336,24 @@ def reconcile(*, tenant: str, source: list[dict], rows: list[dict], receipts: li
     rec.check("job terminal status agrees with row outcomes", job.get("status") == want_status,
               {"job": job.get("status"), "expected": want_status})
     totals = job.get("totals_json") or {}
-    rec.check("job totals agree with persisted rows",
-              totals.get("processed") == n_ok and totals.get("failed") == n_failed,
-              {"totals_json": totals, "rows_succeeded": n_ok, "rows_failed": n_failed})
+    rec.check("job totals agree with persisted rows and source",
+              totals.get("processed") == n_ok and totals.get("failed") == n_failed
+              and totals.get("total") == len(rows) == len(source_keys),
+              {"totals_json": totals, "rows_succeeded": n_ok, "rows_failed": n_failed,
+               "rows": len(rows), "source": len(source_keys)})
     return rec
+
+
+def attempt_sequence_check(attempts: list[dict], *, tenant: str, external_id: str,
+                           statuses: list[int]) -> dict:
+    """The destination saw exactly ``statuses`` for one record, under one idempotency key."""
+    seen = sorted((a for a in attempts if a.get("tenant") == tenant and a.get("external_id") == external_id),
+                  key=lambda a: a["seq"])
+    got = [a["status"] for a in seen]
+    keys = {a.get("idempotency_key") for a in seen}
+    return {"check": f"destination saw {statuses} for {external_id} under one idempotency key",
+            "passed": got == statuses and len(keys) == 1 and None not in keys,
+            "detail": {"statuses": got, "idempotency_keys": sorted(k or "" for k in keys)}}
 
 
 # --------------------------------------------------------------------- scenarios
@@ -350,14 +368,19 @@ class Scenario:
 
 def run_customer_migration(*, tenant: str, faults: list[dict], expect_failed: set[str],
                            expect_ambiguous: set[str] | None = None, dest_config: dict | None = None,
-                           retry: dict | None = None) -> dict:
+                           retry: dict | None = None,
+                           customize: Callable[[dict], None] | None = None,
+                           extra_checks: Callable[[list[dict], list[dict]], list[dict]] | None = None) -> dict:
     run_id = uuid.uuid4().hex[:8]
     dest_reset(dest_config, faults)
     token = login(tenant)
     source_path = DATA / tenant / "customers.csv"
     source = read_source(tenant, "customers")
     source_ref = multipart_upload(token, source_path)
-    tpl_id = create_published_template(token, customer_template(tenant, run_id, retry))
+    tpl = customer_template(tenant, run_id, retry)
+    if customize:
+        customize(tpl["schema_json"])
+    tpl_id = create_published_template(token, tpl)
     job = start_job(token, tpl_id, source_ref)
     job = wait_job(token, job["id"])
     rows = job_rows(token, job["id"])
@@ -365,14 +388,15 @@ def run_customer_migration(*, tenant: str, faults: list[dict], expect_failed: se
     rec = reconcile(tenant=tenant, source=source, rows=rows, receipts=receipts,
                     all_receipts=dest_receipts(), job=job, expect_failed=expect_failed,
                     expect_ambiguous=expect_ambiguous)
+    checks = rec.checks + (extra_checks(source, receipts) if extra_checks else [])
     return {
-        "passed": rec.passed,
+        "passed": all(c["passed"] for c in checks),
         "job": {k: job.get(k) for k in ("id", "status", "totals_json", "temporal_workflow_id")},
         "template_id": tpl_id,
         "source": {"path": str(source_path.relative_to(REPO)), "records": len(source),
                    "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest()},
         "faults": faults,
-        "checks": rec.checks,
+        "checks": checks,
         "dispositions": rec.dispositions,
         "destination_attempts": len(dest_attempts()),
         "destination_receipts": len(receipts),
@@ -394,7 +418,33 @@ def scenario_forced_failure(_: Scenario) -> dict:
 def scenario_throttle_recovers(_: Scenario) -> dict:
     faults = [{"id": "throttle-once", "tenant": "org-a", "external_id": "A-CUS-0003",
                "action": "throttle", "times": 2}]
-    return run_customer_migration(tenant="org-a", faults=faults, expect_failed=set())
+    return run_customer_migration(
+        tenant="org-a", faults=faults, expect_failed=set(),
+        extra_checks=lambda _src, _rcpt: [attempt_sequence_check(
+            dest_attempts(), tenant="org-a", external_id="A-CUS-0003", statuses=[429, 429, 201])])
+
+
+def scenario_python_transforms(_: Scenario) -> dict:
+    """Python preprocess + $py payload expression subscripting the row (MP-06)."""
+    def customize(schema: dict) -> None:
+        schema["preprocess"] = [{"id": "lower_country", "field": "country", "fn": "python",
+                                 "code": "result = value.lower() if value else ''"}]
+        schema["mapping"]["payload"]["email_domain"] = {"$py": "row['email'].split('@')[1]"}
+
+    def payload_checks(source: list[dict], receipts: list[dict]) -> list[dict]:
+        expected = {r["external_id"]: {"country": r["country"].lower(), "email_domain": r["email"].split("@")[1]}
+                    for r in source}
+        wrong = []
+        for rec in receipts:
+            got = rec.get("payload") or {}
+            want = expected.get(rec["external_id"], {})
+            if any(got.get(k) != v for k, v in want.items()):
+                wrong.append({"external_id": rec["external_id"], "got": {k: got.get(k) for k in want}, "want": want})
+        return [{"check": "python-transformed fields match independently computed values",
+                 "passed": not wrong and len(receipts) == len(source), "mismatches": wrong[:5]}]
+
+    return run_customer_migration(tenant="org-a", faults=[], expect_failed=set(),
+                                  customize=customize, extra_checks=payload_checks)
 
 
 def latest_job_id(token: str) -> int | None:
@@ -443,6 +493,8 @@ SCENARIOS: dict[str, Scenario] = {
         Scenario("source-authz", "org B cannot start, sample or batch org A's source; path/url refs refused",
                  scenario_source_authz),
         Scenario("ordinary", "40 customers, no faults: one receipt per record", scenario_ordinary),
+        Scenario("python-transforms", "python preprocess and $py row subscripting produce expected payloads",
+                 scenario_python_transforms),
         Scenario("forced-failure", "destination rejects row 0 and row 7: failed rows have no receipts",
                  scenario_forced_failure),
         Scenario("throttle-recovers", "429 twice for one record, retried to exactly one receipt",

@@ -471,7 +471,13 @@ func RetryFailedRowsWorkflow(ctx workflow.Context, in RetryFailedRowsInput) (*Mi
 	result := &MigrationWorkflowResult{}
 	const rowsPerRun = 2000
 	processedThisRun := 0
+	// Send an explicit -1 rather than omitting the cursor: activity workers
+	// built before MP-09 decode a missing cursor as 0 and would skip row zero.
 	cursor := in.After
+	if cursor == nil {
+		start := int64(-1)
+		cursor = &start
+	}
 
 	for {
 		var page activities.ListFailedRowsOutput
