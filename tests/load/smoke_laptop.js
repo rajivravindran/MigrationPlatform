@@ -9,8 +9,8 @@
 // Success:
 //   - HTTP upload 2xx
 //   - Job reaches 'succeeded' within 120s
-//   - processed + failed == total_rows
-//   - failed / total_rows < 0.01
+//   - totals_json.processed + totals_json.failed == totals_json.total
+//   - totals_json.failed / totals_json.total < 0.01
 //
 // Run:
 //   k6 run tests/load/smoke_laptop.js
@@ -70,9 +70,10 @@ export default function () {
     if (js.status !== 200) continue;
     const b = js.json();
     finalStatus = b.status;
-    total = b.total_rows || 0;
-    processed = b.processed || 0;
-    failed = b.failed || 0;
+    const t = b.totals_json || {};
+    total = t.total || 0;
+    processed = t.processed || 0;
+    failed = t.failed || 0;
     if (["succeeded", "failed", "cancelled"].includes(finalStatus)) break;
   }
   jobWait.add((Date.now() - t0) / 1000);

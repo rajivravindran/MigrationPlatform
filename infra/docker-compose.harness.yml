@@ -1,0 +1,23 @@
+# Integrity-harness overlay (test-only). Adds the deterministic destination
+# fixture on the compose network. Use together with docker-compose.yml:
+#
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.harness.yml up -d
+#
+# The orchestrator reaches it at http://destination-fixture:8099; the harness
+# runner reaches its admin API at http://localhost:18099.
+services:
+  destination-fixture:
+    build:
+      context: ..
+      dockerfile: tests/harness/destination/Dockerfile
+    environment:
+      DEST_ADDR: ":8099"
+      DEST_LEDGER_PATH: /data/receipts.jsonl
+      DEST_IDEMPOTENCY: "on"
+    volumes:
+      - destination-ledger:/data
+    ports: ["18099:8099"]
+    networks: [migration]
+
+volumes:
+  destination-ledger: {}

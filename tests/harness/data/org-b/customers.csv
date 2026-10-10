@@ -1,0 +1,16 @@
+external_id,email,name,country
+B-CUS-0000,customer0000@org-b.example.test,Synthetic Customer B0000,US
+B-CUS-0001,customer0001@org-b.example.test,Synthetic Customer B0001,US
+B-CUS-0002,customer0002@org-b.example.test,Synthetic Customer B0002,US
+B-CUS-0003,customer0003@org-b.example.test,Synthetic Customer B0003,US
+B-CUS-0004,customer0004@org-b.example.test,Synthetic Customer B0004,US
+B-CUS-0005,customer0005@org-b.example.test,Synthetic Customer B0005,DE
+B-CUS-0006,customer0006@org-b.example.test,Synthetic Customer B0006,DE
+B-CUS-0007,customer0007@org-b.example.test,Synthetic Customer B0007,DE
+B-CUS-0008,customer0008@org-b.example.test,Synthetic Customer B0008,GB
+B-CUS-0009,customer0009@org-b.example.test,Synthetic Customer B0009,US
+B-CUS-0010,customer0010@org-b.example.test,Synthetic Customer B0010,US
+B-CUS-0011,customer0011@org-b.example.test,Synthetic Customer B0011,US
+B-CUS-0012,customer0012@org-b.example.test,Synthetic Customer B0012,DE
+B-CUS-0013,customer0013@org-b.example.test,Synthetic Customer B0013,CA
+B-CUS-0014,customer0014@org-b.example.test,Synthetic Customer B0014,GB

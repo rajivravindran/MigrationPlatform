@@ -5,7 +5,7 @@ PROJECT := migration-platform
 HUB_IMAGE_PREFIX ?= rajivravindran
 IMAGE_TAG ?= demo
 
-.PHONY: help up hub-up hub-pull demo-pack down logs ps build rebuild seed smoke test test-rust test-go test-py test-web lint fmt clean keys
+.PHONY: harness-up harness-setup harness harness-unit help up hub-up hub-pull demo-pack down logs ps build rebuild seed smoke test test-rust test-go test-py test-web lint fmt clean keys
 
 help:
 	@echo "Migration Platform — laptop developer targets"
@@ -24,6 +24,7 @@ help:
 	@echo "  make seed        Create demo org, admin user, sample template + CSV"
 	@echo "  make smoke       Run k6 compose smoke (100k rows by default)"
 	@echo "  make test        Run all unit/integration tests"
+	@echo "  make harness-up  Stack + destination fixture; then make harness-setup harness"
 	@echo
 	@echo "Hub defaults: HUB_IMAGE_PREFIX=$(HUB_IMAGE_PREFIX) IMAGE_TAG=$(IMAGE_TAG)"
 	@echo
@@ -110,6 +111,21 @@ test-py:
 
 test-web:
 	cd apps/web && npm test || true
+
+HARNESS_COMPOSE := docker compose -f infra/docker-compose.yml -f infra/docker-compose.harness.yml
+
+harness-up: keys
+	$(HARNESS_COMPOSE) up -d --build
+
+harness-setup:
+	python3 tests/harness/harness.py setup
+
+harness:
+	python3 tests/harness/harness.py run
+
+harness-unit:
+	cd tests/harness/destination && go test -race ./...
+	python3 -m unittest discover -s tests/harness -p 'test_*.py'
 
 lint:
 	cargo clippy --manifest-path apps/api/Cargo.toml -- -D warnings

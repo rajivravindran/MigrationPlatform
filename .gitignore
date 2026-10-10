@@ -107,3 +107,6 @@ override.tf.json
 # OS and generic temporary files
 Thumbs.db
 *.tmp
+
+# Integrity harness evidence output
+tests/harness/out/

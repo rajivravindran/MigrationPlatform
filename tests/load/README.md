@@ -63,13 +63,17 @@ kubectl -n migration logs job/k6-load -f
 
 The job mounts a `k6` container that runs `load_10m.js`, which:
 
-1. Uploads the sharded CSV to MinIO via `mc` (pre-step).
-2. Kicks off a single Migration job using the `watched_prefix` connector.
-3. Polls `/jobs/{id}` until `status in (succeeded, failed, cancelled)`.
-4. Streams `/jobs/{id}/stream` (SSE) and records processed/sec.
-5. Asserts:
-   - `processed + failed == total_rows`
-   - `failed / total_rows < 0.001`
-   - `rows_per_second >= 2_500` (sustained)
-   - Resumes cleanly after a simulated pod kill (`kubectl delete pod` on
-     `migration-orchestrator` half-way through).
+1. Expects the input to be uploaded beforehand with `POST /files`; the returned
+   `source_ref` object is passed verbatim as `SOURCE_REF_JSON`.
+2. Starts one job with `{"rule_template_id", "source_ref"}`.
+3. Polls `/jobs/{id}` every 30s until `status in (succeeded, failed, cancelled)`
+   and derives rows/sec from `totals_json.processed + totals_json.failed`.
+4. Asserts (targets, not verified capabilities):
+   - `totals_json.failed / totals_json.total < 0.001`
+   - `rows_per_second >= 2_500` average
+   - processed rows reach `EXPECTED_TOTAL_ROWS`
+
+Pod-kill recovery is not asserted by this script; recovery and destination-side
+reconciliation are covered by the integrity harness (`tests/harness/`).
+Throughput numbers have not been measured at 10M rows (see
+`docs/ENGINEERING_REVIEW_HANDOVER_2026-10-02.md`, MP-07).

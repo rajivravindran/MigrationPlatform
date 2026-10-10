@@ -30,11 +30,12 @@ spec:
                 configMapKeyRef:
                   name: k6-load-config
                   key: rule_template_id
-            - name: WATCHED_PREFIX_CONNECTOR_ID
+            # The `source_ref` object returned by POST /files for the input.
+            - name: SOURCE_REF_JSON
               valueFrom:
                 configMapKeyRef:
                   name: k6-load-config
-                  key: connector_id
+                  key: source_ref_json
             - name: EXPECTED_TOTAL_ROWS
               value: "10000000"
             - name: K6_OUT
