@@ -54,6 +54,9 @@ func (l *memLedger) begin(_ context.Context, in beginInput) (beginResult, error)
 		if cur.FirstSentAt.IsZero() {
 			cur.FirstSentAt = snap.Now
 		}
+		if in.Intent.Generation != "" && (in.Intent.Resend || in.Intent.ConfirmNotApplied) {
+			cur.DecisionGeneration = in.Intent.Generation
+		}
 	}
 	return res, nil
 }
@@ -373,6 +376,73 @@ func TestCallEndpointBusyWhileAnotherAttemptSends(t *testing.T) {
 	}
 	if f.hits.Load() != 0 {
 		t.Fatal("nothing may be sent while another attempt holds the lease")
+	}
+}
+
+// Principal review F1: one from-start retry is one generation. Its send is
+// consumed on first delivery; a redelivered activity with the same generation
+// replays the receipt, and only a genuinely new operator decision sends again.
+func TestCallEndpointResendIsConsumedPerGeneration(t *testing.T) {
+	f := newEndpointFixture(t, status(201))
+	if _, err := f.call(f.input("POST")); err != nil {
+		t.Fatal(err)
+	}
+	resend := f.input("POST")
+	resend.Resend = true
+	resend.DecisionGeneration = "retry-run-1"
+	out, err := f.call(resend)
+	if err != nil || out.Replayed || f.hits.Load() != 2 {
+		t.Fatalf("the authorized resend must send once: out=%+v err=%v hits=%d", out, err, f.hits.Load())
+	}
+	// Lost activity acknowledgment: Temporal redelivers the same input.
+	out, err = f.call(resend)
+	if err != nil || !out.Replayed || !out.Succeeded || f.hits.Load() != 2 {
+		t.Fatalf("redelivery of the same generation must replay, not send: out=%+v err=%v hits=%d", out, err, f.hits.Load())
+	}
+	// A new operator decision is a new generation and may send again.
+	resend.DecisionGeneration = "retry-run-2"
+	if _, err := f.call(resend); err != nil || f.hits.Load() != 3 {
+		t.Fatalf("a new generation must send: err=%v hits=%d", err, f.hits.Load())
+	}
+}
+
+func TestCallEndpointConfirmNotAppliedIsConsumedPerGeneration(t *testing.T) {
+	f := newEndpointFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = fmt.Fprint(w, `{"err":"upstream"}`)
+	})
+	// POST without a policy: a 502 is an unknown outcome and the operation
+	// becomes unresolved.
+	if out, err := f.call(f.input("POST")); err != nil || out.Outcome != CallUnresolved {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+	confirm := f.input("POST")
+	confirm.ConfirmNotApplied = true
+	confirm.DecisionGeneration = "retry-run-1"
+	if out, err := f.call(confirm); err != nil || out.Outcome != CallUnresolved || f.hits.Load() != 2 {
+		t.Fatalf("the confirmed retry sends once and is unresolved again on 502: out=%+v err=%v hits=%d", out, err, f.hits.Load())
+	}
+	// Redelivery of the same decision must not treat the new ambiguity as confirmed.
+	out, err := f.call(confirm)
+	if err != nil || out.Outcome != CallUnresolved || f.hits.Load() != 2 {
+		t.Fatalf("a spent confirmation must not authorize another send: out=%+v err=%v hits=%d", out, err, f.hits.Load())
+	}
+	if !strings.Contains(out.Error, "already used") {
+		t.Fatalf("the reason must say the confirmation was spent: %q", out.Error)
+	}
+}
+
+// Principal review F6: a receipt that cannot be saved after the destination
+// accepted the request is an unknown outcome, never an ordinary failure.
+func TestCallEndpointReceiptWriteFailureIsAnUnknownOutcome(t *testing.T) {
+	f := newEndpointFixture(t, status(200))
+	f.ledger.finishErr = errors.New("db down")
+	out, err := f.call(f.input("POST"))
+	if err == nil || out.Succeeded {
+		t.Fatalf("an unrecorded success must fail the activity: out=%+v err=%v", out, err)
+	}
+	if errType(err) != ErrTypeOutcomeUnknown {
+		t.Fatalf("error type %q, want %q so the row is unresolved rather than failed", errType(err), ErrTypeOutcomeUnknown)
 	}
 }
 

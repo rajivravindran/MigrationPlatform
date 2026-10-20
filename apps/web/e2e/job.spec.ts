@@ -29,11 +29,13 @@ test.describe("job lifecycle", () => {
     await page.getByRole("button", { name: /start job/i }).click();
 
     await page.waitForURL(/\/jobs\/\d+/);
-    await expect(page.getByText(/processed/i)).toBeVisible();
+    await expect(page.getByText(/source records/i)).toBeVisible();
 
+    // The chip shows operator wording (Reconciled / Needs attention / Cancelled);
+    // the raw job status is on data-status.
     await expect
       .poll(
-        async () => (await page.getByTestId("job-status").textContent())?.trim().toLowerCase(),
+        async () => (await page.getByTestId("job-status").getAttribute("data-status"))?.trim().toLowerCase(),
         { timeout: 60_000, intervals: [1000, 2000, 5000] }
       )
       .toMatch(/succeeded|failed|cancelled/);

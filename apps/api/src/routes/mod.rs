@@ -9,6 +9,7 @@ pub mod license;
 pub mod llm;
 pub mod metrics;
 pub mod openapi;
+pub mod plans;
 pub mod schedules;
 pub mod secrets;
 pub mod specs;

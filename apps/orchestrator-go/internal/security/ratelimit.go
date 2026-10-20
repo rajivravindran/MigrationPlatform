@@ -11,6 +11,13 @@ import (
 // cannot hammer a target API. Hosts are limited independently; the limiter
 // map is unbounded in theory but in practice holds one entry per distinct
 // destination host, which is small.
+//
+// Scope: this limiter is per process. It is a per-worker tuning knob, not a
+// destination-wide guarantee: N orchestrator replicas permit about N times
+// its rate. The worker divides the configured deployment budget by the
+// declared replica count (config.WorkerRateShare); a coordinated quota at
+// the dispatch seam is required before any destination-wide limit can be
+// claimed (architecture review A6).
 type HostLimiter struct {
 	mu       sync.Mutex
 	limiters map[string]*rate.Limiter

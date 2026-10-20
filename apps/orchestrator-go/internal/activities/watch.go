@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -147,6 +148,9 @@ type StageSftpObjectOutput struct {
 	Key    string `json:"key"`
 	ETag   string `json:"etag"`
 	Size   int64  `json:"size"`
+	// ObjectETag is the staged object's ETag in the object store (the content
+	// version); ETag above is the SFTP fingerprint used by the discovery cursor.
+	ObjectETag string `json:"objectEtag,omitempty"`
 }
 
 // StageSftpObject downloads one remote file into the MinIO staging bucket so
@@ -181,16 +185,19 @@ func (a *Activities) StageSftpObject(ctx context.Context, in StageSftpObjectInpu
 	if size <= 0 {
 		size = n
 	}
-	if err := connectors.PutObject(ctx, cfg.StagingBucket, stagingKey, local, ""); err != nil {
+	stored, err := connectors.PutObject(ctx, cfg.StagingBucket, stagingKey, local, "")
+	if err != nil {
 		return StageSftpObjectOutput{}, fmt.Errorf("stage to object store: %w", err)
 	}
-	// Keep the SFTP fingerprint as etag so cursor diffs stay consistent.
+	// Keep the SFTP fingerprint as etag so cursor diffs stay consistent; the
+	// staged object's own ETag is what the source registry and conditional
+	// reads are bound to (F2/F3).
 	etag := in.ETag
 	if etag == "" {
 		etag = connectors.SftpFingerprint(time.Now().UTC(), size)
 	}
 	return StageSftpObjectOutput{
-		Bucket: cfg.StagingBucket, Key: stagingKey, ETag: etag, Size: size,
+		Bucket: cfg.StagingBucket, Key: stagingKey, ETag: etag, Size: size, ObjectETag: stored.ETag,
 	}, nil
 }
 
@@ -269,9 +276,102 @@ func (a *Activities) TestSFTPConnector(ctx context.Context, orgID, connectorID i
 // ---------------- AdvanceConnectorCursor ----------------
 
 type AdvanceConnectorCursorInput struct {
-	OrgID       int64             `json:"orgId"`
-	ConnectorID int64             `json:"connectorId"`
-	Seen        map[string]string `json:"seen"` // key -> etag
+	OrgID       int64 `json:"orgId"`
+	ConnectorID int64 `json:"connectorId"`
+	// ScheduleID scopes the discovery cursor to the schedule (the execution
+	// intent) that processed these objects. Zero writes the legacy
+	// connector-wide cursor, shared by every schedule on the connector.
+	ScheduleID int64             `json:"scheduleId,omitempty"`
+	Seen       map[string]string `json:"seen"` // key -> etag
+}
+
+// Cursor layout inside connectors.config_json (review A4):
+//
+//	cursor.seen                       legacy, connector-wide: key -> etag
+//	cursor.bySchedule.<scheduleId>.seen per execution intent: key -> etag
+//	cursor.updatedAt
+//
+// SeenObjects merges the legacy connector-wide cursor with the schedule's own
+// cursor. The legacy entries count as seen for every schedule: they were
+// recorded when one cursor served all schedules, and reprocessing them
+// would repeat external effects. Objects discovered after the per-schedule
+// cursors exist are deduplicated per schedule only, so two schedules over
+// the same source each execute once. A later template version within the
+// same schedule does not reprocess source versions that schedule has seen;
+// replaying them is an explicit operator action, not a side effect of a
+// version change.
+func SeenObjects(config map[string]any, scheduleID int64) map[string]string {
+	seen := map[string]string{}
+	cursor, _ := config["cursor"].(map[string]any)
+	if cursor == nil {
+		return seen
+	}
+	copySeen := func(src map[string]any) {
+		for k, v := range src {
+			if s, ok := v.(string); ok {
+				seen[k] = s
+			}
+		}
+	}
+	if legacy, ok := cursor["seen"].(map[string]any); ok {
+		copySeen(legacy)
+	}
+	if scheduleID > 0 {
+		if by, ok := cursor["bySchedule"].(map[string]any); ok {
+			if own, ok := by[strconv.FormatInt(scheduleID, 10)].(map[string]any); ok {
+				if s, ok := own["seen"].(map[string]any); ok {
+					copySeen(s)
+				}
+			}
+		}
+	}
+	return seen
+}
+
+// advanceSeen merges newly seen objects into the cursor map for one intent
+// (the legacy connector-wide map when scheduleID is zero) and bounds its
+// size. It returns the modified cursor.
+func advanceSeen(cursor map[string]any, scheduleID int64, newly map[string]string, now time.Time) map[string]any {
+	if cursor == nil {
+		cursor = map[string]any{}
+	}
+	owner := cursor
+	if scheduleID > 0 {
+		by, _ := cursor["bySchedule"].(map[string]any)
+		if by == nil {
+			by = map[string]any{}
+		}
+		key := strconv.FormatInt(scheduleID, 10)
+		own, _ := by[key].(map[string]any)
+		if own == nil {
+			own = map[string]any{}
+		}
+		by[key] = own
+		cursor["bySchedule"] = by
+		owner = own
+	}
+	seen, _ := owner["seen"].(map[string]any)
+	if seen == nil {
+		seen = map[string]any{}
+	}
+	for k, etag := range newly {
+		seen[k] = etag
+	}
+	const maxCursorEntries = 10_000
+	if len(seen) > maxCursorEntries {
+		keys := make([]string, 0, len(seen))
+		for k := range seen {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys[:len(keys)-maxCursorEntries] {
+			delete(seen, k)
+		}
+	}
+	owner["seen"] = seen
+	owner["updatedAt"] = now.UTC().Format(time.RFC3339)
+	cursor["updatedAt"] = now.UTC().Format(time.RFC3339)
+	return cursor
 }
 
 func (a *Activities) AdvanceConnectorCursor(ctx context.Context, in AdvanceConnectorCursorInput) error {
@@ -300,30 +400,7 @@ func (a *Activities) AdvanceConnectorCursor(ctx context.Context, in AdvanceConne
 		cfg = map[string]any{}
 	}
 	cursor, _ := cfg["cursor"].(map[string]any)
-	if cursor == nil {
-		cursor = map[string]any{}
-	}
-	seen, _ := cursor["seen"].(map[string]any)
-	if seen == nil {
-		seen = map[string]any{}
-	}
-	for k, etag := range in.Seen {
-		seen[k] = etag
-	}
-	const maxCursorEntries = 10_000
-	if len(seen) > maxCursorEntries {
-		keys := make([]string, 0, len(seen))
-		for k := range seen {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys[:len(keys)-maxCursorEntries] {
-			delete(seen, k)
-		}
-	}
-	cursor["seen"] = seen
-	cursor["updatedAt"] = time.Now().UTC().Format(time.RFC3339)
-	cfg["cursor"] = cursor
+	cfg["cursor"] = advanceSeen(cursor, in.ScheduleID, in.Seen, time.Now())
 
 	next, err := json.Marshal(cfg)
 	if err != nil {
@@ -351,6 +428,11 @@ type StartWatchObjectJobInput struct {
 	ETag                string    `json:"etag"`
 	Size                int64     `json:"size"`
 	ScheduledTime       time.Time `json:"scheduledTime"`
+	// ContentETag is the object store's ETag for the object when ETag is a
+	// discovery fingerprint rather than a content version (SFTP staging).
+	// The source registry records the content version so reads can be bound
+	// to it; identity hashing keeps using ETag.
+	ContentETag string `json:"contentEtag,omitempty"`
 }
 
 type StartWatchObjectJobOutput struct {
@@ -360,29 +442,67 @@ type StartWatchObjectJobOutput struct {
 	SourceID   int64  `json:"sourceId"`
 }
 
-// WatchWorkflowID builds a stable Temporal workflow id for a watched object.
+// WatchWorkflowID is the legacy workflow id for a watched object: it names
+// the source version only (organization, bucket, key, ETag). Two schedules
+// over the same object resolved to the same id, so the second was skipped as
+// already started (review A4). Kept for recognising jobs created before the
+// intent-scoped id.
 func WatchWorkflowID(orgID int64, bucket, key, etag string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%s", orgID, bucket, key, etag)))
 	return fmt.Sprintf("watch-%d-%s", orgID, hex.EncodeToString(sum[:16]))
 }
 
+// WatchExecutionWorkflowID names an execution intent: the source version
+// together with the schedule that binds it to a template and destination.
+// Distinct schedules over the same object get distinct ids and each executes
+// once; redelivery of the same schedule still deduplicates. Without a
+// schedule the legacy source-only id is used.
+func WatchExecutionWorkflowID(orgID, scheduleID int64, bucket, key, etag string) string {
+	if scheduleID <= 0 {
+		return WatchWorkflowID(orgID, bucket, key, etag)
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|s%d|%s|%s|%s", orgID, scheduleID, bucket, key, etag)))
+	return fmt.Sprintf("watch-%d-%s", orgID, hex.EncodeToString(sum[:16]))
+}
+
 // StartWatchObjectJob inserts a jobs (+ schedule_runs) row for one discovered
-// object. Idempotent on temporal_workflow_id so redeliveries reuse the same job.
+// object. Idempotent on temporal_workflow_id so redeliveries reuse the same
+// job. A job this schedule already created under the legacy source-only id
+// is reused rather than duplicated.
 func (a *Activities) StartWatchObjectJob(ctx context.Context, in StartWatchObjectJobInput) (StartWatchObjectJobOutput, error) {
 	if err := a.sources.checkOrgLocation(in.OrgID, in.Bucket, in.Key); err != nil {
 		return StartWatchObjectJobOutput{}, err
 	}
 	filename := path.Base(in.Key)
-	workflowID := WatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag)
+	workflowID := WatchExecutionWorkflowID(in.OrgID, in.ScheduleID, in.Bucket, in.Key, in.ETag)
 	tx, err := a.d.DB.Begin(ctx)
 	if err != nil {
 		return StartWatchObjectJobOutput{}, err
 	}
 	defer tx.Rollback(ctx)
 
+	if legacyID := WatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag); legacyID != workflowID {
+		var legacyJobID, legacySourceID int64
+		err := tx.QueryRow(ctx, `
+			SELECT j.id, COALESCE((j.source_ref->>'source_id')::bigint, 0)
+			FROM jobs j
+			WHERE j.temporal_workflow_id = $1 AND j.org_id = $2 AND j.schedule_id = $3`,
+			legacyID, in.OrgID, in.ScheduleID).Scan(&legacyJobID, &legacySourceID)
+		switch {
+		case err == nil:
+			return StartWatchObjectJobOutput{JobID: legacyJobID, WorkflowID: legacyID, Created: false, SourceID: legacySourceID}, nil
+		case !errors.Is(err, pgx.ErrNoRows):
+			return StartWatchObjectJobOutput{}, fmt.Errorf("look up legacy watch job: %w", err)
+		}
+	}
+
+	contentETag := in.ContentETag
+	if contentETag == "" {
+		contentETag = in.ETag
+	}
 	sourceID, err := registerSource(ctx, tx, newSource{
 		OrgID: in.OrgID, Bucket: in.Bucket, Key: in.Key, Filename: filename,
-		ETag: in.ETag, Size: in.Size, Provenance: "watched",
+		ETag: contentETag, Size: in.Size, Provenance: "watched",
 	})
 	if err != nil {
 		return StartWatchObjectJobOutput{}, err
@@ -394,7 +514,7 @@ func (a *Activities) StartWatchObjectJob(ctx context.Context, in StartWatchObjec
 		"key":       in.Key,
 		"filename":  filename,
 		"size":      in.Size,
-		"etag":      in.ETag,
+		"etag":      contentETag,
 	})
 	if err != nil {
 		return StartWatchObjectJobOutput{}, err

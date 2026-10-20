@@ -169,3 +169,25 @@ default refuses to guess for creates.
 - **Store attempts as a JSON array on the operation.** Fewer rows, but every
   attempt would rewrite the whole array, and concurrent attempts could not be
   told apart.
+
+
+## Amendment 2026-10-19 — decision generations (principal review F1, F6)
+
+`Resend` and `ConfirmNotApplied` are operator decisions, not per-attempt
+flags. Each carries a *generation*: the retry workflow's first run id, which
+continue-as-new preserves and every activity redelivery shares. The ledger
+records the generation that last spent a decision on an operation
+(`operations.decision_generation`):
+
+- `succeeded` + `Resend`: sends if the generation differs from the recorded
+  one, replays the receipt if it is the same (a redelivered activity).
+- `unresolved`/`unknown` + `ConfirmNotApplied`: sends if the generation
+  differs; stays unresolved, with a reason naming the spent confirmation, if
+  it is the same — the new ambiguity was created by the send this decision
+  authorized and needs a fresh check of the destination.
+- An empty generation (histories older than this change) keeps the previous
+  unscoped behaviour.
+
+Persistence failures after the request reached the destination (receipt
+write, unknown-outcome write) are typed `OutcomeUnknown`, so an exhausted
+retry budget leaves the row `unresolved`, never `failed`.

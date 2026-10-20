@@ -20,9 +20,16 @@ type Config struct {
 	// Egress hardening. AllowPrivateDestinations must only be true in local
 	// development (compose networks resolve to private IPs).
 	AllowPrivateDestinations bool
-	// Per-destination-host rate limit; <= 0 disables limiting.
-	DestinationRPS   float64
-	DestinationBurst int
+	// Destination rate limit per host. DestinationRPS/DestinationBurst are
+	// the deployment-wide budget as configured; the limiter in each worker
+	// process enforces only its share (budget / DestinationRateWorkers),
+	// because token buckets are per process and the deployment runs several
+	// (architecture review A6). The aggregate stays within budget only while
+	// at most DestinationRateWorkers orchestrator processes run; set it to
+	// the maximum replica count. <= 0 RPS disables limiting.
+	DestinationRPS         float64
+	DestinationBurst       int
+	DestinationRateWorkers int
 	// Cap on stored/parsed response body bytes.
 	MaxResponseBytes int64
 
@@ -69,6 +76,11 @@ func Load() (Config, error) {
 		return cfg, errors.New("DESTINATION_BURST must be a positive integer")
 	}
 	cfg.DestinationBurst = burst
+	workers, err := strconv.Atoi(getenv("DESTINATION_RATE_WORKERS", "1"))
+	if err != nil || workers <= 0 {
+		return cfg, errors.New("DESTINATION_RATE_WORKERS must be a positive integer (the maximum number of orchestrator replicas sharing DESTINATION_RPS)")
+	}
+	cfg.DestinationRateWorkers = workers
 	maxResp, err := strconv.ParseInt(getenv("MAX_RESPONSE_BYTES", "1048576"), 10, 64)
 	if err != nil || maxResp <= 0 {
 		return cfg, errors.New("MAX_RESPONSE_BYTES must be a positive integer")
@@ -96,4 +108,24 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// WorkerRateShare returns the per-process share of the destination budget:
+// the configured RPS and burst divided across DestinationRateWorkers
+// processes. The burst share is at least 1 so a single request can always
+// proceed. RPS <= 0 stays disabled.
+func (c Config) WorkerRateShare() (rps float64, burst int) {
+	workers := c.DestinationRateWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	if c.DestinationRPS <= 0 {
+		return c.DestinationRPS, c.DestinationBurst
+	}
+	rps = c.DestinationRPS / float64(workers)
+	burst = (c.DestinationBurst + workers - 1) / workers
+	if burst < 1 {
+		burst = 1
+	}
+	return rps, burst
 }

@@ -20,6 +20,17 @@ pub struct WorkflowAlreadyRunning(pub String);
 #[error("{0}")]
 pub struct WorkflowNotFound(pub String);
 
+/// Answer of the workflow's `pauseState` query (architecture review A3).
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct PauseState {
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default, rename = "lastCommandId")]
+    pub last_command_id: Option<String>,
+    #[serde(default)]
+    pub acknowledged: bool,
+}
+
 #[derive(Clone)]
 pub struct TemporalClient {
     bridge_url: Option<String>,
@@ -144,6 +155,23 @@ impl TemporalClient {
         )
         .await?;
         Ok(())
+    }
+
+    /// Read the workflow's pause state (architecture review A3).
+    pub async fn query_pause_state(&self, workflow_id: &str) -> Result<PauseState> {
+        let v = self
+            .post(
+                "/v1/workflows/query",
+                &json!({"workflowId": workflow_id, "query": "pauseState"}),
+            )
+            .await?;
+        match v.get("result") {
+            Some(r) if !r.is_null() => Ok(serde_json::from_value(r.clone())?),
+            // Stub mode or an older bridge without the query endpoint: no
+            // confirmation is available; the caller leaves the request
+            // recorded for the reconciler.
+            _ => Err(anyhow::anyhow!("bridge returned no pause state")),
+        }
     }
 
     pub async fn cancel_workflow(&self, workflow_id: &str) -> Result<()> {

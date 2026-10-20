@@ -122,5 +122,42 @@ Full restore runbook (with Temporal resetworkflow guidance) lives in
   custom metric and no HPA on it: one job is one sequential workflow.
 - `DESTINATION_RPS` / activity timeouts bound how long a stalled
   destination holds a worker slot.
+
+### Destination rate limits are per process
+
+The orchestrator's limiter (`internal/security/ratelimit.go`) is an in-memory
+token bucket per destination host **in each worker process**. It is not a
+destination-wide guarantee: N replicas allow about N times the configured
+rate, and one host may serve several separately limited destination accounts.
+
+`DESTINATION_RPS` and `DESTINATION_BURST` are therefore read as the
+deployment-wide budget per host, and each worker enforces
+`DESTINATION_RPS / DESTINATION_RATE_WORKERS` (burst divided likewise, minimum
+1). Set `DESTINATION_RATE_WORKERS` to the **maximum** number of orchestrator
+processes that can run (the HPA `maxReplicas`, 40 in the default chart). With
+fewer replicas the budget is under-used; it is never exceeded unless more
+processes run than declared. The worker logs its share at startup
+(`destination rate budget per host`). Verify the combined outbound rate with
+several workers against a counting fixture before relying on any figure; a
+coordinated quota at the dispatch seam is the planned replacement (R15,
+architecture review A6).
 - `job_rows` hot columns are indexed; cold audit data is pruned after 180d.
 - Set `storage.retention.daysInput=30` and `daysResults=90` in values.yaml.
+
+## Deploying the 19 October 2026 P0 changes
+
+Order matters:
+
+1. Apply migration `0011_integrity_contracts.sql` first. Workers and the API
+   read the new columns (`operations.decision_generation`,
+   `jobs.outcome_revision`, `jobs.control_*`) unconditionally.
+2. Roll the orchestrator workers and the API together. Pause/resume needs the
+   bridge's `/v1/workflows/query` endpoint; on an older bridge the API
+   records the command and returns 409 "recorded but not confirmed" until the
+   reconciler converges it.
+3. Mixed orchestrator versions are safe for batch finalisation (both the
+   counter status and `DeriveFromStages` are sent). Running workflows pick up
+   row-level pause and batch sizing only after their next continue-as-new.
+
+Before rolling the orchestrator *back* past this change, run
+`migration-admin merge-cursors` (ADR 0005).

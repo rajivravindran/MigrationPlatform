@@ -280,9 +280,20 @@ func ValidateRelPath(p string) error {
 
 // IsArchive reports whether key basename looks like a supported batch package.
 func IsArchive(key string) bool {
-	base := strings.ToLower(key)
+	return ArchiveExt(key) != ""
+}
+
+// ArchiveExt returns the supported archive extension of name's basename
+// (".tar.gz", ".tgz" or ".zip"), or "" when it is not a batch package.
+func ArchiveExt(name string) string {
+	base := strings.ToLower(name)
 	if i := strings.LastIndex(base, "/"); i >= 0 {
 		base = base[i+1:]
 	}
-	return strings.HasSuffix(base, ".tar.gz") || strings.HasSuffix(base, ".tgz") || strings.HasSuffix(base, ".zip")
+	for _, ext := range []string{".tar.gz", ".tgz", ".zip"} {
+		if strings.HasSuffix(base, ext) {
+			return ext
+		}
+	}
+	return ""
 }

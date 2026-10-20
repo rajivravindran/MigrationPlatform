@@ -1,109 +1,144 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import { clsx } from "clsx";
+import { Search, Upload } from "lucide-react";
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-import { Button, EmptyState, ErrorState, LoadingState, PageHeader, Select, StatusBadge, formatDateTime } from "@/components/ui";
+import { Chip, Panel, PanelHeader, relativeTime } from "@/components/ops";
+import { Button, ErrorState, LoadingState } from "@/components/ui";
 import { apiFetch } from "@/lib/api";
-import { sourceListLabel, type JobSource } from "@/lib/job-source";
+import { migrationIdentity, outcomeLabel, searchText, templateNameIndex } from "@/lib/identity";
+import type { JobSource } from "@/lib/job-source";
 
 type Job = {
   id: number;
   rule_template_id: number;
+  rule_template_version?: number | null;
   status: "pending" | "running" | "paused" | "succeeded" | "failed" | "cancelled";
-  totals_json: { processed?: number; failed?: number; total?: number };
+  totals_json: { processed?: number; failed?: number; unresolved?: number; total?: number };
   started_at?: string;
   finished_at?: string;
+  updated_at?: string;
   batch_id?: number | null;
   source?: JobSource;
+  source_ref?: JobSource;
+  last_error?: string | null;
 };
+type Template = { id: number; name: string };
+
+const FILTERS = [
+  ["all", "All"],
+  ["running", "Running"],
+  ["failed", "Needs attention"],
+  ["paused", "Paused"],
+  ["succeeded", "Reconciled"],
+  ["cancelled", "Cancelled"]
+] as const;
+type Filter = (typeof FILTERS)[number][0];
 
 export default function JobsPage() {
-  const [status, setStatus] = useState("all");
+  const [status, setStatus] = useState<Filter>("all");
+  const [q, setQ] = useState("");
   useEffect(() => {
-    setStatus(new URLSearchParams(window.location.search).get("status") ?? "all");
+    const s = new URLSearchParams(window.location.search).get("status") as Filter | null;
+    if (s && FILTERS.some(([f]) => f === s)) setStatus(s);
   }, []);
-  const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ["jobs"],
-    queryFn: () => apiFetch<{ items: Job[] }>("/jobs"),
-    refetchInterval: 5000
-  });
-  const items = (data?.items ?? []).filter((job) => status === "all" || job.status === status);
+  const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => apiFetch<{ items: Job[] }>("/jobs?limit=200"), refetchInterval: 5000 });
+  const templates = useQuery({ queryKey: ["templates"], queryFn: () => apiFetch<{ items: Template[] }>("/rule-templates"), staleTime: 60_000 });
+  const names = useMemo(() => templateNameIndex(templates.data?.items), [templates.data]);
+
+  const rows = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    return (jobs.data?.items ?? [])
+      .map((job) => ({ job, id: migrationIdentity(job, names), outcome: outcomeLabel(job.status, job.totals_json) }))
+      .filter((r) => {
+        if (status === "running") return ["pending", "running"].includes(r.job.status);
+        if (status !== "all" && r.job.status !== status) return false;
+        return !needle || searchText(r.id).includes(needle);
+      });
+  }, [jobs.data, names, status, q]);
+
+  if (jobs.isLoading) return <LoadingState label="Loading migrations" />;
+  if (jobs.error) return <ErrorState error={jobs.error} retry={() => jobs.refetch()} />;
 
   return (
-    <div className="space-y-6">
-      <PageHeader title="Jobs" description="Monitor migration runs, inspect row-level failures, and retry recoverable work." actions={<Link href="/jobs/new"><Button>Start a job</Button></Link>} />
-      {isLoading ? <LoadingState label="Loading jobs" /> : null}
-      {error ? <ErrorState error={error} retry={() => refetch()} /> : null}
-      {data && data.items?.length === 0 ? (
-        <EmptyState
-          title="No jobs yet"
-          hint="Upload a source file and start a migration against a published template."
-          action={<Link href="/jobs/new"><Button>Start a job</Button></Link>}
-        />
-      ) : null}
-      {data?.items.length ? (
-        <>
-        <div className="flex items-center justify-between gap-3">
-          <div className="text-sm text-slate-500">{items.length} of {data.items.length} jobs</div>
-          <label className="flex items-center gap-2 text-sm text-slate-600">Status
-            <Select className="!min-h-9 w-44" value={status} onChange={(event) => setStatus(event.target.value)}>
-              <option value="all">All statuses</option><option value="running">Running</option><option value="paused">Paused</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option>
-            </Select>
-          </label>
+    <div className="space-y-5">
+      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
+        <div>
+          <h1 className="text-[28px] leading-tight text-slate-950">Migrations</h1>
+          <p className="mt-1 text-[15px] text-slate-500">Every file-level execution, newest first. Open one to inspect records, retry and reconcile.</p>
         </div>
-      <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
-        <table className="min-w-[1100px] w-full text-sm">
-          <caption className="sr-only">Migration jobs</caption>
-          <thead className="bg-slate-50 text-slate-600">
-            <tr>
-              <th className="px-3 py-2 text-left">Job</th>
-              <th className="px-3 py-2 text-left">Source</th>
-              <th className="px-3 py-2 text-left">Template</th>
-              <th className="px-3 py-2 text-left">Status</th>
-              <th className="px-3 py-2 text-left">Progress</th>
-              <th className="px-3 py-2 text-right">Processed</th>
-              <th className="px-3 py-2 text-right">Failed</th>
-              <th className="px-3 py-2 text-left">Started</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((j) => {
-              const processed = j.totals_json?.processed ?? 0;
-              const failed = j.totals_json?.failed ?? 0;
-              const total = j.totals_json?.total;
-              const pct = total ? Math.min(100, Math.round(((processed + failed) / total) * 100)) : 0;
-              return (
-              <tr key={j.id} className="border-t border-slate-100 hover:bg-slate-50">
-                <td className="px-3 py-2">
-                  <Link className="text-brand-700 hover:underline" href={`/jobs/${j.id}`}>#{j.id}</Link>
-                  {j.batch_id ? (
-                    <>
-                      {" "}
-                      <Link className="text-xs text-slate-500 hover:underline" href={`/batches/${j.batch_id}`}>
-                        Batch #{j.batch_id}
-                      </Link>
-                    </>
-                  ) : null}
-                </td>
-                <td className="max-w-[280px] truncate px-3 py-2 text-slate-600" title={sourceListLabel(j)}>
-                  {sourceListLabel(j)}
-                </td>
-                <td className="px-3 py-2">#{j.rule_template_id}</td>
-                <td className="px-3 py-2"><StatusBadge status={j.status} /></td>
-                <td className="w-44 px-3 py-2"><div className="flex items-center gap-2"><div className="h-1.5 flex-1 rounded bg-slate-200"><div className={`h-1.5 rounded ${failed ? "bg-rose-500" : "bg-brand-600"}`} style={{ width: `${pct}%` }} /></div><span className="w-9 text-right text-xs tabular-nums text-slate-500">{total ? `${pct}%` : "—"}</span></div></td>
-                <td className="px-3 py-2 text-right tabular-nums">{processed}</td>
-                <td className={`px-3 py-2 text-right tabular-nums ${failed ? "font-medium text-rose-700" : ""}`}>{failed}</td>
-                <td className="px-3 py-2 text-slate-500">{formatDateTime(j.started_at)}</td>
-              </tr>
-            )})}
-          </tbody>
-        </table>
+        <Link href="/jobs/new">
+          <Button>
+            <Upload className="h-4 w-4" /> Start a migration
+          </Button>
+        </Link>
       </div>
-      {items.length === 0 ? <EmptyState title="No jobs match this filter" hint="Choose another status to see jobs." /> : null}
-      </>
-      ) : null}
+
+      <Panel>
+        <PanelHeader>
+          <div className="flex flex-wrap gap-1" role="group" aria-label="Filter by outcome">
+            {FILTERS.map(([f, label]) => (
+              <button
+                key={f}
+                type="button"
+                aria-pressed={status === f}
+                onClick={() => setStatus(f)}
+                className={clsx("rounded-md px-2.5 py-1 text-sm", status === f ? "bg-slate-100 text-slate-950 ring-1 ring-slate-300" : "text-slate-500 hover:text-slate-800")}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <label className="ml-auto flex min-w-[240px] items-center gap-2 rounded-md bg-slate-50 px-2.5 py-1.5 text-sm ring-1 ring-slate-300 focus-within:ring-brand-400">
+            <Search className="h-4 w-4 text-slate-500" aria-hidden />
+            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Name, archive, file or execution id" className="w-full bg-transparent text-slate-900 placeholder:text-slate-500 focus:outline-none" aria-label="Search migrations" />
+          </label>
+        </PanelHeader>
+        {rows.length === 0 ? (
+          <div className="px-5 py-10 text-center text-sm text-slate-500">
+            {jobs.data?.items.length ? "No migration matches." : "No migrations yet. Start one from a published template or upload a package."}
+          </div>
+        ) : (
+          <ul className="divide-y divide-slate-200">
+            {rows.map(({ job, id, outcome }) => {
+              const t = job.totals_json ?? {};
+              const done = (t.processed ?? 0) + (t.failed ?? 0) + (t.unresolved ?? 0);
+              const total = t.total ?? done;
+              return (
+                <li key={job.id}>
+                  <Link href={`/jobs/${job.id}`} className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 px-5 py-3.5 hover:bg-slate-50 sm:grid-cols-[minmax(0,1fr)_140px_150px_110px]">
+                    <div className="min-w-0">
+                      <div className="truncate text-[15px] text-slate-950">
+                        {id.purpose}
+                        {id.purposeIsFallback ? <span className="ml-2 text-xs text-slate-500">name not recorded</span> : null}
+                      </div>
+                      <div className="mt-0.5 truncate text-[13px] text-slate-500">
+                        {id.packageName ? <>{id.packageName} › </> : null}
+                        {id.fileName ?? "source not recorded"}
+                        <span className="text-slate-400"> · Execution {id.executionId}</span>
+                        {id.templateVersion ? <span className="text-slate-400"> · v{id.templateVersion}</span> : null}
+                      </div>
+                    </div>
+                    <div className="row-start-1 sm:row-auto">
+                      <Chip tone={outcome.tone}>{outcome.label}</Chip>
+                    </div>
+                    <div className="tnum self-center text-[13px] text-slate-600">
+                      <span className="text-slate-950">{(t.processed ?? 0).toLocaleString()}</span> ok
+                      {t.failed ? <span className="text-rose-700"> · {t.failed} failed</span> : null}
+                      {t.unresolved ? <span className="text-amber-700"> · {t.unresolved} unresolved</span> : null}
+                      {total ? <span className="text-slate-500"> / {total.toLocaleString()}</span> : null}
+                    </div>
+                    <div className="self-center text-[13px] text-slate-500">{relativeTime(job.updated_at ?? job.finished_at ?? job.started_at)}</div>
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </Panel>
     </div>
   );
 }

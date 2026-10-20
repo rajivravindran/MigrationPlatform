@@ -1,6 +1,8 @@
 //! Route-level test harness: the real router, real Postgres
-//! (testcontainers), and wiremock standing in for S3 and the orchestrator's
-//! Temporal bridge so dispatched workflow input can be asserted.
+//! (testcontainers, or a server named by TEST_DATABASE_URL — each test gets
+//! its own database there), and wiremock standing in for S3 and the
+//! orchestrator's Temporal bridge so dispatched workflow input can be
+//! asserted.
 #![allow(dead_code)]
 
 use axum::body::Body;
@@ -29,7 +31,7 @@ pub struct Org {
 }
 
 pub struct Harness {
-    _pg: testcontainers::ContainerAsync<PgImage>,
+    _pg: Option<testcontainers::ContainerAsync<PgImage>>,
     pub db: PgPool,
     pub router: axum::Router,
     pub mocks: MockServer,
@@ -92,7 +94,32 @@ pub async fn seed_org(db: &PgPool, jwt: &JwtKeys, name: &str) -> Org {
     }
 }
 
-pub async fn setup() -> Harness {
+/// Connect to a fresh database: a testcontainers Postgres, or, when
+/// TEST_DATABASE_URL names a running server, a new database created there so
+/// tests stay isolated without Docker.
+async fn fresh_database() -> (Option<testcontainers::ContainerAsync<PgImage>>, PgPool) {
+    if let Ok(base) = std::env::var("TEST_DATABASE_URL") {
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&base)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        let name = format!("mp_test_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .expect("create test database");
+        let url = match base.rfind('/') {
+            Some(i) if !base[i + 1..].contains('@') => format!("{}/{name}", &base[..i]),
+            _ => format!("{base}/{name}"),
+        };
+        let db = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .expect("connect test database");
+        return (None, db);
+    }
     let pg = PgImage::default().start().await.expect("start postgres");
     let port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db = PgPoolOptions::new()
@@ -102,6 +129,11 @@ pub async fn setup() -> Harness {
         ))
         .await
         .expect("connect pg");
+    (Some(pg), db)
+}
+
+pub async fn setup() -> Harness {
+    let (pg, db) = fresh_database().await;
     sqlx::migrate!("./migrations")
         .run(&db)
         .await

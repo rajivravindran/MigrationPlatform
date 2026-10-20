@@ -60,6 +60,11 @@ type opSnapshot struct {
 	ReceiptStatus int
 	Receipt       json.RawMessage
 	Now           time.Time
+	// DecisionGeneration is the logical operator decision (a from-start
+	// retry or a confirm-not-applied) that last authorized a send on this
+	// operation. Empty for operations never authorized that way, and for
+	// rows written before generations existed.
+	DecisionGeneration string
 }
 
 type attemptIntent struct {
@@ -70,6 +75,19 @@ type attemptIntent struct {
 	// from-start retry). ConfirmNotApplied lets an unresolved one be sent.
 	Resend            bool
 	ConfirmNotApplied bool
+	// Generation identifies the operator decision that carries Resend or
+	// ConfirmNotApplied: one retry request is one generation, however many
+	// times Temporal redelivers its activities. The permission is consumed
+	// the first time a generation sends; a redelivery of the same generation
+	// replays the receipt (or stays unresolved) instead of sending again
+	// (principal review F1). Empty means an unscoped legacy decision.
+	Generation string
+}
+
+// decisionConsumed reports whether the operator decision in the intent was
+// already spent on this operation by the same generation.
+func decisionConsumed(s opSnapshot, in attemptIntent) bool {
+	return in.Generation != "" && s.DecisionGeneration == in.Generation
 }
 
 type decisionKind int
@@ -103,20 +121,28 @@ func decideAttempt(s opSnapshot, in attemptIntent) attemptDecision {
 	case opSending:
 		return attemptDecision{Kind: decideBusy, Reason: "another attempt is sending this operation"}
 	case opSucceeded:
-		if in.Resend {
+		if in.Resend && !decisionConsumed(s, in) {
 			return attemptDecision{Kind: decideSend}
 		}
 		if samePayload {
+			// A redelivered from-start retry lands here once its generation
+			// has sent: the effect exists, replay its receipt.
 			return attemptDecision{Kind: decideReplay}
 		}
 		return attemptDecision{Kind: decideUnresolved, Reason: "payload changed after the operation succeeded; the new payload is a new intent"}
 	case opUnresolved:
 		if in.ConfirmNotApplied {
+			if decisionConsumed(s, in) {
+				return attemptDecision{Kind: decideUnresolved, Reason: "the confirm-not-applied decision was already used by this retry and the send it authorized has an unknown outcome; check the destination again"}
+			}
 			return attemptDecision{Kind: decideSend}
 		}
 		return attemptDecision{Kind: decideUnresolved, Reason: "operation is unresolved; retry with confirm_not_applied once the destination shows no effect"}
 	case opUnknown:
 		if in.ConfirmNotApplied {
+			if decisionConsumed(s, in) {
+				return attemptDecision{Kind: decideUnresolved, Reason: "the confirm-not-applied decision was already used by this retry and the send it authorized has an unknown outcome; check the destination again"}
+			}
 			return attemptDecision{Kind: decideSend}
 		}
 		if !samePayload {
@@ -189,22 +215,25 @@ func (l pgOperationLedger) begin(ctx context.Context, in beginInput) (beginResul
 			return err
 		}
 		var (
-			s                     opSnapshot
-			leaseAttempt          *string
-			leaseUntil, firstSent *time.Time
-			receiptStatus         *int
+			s                      opSnapshot
+			leaseAttempt, decision *string
+			leaseUntil, firstSent  *time.Time
+			receiptStatus          *int
 		)
 		if err := tx.QueryRow(ctx, `
             SELECT state, payload_sha256, attempts, lease_attempt, lease_until, first_sent_at,
-                   receipt_status, receipt_json, now(), attempts > 0 OR state <> 'pending'
+                   receipt_status, receipt_json, now(), attempts > 0 OR state <> 'pending', decision_generation
             FROM operations WHERE job_id = $1 AND row_index = $2 AND step_index = $3
             FOR UPDATE`, op.JobID, op.RowIndex, op.StepIndex).Scan(
 			&s.State, &s.PayloadSHA256, &s.Attempts, &leaseAttempt, &leaseUntil, &firstSent,
-			&receiptStatus, &s.Receipt, &s.Now, &s.Exists); err != nil {
+			&receiptStatus, &s.Receipt, &s.Now, &s.Exists, &decision); err != nil {
 			return err
 		}
 		if leaseAttempt != nil {
 			s.LeaseAttempt = *leaseAttempt
+		}
+		if decision != nil {
+			s.DecisionGeneration = *decision
 		}
 		if leaseUntil != nil {
 			s.LeaseUntil = *leaseUntil
@@ -242,14 +271,22 @@ func (l pgOperationLedger) begin(ctx context.Context, in beginInput) (beginResul
 				op.JobID, in.AttemptID, op.RowIndex, op.StepIndex, s.Attempts, res.Decision.Reason)
 			return err
 		}
+		// A send authorized by an operator decision records the generation
+		// that spent it, so redelivery of that generation cannot spend it again.
+		var spent *string
+		if in.Intent.Generation != "" && (in.Intent.Resend || in.Intent.ConfirmNotApplied) {
+			g := in.Intent.Generation
+			spent = &g
+		}
 		if _, err := tx.Exec(ctx, `
             UPDATE operations SET state = 'sending', attempts = attempts + 1,
                    operation_key = $4, payload_sha256 = $5,
                    lease_attempt = $6, lease_until = now() + $7::interval,
-                   first_sent_at = COALESCE(first_sent_at, now()), updated_at = now()
+                   first_sent_at = COALESCE(first_sent_at, now()), updated_at = now(),
+                   decision_generation = COALESCE($8, decision_generation)
             WHERE job_id = $1 AND row_index = $2 AND step_index = $3`,
 			op.JobID, op.RowIndex, op.StepIndex, in.OperationKey, in.Intent.PayloadSHA256,
-			in.AttemptID, fmt.Sprintf("%d seconds", int(operationLease.Seconds()))); err != nil {
+			in.AttemptID, fmt.Sprintf("%d seconds", int(operationLease.Seconds())), spent); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `

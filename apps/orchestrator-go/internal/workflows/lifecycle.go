@@ -80,32 +80,54 @@ func exportActivityOptions() workflow.ActivityOptions {
 // returned (the workflow fails and the reconciler repairs the job); an
 // export failure is recorded on the job and does not change its outcome.
 // runErr is returned unchanged when finalizing succeeds.
-func finishJob(ctx workflow.Context, jobID int64, runErr error) error {
+//
+// The returned verdict is the one FinalizeJob persisted (status, reason,
+// totals). It is nil when the outcome was not recorded by this run: the
+// legacy pre-"finalize-on-exit" history path, a FinalizeJob failure, or a
+// FinalizeJob worker built before the activity returned a verdict. Callers
+// surface it in their result so parents consume the persisted decision
+// instead of reconstructing one from counters (ADR 0004, review A1).
+func finishJob(ctx workflow.Context, jobID int64, runErr error) (*activities.FinalizeJobOutput, error) {
 	if workflow.GetVersion(ctx, finalizeOnExitChange, workflow.DefaultVersion, finalizeOnExitVersion) == workflow.DefaultVersion {
 		if runErr == nil {
 			legacyFinalizeAndExport(ctx, jobID)
 		}
-		return runErr
+		return nil, runErr
 	}
 
 	dctx, cancel := workflow.NewDisconnectedContext(ctx)
 	defer cancel()
 	outcome := jobOutcome(ctx, jobID, runErr)
 	fctx := workflow.WithActivityOptions(dctx, finishActivityOptions())
-	if err := workflow.ExecuteActivity(fctx, "FinalizeJob", outcome).Get(fctx, nil); err != nil {
+	var verdict *activities.FinalizeJobOutput
+	if err := workflow.ExecuteActivity(fctx, "FinalizeJob", outcome).Get(fctx, &verdict); err != nil {
 		workflow.GetLogger(ctx).Error("FinalizeJob failed; the reconciler will repair the job", "jobId", jobID, "err", err)
 		if runErr != nil {
-			return fmt.Errorf("%w (and finalize job failed: %v)", runErr, err)
+			return nil, fmt.Errorf("%w (and finalize job failed: %v)", runErr, err)
 		}
-		return fmt.Errorf("finalize job: %w", err)
+		return nil, fmt.Errorf("finalize job: %w", err)
+	}
+	if verdict != nil && verdict.Status == "" {
+		// An older FinalizeJob worker returned nothing: no persisted verdict
+		// is known to this run.
+		verdict = nil
 	}
 	if err := exportResults(dctx, jobID); err != nil {
 		if runErr != nil {
-			return runErr
+			return verdict, runErr
 		}
-		return err
+		return verdict, err
 	}
-	return runErr
+	return verdict, runErr
+}
+
+// applyVerdict copies the persisted verdict onto the workflow result.
+func applyVerdict(result *MigrationWorkflowResult, verdict *activities.FinalizeJobOutput) {
+	if result == nil || verdict == nil {
+		return
+	}
+	result.Status = verdict.Status
+	result.Reason = verdict.Reason
 }
 
 // exportResults uploads the results files and records a failure on the job

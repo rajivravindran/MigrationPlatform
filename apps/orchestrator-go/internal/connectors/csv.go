@@ -129,7 +129,7 @@ func openSource(ctx context.Context, c Config) (io.ReadCloser, error) {
 	cfg := c.Config
 	if bucket, ok := cfg["s3_bucket"].(string); ok && bucket != "" {
 		if key, ok := cfg["s3_key"].(string); ok && key != "" {
-			return openObjectStore(ctx, bucket, key)
+			return openObjectStore(ctx, bucket, key, c.Version)
 		}
 	}
 	if url, ok := cfg["url"].(string); ok && strings.HasPrefix(url, "http") {

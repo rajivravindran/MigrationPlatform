@@ -15,6 +15,7 @@ import (
 
 	"github.com/migration-platform/orchestrator/internal/activities"
 	"github.com/migration-platform/orchestrator/internal/connectors"
+	"github.com/migration-platform/orchestrator/internal/lifecycle"
 	"github.com/migration-platform/orchestrator/internal/template"
 )
 
@@ -28,15 +29,42 @@ type jobFinish struct {
 
 	finalizeErr error
 	exportErr   error
+	// verdict decides what the FinalizeJob stub reports as persisted. nil
+	// uses stubVerdict, which stands in for a job whose rows all succeeded.
+	verdict func(activities.FinalizeJobInput) *activities.FinalizeJobOutput
+}
+
+// stubVerdict mirrors lifecycle.TerminalStatus for a job with rows that all
+// succeeded: the outcome decides, otherwise the job succeeded.
+func stubVerdict(in activities.FinalizeJobInput) *activities.FinalizeJobOutput {
+	t := lifecycle.Totals{Processed: 1, Total: 1}
+	o := lifecycle.Outcome{Cancelled: in.Cancelled, Error: in.Error}
+	st := lifecycle.TerminalStatus(t, o)
+	return &activities.FinalizeJobOutput{Status: st, Reason: lifecycle.Explain(st, t, o, ""), Totals: t}
+}
+
+// emptyJobVerdict is what lifecycle.Finalize persists for a job that read no
+// source rows: failed, whatever the counters say.
+func emptyJobVerdict(in activities.FinalizeJobInput) *activities.FinalizeJobOutput {
+	var t lifecycle.Totals
+	o := lifecycle.Outcome{Cancelled: in.Cancelled, Error: in.Error}
+	st := lifecycle.TerminalStatus(t, o)
+	return &activities.FinalizeJobOutput{Status: st, Reason: lifecycle.Explain(st, t, o, ""), Totals: t}
 }
 
 func registerJobFinish(env *testsuite.TestWorkflowEnvironment) *jobFinish {
 	f := &jobFinish{}
-	env.RegisterActivityWithOptions(func(_ context.Context, in activities.FinalizeJobInput) error {
+	env.RegisterActivityWithOptions(func(_ context.Context, in activities.FinalizeJobInput) (*activities.FinalizeJobOutput, error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.finalized = append(f.finalized, in)
-		return f.finalizeErr
+		if f.finalizeErr != nil {
+			return nil, f.finalizeErr
+		}
+		if f.verdict != nil {
+			return f.verdict(in), nil
+		}
+		return stubVerdict(in), nil
 	}, activities.RegisterOptions("FinalizeJob"))
 	env.RegisterActivityWithOptions(func(_ context.Context, _ activities.ExportJobResultsInput) error {
 		f.mu.Lock()

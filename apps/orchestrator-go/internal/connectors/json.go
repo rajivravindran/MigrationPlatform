@@ -1,10 +1,12 @@
 package connectors
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"unicode"
 )
 
 type jsonBuilder struct{ cfg Config }
@@ -18,16 +20,28 @@ func (b *jsonBuilder) Open(ctx context.Context, offset Offset) (RowIterator, err
 	if err != nil {
 		return nil, err
 	}
-	dec := json.NewDecoder(src)
-	// Expect a top-level array; skip the opening bracket.
-	tok, err := dec.Token()
+	// Two layouts: a top-level array of records, or JSON Lines / NDJSON
+	// (one record object after another). The first non-space byte decides.
+	br := bufio.NewReader(src)
+	first, err := firstNonSpace(br)
 	if err != nil {
 		_ = src.Close()
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("json source is empty")
+		}
 		return nil, err
 	}
-	if d, ok := tok.(json.Delim); !ok || d != '[' {
+	dec := json.NewDecoder(br)
+	switch first {
+	case '[':
+		if _, err := dec.Token(); err != nil {
+			_ = src.Close()
+			return nil, err
+		}
+	case '{':
+	default:
 		_ = src.Close()
-		return nil, errors.New("json source must be a top-level array")
+		return nil, errors.New("json source must be a top-level array of records or JSON Lines (one object per line)")
 	}
 	it := &jsonIter{closer: src, dec: dec}
 	for i := int64(0); i < offset.Items; i++ {
@@ -69,3 +83,23 @@ func (it *jsonIter) Next(ctx context.Context) (Row, Offset, bool, error) {
 }
 
 func (it *jsonIter) Close() error { return it.closer.Close() }
+
+// firstNonSpace returns the first non-whitespace byte without consuming it,
+// skipping a leading UTF-8 byte-order mark.
+func firstNonSpace(br *bufio.Reader) (byte, error) {
+	if bom, err := br.Peek(3); err == nil && bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
+		_, _ = br.Discard(3)
+	}
+	for {
+		b, err := br.Peek(1)
+		if err != nil {
+			return 0, err
+		}
+		if !unicode.IsSpace(rune(b[0])) {
+			return b[0], nil
+		}
+		if _, err := br.ReadByte(); err != nil {
+			return 0, err
+		}
+	}
+}

@@ -10,7 +10,7 @@ test("user can sign in and see the templates page", async ({ page }) => {
   await page.getByRole("button", { name: /sign in/i }).click();
 
   await page.waitForURL((url) => !url.pathname.startsWith("/login"));
-  await expect(page.getByText(EMAIL)).toBeVisible();
+  await expect(page.getByText(EMAIL.split("@")[0], { exact: true })).toBeVisible();
   await page.goto("/templates");
   await expect(page.getByRole("heading", { name: /templates/i })).toBeVisible();
 });

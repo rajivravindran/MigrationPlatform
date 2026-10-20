@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 
+	"go.temporal.io/sdk/temporal"
+
 	"github.com/migration-platform/orchestrator/internal/connectors"
 	"github.com/migration-platform/orchestrator/internal/export"
 	"github.com/migration-platform/orchestrator/internal/template"
@@ -18,20 +20,31 @@ type ExportJobResultsInput struct {
 	JobID int64 `json:"jobId"`
 }
 
-// ExportJobResults streams job_rows into CSV objects on MinIO and stores
-// results_ref on the job. Safe to retry: objects are overwritten.
+// ErrTypeExportStale is returned when row outcomes changed while an export
+// was being written: the files describe an older revision and are not
+// published (principal review F5). Non-retryable; a new export reads the
+// current revision.
+const ErrTypeExportStale = "ExportStale"
+
+// ExportJobResults streams job_rows into CSV objects on MinIO and publishes
+// results_ref on the job. Every export is fenced by the job's outcome
+// revision (bumped by every job_rows write, see migration 0011): the files
+// are written under a revision-specific prefix and results_ref is replaced
+// only if the revision is still current and not older than the one already
+// published. Two exports racing a row retry can therefore never leave stale
+// evidence labelled as current, whichever finishes last.
 func (a *Activities) ExportJobResults(ctx context.Context, in ExportJobResultsInput) error {
 	bucket := os.Getenv("MINIO_BUCKET")
 	if bucket == "" {
 		bucket = "migration"
 	}
 
-	var orgID, tplID int64
+	var orgID, tplID, revision int64
 	var tplVer int32
 	if err := a.d.DB.QueryRow(ctx,
-		`SELECT org_id, rule_template_id, rule_template_version FROM jobs WHERE id = $1`,
+		`SELECT org_id, rule_template_id, rule_template_version, outcome_revision FROM jobs WHERE id = $1`,
 		in.JobID,
-	).Scan(&orgID, &tplID, &tplVer); err != nil {
+	).Scan(&orgID, &tplID, &tplVer, &revision); err != nil {
 		return fmt.Errorf("load job for export: %w", err)
 	}
 
@@ -42,8 +55,8 @@ func (a *Activities) ExportJobResults(ctx context.Context, in ExportJobResultsIn
 		cols = tplOut.Template.Export.Columns
 	}
 
-	allKey := fmt.Sprintf("jobs/%d/results.csv", in.JobID)
-	failedKey := fmt.Sprintf("jobs/%d/results-failed.csv", in.JobID)
+	allKey := fmt.Sprintf("jobs/%d/exports/%d/results.csv", in.JobID, revision)
+	failedKey := fmt.Sprintf("jobs/%d/exports/%d/results-failed.csv", in.JobID, revision)
 
 	allCount, err := a.writeResultsCSV(ctx, in.JobID, cols, allKey, bucket, false)
 	if err != nil {
@@ -61,14 +74,26 @@ func (a *Activities) ExportJobResults(ctx context.Context, in ExportJobResultsIn
 		"failed_key":  failedKey,
 		"rows":        allCount,
 		"failed_rows": failedCount,
+		"revision":    revision,
 	})
 	if err != nil {
 		return err
 	}
-	_, err = a.d.DB.Exec(ctx, `
+	tag, err := a.d.DB.Exec(ctx, `
 		UPDATE jobs SET results_ref = $1, export_status = 'succeeded', export_error = NULL, updated_at = now()
-		WHERE id = $2`, ref, in.JobID)
-	return err
+		WHERE id = $2
+		  AND outcome_revision = $3
+		  AND COALESCE((results_ref->>'revision')::bigint, -1) <= $3`, ref, in.JobID, revision)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		var current int64
+		_ = a.d.DB.QueryRow(ctx, `SELECT outcome_revision FROM jobs WHERE id = $1`, in.JobID).Scan(&current)
+		msg := fmt.Sprintf("row outcomes changed while exporting (revision %d, now %d); the files were not published, export again", revision, current)
+		return temporal.NewNonRetryableApplicationError(msg, ErrTypeExportStale, nil)
+	}
+	return nil
 }
 
 // RecordExportStarted marks the export in progress. The export workflow owns
@@ -140,7 +165,7 @@ func (a *Activities) writeResultsCSV(ctx context.Context, jobID int64, cols []te
 		return 0, err
 	}
 
-	if err := connectors.PutObject(ctx, bucket, key, tmpPath, "text/csv"); err != nil {
+	if _, err := connectors.PutObject(ctx, bucket, key, tmpPath, "text/csv"); err != nil {
 		return 0, fmt.Errorf("put results %s: %w", key, err)
 	}
 	return written, nil

@@ -52,6 +52,10 @@ type CallEndpointInput struct {
 	// retry); ConfirmNotApplied lets an unresolved operation be sent.
 	Resend            bool `json:"resend,omitempty"`
 	ConfirmNotApplied bool `json:"confirmNotApplied,omitempty"`
+	// DecisionGeneration scopes Resend/ConfirmNotApplied to one operator
+	// decision (the retry workflow's first run id): consumed on the first
+	// send, replayed on redelivery (principal review F1).
+	DecisionGeneration string `json:"decisionGeneration,omitempty"`
 }
 
 // DestinationAuth references an organization secret; it never holds one.
@@ -115,7 +119,7 @@ func (a *Activities) CallEndpoint(ctx context.Context, in CallEndpointInput) (Ca
 		Op: op, AttemptID: attemptID, OperationKey: in.IdempotencyKey,
 		Intent: attemptIntent{
 			PayloadSHA256: payloadDigest(in.Payload, in.HasBody), Mode: mode, RetentionHours: retention,
-			Resend: in.Resend, ConfirmNotApplied: in.ConfirmNotApplied,
+			Resend: in.Resend, ConfirmNotApplied: in.ConfirmNotApplied, Generation: in.DecisionGeneration,
 		},
 	})
 	if err != nil {
@@ -170,7 +174,10 @@ func (a *Activities) CallEndpoint(ctx context.Context, in CallEndpointInput) (Ca
 			// The effect exists but its receipt is not recorded. Failing the
 			// activity stops dependent steps; the next attempt finds the
 			// operation in flight and resolves it under the delivery policy.
-			return CallEndpointOutput{Error: "record receipt: " + err.Error()}, fmt.Errorf("record receipt: %w", err)
+			// The error is typed as an unknown outcome so an exhausted retry
+			// budget records the row as unresolved, never as failed (F6).
+			return CallEndpointOutput{Status: res.status, Body: res.body, Error: "record receipt: " + err.Error()},
+				effectMayExistError("record receipt: "+err.Error(), err)
 		}
 		return out, nil
 	case res.err == nil && res.status >= 400 && res.status < 500 && res.status != http.StatusRequestTimeout:
@@ -186,15 +193,25 @@ func (a *Activities) CallEndpoint(ctx context.Context, in CallEndpointInput) (Ca
 	if mode == template.DeliveryManual {
 		msg := out.Error + "; the destination has no deduplication or lookup policy, so it is not re-sent"
 		if err := finish(finishInput{Outcome: outcomeUnknown, State: opUnresolved, HTTPStatus: res.status, Error: msg}); err != nil {
-			return out, err
+			return out, effectMayExistError("record unknown outcome: "+err.Error(), err)
 		}
 		out.Outcome, out.Error = CallUnresolved, msg
 		return out, nil
 	}
 	if err := finish(finishInput{Outcome: outcomeUnknown, State: opUnknown, HTTPStatus: res.status, Error: out.Error}); err != nil {
-		return out, err
+		return out, effectMayExistError("record unknown outcome: "+err.Error(), err)
 	}
 	return out, temporal.NewApplicationError(out.Error, ErrTypeOutcomeUnknown)
+}
+
+// effectMayExistError types an error raised after the request reached the
+// destination (a receipt or unknown-outcome write that failed) as an unknown
+// outcome, so the workflow classifies the row as unresolved rather than failed
+// once retries are exhausted (principal review F6, roadmap §9). A lost lease
+// is kept retryable the same way: another attempt owns the operation and the
+// ledger will resolve it.
+func effectMayExistError(msg string, cause error) error {
+	return temporal.NewApplicationErrorWithCause(msg, ErrTypeOutcomeUnknown, cause)
 }
 
 // finishWithRetry absorbs short database blips before giving up on

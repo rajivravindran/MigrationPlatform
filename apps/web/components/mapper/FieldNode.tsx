@@ -70,7 +70,7 @@ function FieldNodeInner({ id, data }: NodeProps<FieldNodeData>) {
         }
       }}
       className={clsx(
-        "group relative w-[220px] cursor-pointer rounded-xl border-2 bg-white px-3 py-2.5 shadow-sm transition-all select-none",
+        "group relative h-[92px] w-[220px] cursor-pointer rounded-xl border-2 bg-white px-3 py-2 shadow-sm transition-all select-none",
         styles.border,
         data.selected && "ring-2 ring-brand-500 ring-offset-2 border-brand-500 shadow-md scale-[1.02]",
         data.eligible && "ring-2 ring-emerald-400 ring-offset-1 border-emerald-400 shadow-md animate-pulse-soft",
@@ -114,16 +114,21 @@ function FieldNodeInner({ id, data }: NodeProps<FieldNodeData>) {
           <div className="truncate text-sm font-semibold text-slate-900" title={data.label}>
             {data.fieldName}
           </div>
-          {data.fieldType ? (
-            <div className="mt-0.5 truncate font-mono text-[11px] text-slate-500">{data.fieldType}</div>
-          ) : null}
+          <div className="mt-0.5 h-4 truncate font-mono text-[11px] text-slate-500">{data.fieldType ?? ""}</div>
           {data.connectedTo && data.connectedTo.length > 0 ? (
-            <div className="mt-1.5 flex items-center gap-1 truncate text-[11px] text-slate-500">
+            <div
+              className="mt-1 flex items-center gap-1 truncate text-[11px] text-slate-500"
+              title={(isSource ? "Feeds: " : "From: ") + data.connectedTo.join(", ")}
+            >
               <Link2 className="h-3 w-3 shrink-0" />
-              <span className="truncate">{data.connectedTo.join(", ")}</span>
+              <span className="truncate">
+                {isSource && data.connectedTo.length > 1
+                  ? `feeds ${data.connectedTo.length} fields`
+                  : data.connectedTo.join(", ")}
+              </span>
             </div>
           ) : (
-            <div className="mt-1.5 text-[11px] text-slate-400">
+            <div className="mt-1 text-[11px] text-slate-400">
               {isSource ? "Click to connect →" : "← Click to map"}
             </div>
           )}

@@ -1,5 +1,6 @@
 //! migration-api library. Shared by the main HTTP binary and the admin CLI.
 
+pub mod admission;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -30,6 +31,7 @@ pub fn build_router(state: state::AppState) -> axum::Router {
         .merge(routes::secrets::router())
         .merge(routes::batches::router())
         .merge(routes::schedules::router())
+        .merge(routes::plans::router())
         .merge(routes::dry_run::router())
         .merge(routes::openapi::router())
         .merge(routes::specs::router())

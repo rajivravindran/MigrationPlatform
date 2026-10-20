@@ -81,20 +81,32 @@ async fn create_job(
     require_role(&claims, &["admin", "editor", "operator"])?;
     crate::security::license::require_licensed()?;
 
-    let (tpl_version,): (i32,) = sqlx::query_as(
-        "SELECT version FROM rule_templates WHERE id = $1 AND org_id = $2 AND published = true",
-    )
-    .bind(req.rule_template_id)
-    .bind(claims.org)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| ApiError::BadRequest("template not found or not published".to_string()))?;
+    let tpl_version =
+        crate::admission::admit_template(&state.db, claims.org, req.rule_template_id, None)
+            .await?
+            .version;
 
     let created_by: i64 = claims.sub.parse().map_err(|_| ApiError::Unauthorized)?;
     let source_req = sources::parse_source_request(&req.source_ref)?;
-    let source_ref = sources::resolve(&state.db, claims.org, &source_req)
-        .await?
-        .source_ref();
+    let resolved = sources::resolve(&state.db, claims.org, &source_req).await?;
+    if let sources::ResolvedSource::Object(src) = &resolved {
+        let template_type: String = sqlx::query_scalar(
+            "SELECT COALESCE(schema_json->'source'->>'type', '') FROM rule_templates WHERE id = $1",
+        )
+        .bind(req.rule_template_id)
+        .fetch_one(&state.db)
+        .await?;
+        let filename = src.filename.clone().unwrap_or_default();
+        let format = src
+            .format
+            .clone()
+            .unwrap_or_else(|| sources::format_from_filename(&filename).to_string());
+        if let Some(msg) = crate::routes::plans::format_mismatch(&template_type, &format, &filename)
+        {
+            return Err(ApiError::BadRequest(msg));
+        }
+    }
+    let source_ref = resolved.source_ref();
     let workflow_id = format!("mig-{}-{}", claims.org, uuid::Uuid::new_v4());
 
     // Insert the job first so the workflow input can carry the real job id
@@ -282,19 +294,24 @@ async fn download_results(
     Path(id): Path<i64>,
     Query(q): Query<ResultsQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    let row: Option<(Option<Value>, Option<String>)> =
-        sqlx::query_as("SELECT results_ref, export_status FROM jobs WHERE id = $1 AND org_id = $2")
-            .bind(id)
-            .bind(claims.org)
-            .fetch_optional(&state.db)
-            .await?;
-    let Some((results_ref, export_status)) = row else {
+    let row: Option<(Option<Value>, Option<String>, i64)> = sqlx::query_as(
+        "SELECT results_ref, export_status, outcome_revision FROM jobs WHERE id = $1 AND org_id = $2",
+    )
+    .bind(id)
+    .bind(claims.org)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((results_ref, export_status, outcome_revision)) = row else {
         return Err(ApiError::NotFound);
     };
     // Exported files are current only while the latest export succeeded
-    // (NULL: exported before export_status existed). Otherwise read rows.
-    let results_ref =
-        results_ref.filter(|_| export_status.as_deref().map_or(true, |s| s == "succeeded"));
+    // (NULL: exported before export_status existed) and describe the job's
+    // current outcome revision (F5); an export without a revision predates
+    // revisions and is trusted only when nothing has changed since
+    // (revision 0). Otherwise read rows.
+    let results_ref = results_ref
+        .filter(|_| export_status.as_deref().map_or(true, |s| s == "succeeded"))
+        .filter(|r| r.get("revision").and_then(Value::as_i64).unwrap_or(0) == outcome_revision);
 
     let filename = if q.failed {
         format!("job-{id}-results-failed.csv")
@@ -439,6 +456,22 @@ async fn transition_lost(state: &AppState, org: i64, id: i64, action: &str) -> A
     ))
 }
 
+/// Pause/resume as a control command with a stable identity (architecture
+/// review A3). The request is recorded on the job before the signal is sent
+/// and cleared once the workflow confirms it, so an HTTP response can never
+/// claim both effects at once:
+///
+/// 1. record `control_requested` / `control_command_id` (conditional on the
+///    job being in a state the command applies to, or on the same command
+///    being retried);
+/// 2. signal the workflow with that command id (idempotent in the workflow);
+/// 3. confirm the workflow's pause state through its query and persist the
+///    status it reports, clearing the request.
+///
+/// If any step after 1 fails, the request stays recorded and the reconciler
+/// converges the job from the workflow's own pause state, re-sending the
+/// signal if it never arrived. Retrying the same command from the API is
+/// safe at every point.
 async fn signal_and_record(
     state: &AppState,
     claims: &crate::security::Claims,
@@ -451,31 +484,84 @@ async fn signal_and_record(
     let Some(workflow_id) = action_target(state, claims.org, id, action, from).await? else {
         return Err(ApiError::NotFound);
     };
+    let requested = if new_status == "paused" {
+        "pause"
+    } else {
+        "resume"
+    };
+    let from_states: Vec<String> = from.iter().map(|s| s.to_string()).collect();
 
+    // 1. Record the intent. A retry of an unconfirmed request of the same
+    //    kind keeps its command id so the workflow sees one decision.
+    let command_id: Option<String> = sqlx::query_scalar(
+        "UPDATE jobs SET
+           control_command_id = CASE WHEN control_requested = $4 AND control_command_id IS NOT NULL
+                                     THEN control_command_id ELSE $5 END,
+           control_requested = $4,
+           control_requested_at = now(),
+           updated_at = now()
+         WHERE id = $1 AND org_id = $2
+           AND (status::text = ANY($3) OR control_requested = $4)
+         RETURNING control_command_id",
+    )
+    .bind(id)
+    .bind(claims.org)
+    .bind(&from_states)
+    .bind(requested)
+    .bind(uuid::Uuid::new_v4().simple().to_string())
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(command_id) = command_id else {
+        return Err(transition_lost(state, claims.org, id, action).await);
+    };
+
+    // 2. Deliver the command.
     if let Err(e) = state
         .temporal
-        .signal_workflow(&workflow_id, signal_name, &json!({}))
+        .signal_workflow(&workflow_id, signal_name, &json!({"commandId": command_id}))
         .await
     {
         return Err(match e.downcast_ref::<WorkflowNotFound>() {
             Some(_) => ApiError::Conflict(format!(
                 "job {id}'s workflow has ended; it will be reconciled"
             )),
-            None => ApiError::External(format!("temporal: {e}")),
+            None => ApiError::External(format!(
+                "temporal: {e}; the {action} request is recorded and will be reconciled"
+            )),
         });
     }
 
-    let from: Vec<String> = from.iter().map(|s| s.to_string()).collect();
+    // 3. Confirm from the workflow's own state. The query may lag the signal
+    //    by a workflow task; an unconfirmed request is left recorded for the
+    //    reconciler rather than guessed.
+    let acknowledged = match state.temporal.query_pause_state(&workflow_id).await {
+        Ok(pause) => {
+            pause.last_command_id.as_deref() == Some(command_id.as_str())
+                || pause.paused == (new_status == "paused")
+        }
+        Err(e) => {
+            tracing::warn!(job_id = id, error = %e, "pause state query failed; leaving the request for the reconciler");
+            false
+        }
+    };
+    if !acknowledged {
+        return Err(ApiError::Conflict(format!(
+            "job {id}: the {action} request is recorded but the workflow has not confirmed it yet; retry or wait for reconciliation"
+        )));
+    }
+
     let row: Option<JobRow> = sqlx::query_as(&format!(
         "UPDATE jobs SET status = $1::job_status, updated_at = now(),
-           paused_at = CASE WHEN $1 = 'paused' THEN now() ELSE paused_at END
-         WHERE id = $2 AND org_id = $3 AND status::text = ANY($4)
+           paused_at = CASE WHEN $1 = 'paused' THEN now() ELSE paused_at END,
+           control_requested = NULL, control_command_id = NULL, control_requested_at = NULL
+         WHERE id = $2 AND org_id = $3 AND control_command_id = $4
+           AND status IN ('running'::job_status, 'paused'::job_status)
          RETURNING {JOB_COLS}"
     ))
     .bind(new_status)
     .bind(id)
     .bind(claims.org)
-    .bind(&from)
+    .bind(&command_id)
     .fetch_optional(&state.db)
     .await?;
     let Some(row) = row else {
@@ -490,7 +576,7 @@ async fn signal_and_record(
         Some(id.to_string()),
         action,
         None,
-        Some(&serde_json::to_value(&row)?),
+        Some(&json!({"command_id": command_id, "status": row.status})),
     )
     .await?;
     Ok(row)

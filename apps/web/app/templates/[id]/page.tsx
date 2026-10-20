@@ -325,14 +325,12 @@ function Designer({ template }: { template: Template }) {
   const [respPath, setRespPath] = useState("$.id");
   const [importUrl, setImportUrl] = useState("");
   const [importName, setImportName] = useState("");
-  const [dirty, setDirty] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const step = steps[active];
 
   const updateStep = useCallback(
     (idx: number, patch: Partial<StepUI> | ((s: StepUI) => StepUI)) => {
-      setDirty(true);
       setSteps((ss) =>
         ss.map((s, i) => (i === idx ? (typeof patch === "function" ? patch(s) : { ...s, ...patch }) : s))
       );
@@ -346,7 +344,6 @@ function Designer({ template }: { template: Template }) {
   );
 
   const applySample = useCallback((sample: SampleResponse, filename: string) => {
-    setDirty(true);
     setSrcNodes(
       sample.columns.map((col, i) =>
         makeFieldNode("src", col.name, i, { fieldType: col.type, label: col.name })
@@ -401,7 +398,6 @@ function Designer({ template }: { template: Template }) {
   const addSourceField = (name: string) => {
     const id = nodeIdFor("src", name);
     if (srcNodes.some((n) => n.id === id)) return void toast.error("Field already exists");
-    setDirty(true);
     setSrcNodes((ns) => [...ns, makeFieldNode("src", name, ns.length, { label: name, fieldType: "string" })]);
   };
 
@@ -434,7 +430,6 @@ function Designer({ template }: { template: Template }) {
   const addStep = (name: string) => {
     if (!STEP_NAME_RE.test(name)) return void toast.error("Step names must match [A-Za-z_][A-Za-z0-9_]*");
     if (steps.some((s) => s.name === name)) return void toast.error("Step name already used");
-    setDirty(true);
     setSteps((ss) => [...ss, { name, nodes: [], edges: [], url: "", method: "POST", responseSchema: null }]);
     setActive(steps.length);
   };
@@ -446,7 +441,6 @@ function Designer({ template }: { template: Template }) {
       (s, i) => i !== idx && s.nodes.some((n) => parseRespNode(n.id)?.step === name)
     );
     if (referenced) return void toast.error(`Later steps reference "${name}"'s response; remove those refs first`);
-    setDirty(true);
     setSteps((ss) => ss.filter((_, i) => i !== idx));
     setActive((a) => Math.max(0, a > idx ? a - 1 : Math.min(a, steps.length - 2)));
   };
@@ -467,7 +461,6 @@ function Designer({ template }: { template: Template }) {
       );
     }
     setSteps((ss) => ss.map((s, i) => (i === idx ? { ...s, name: newName } : s)));
-    setDirty(true);
     toast.success(`Renamed step to ${newName}`);
   };
 
@@ -557,7 +550,6 @@ function Designer({ template }: { template: Template }) {
       const src = initSrcNodes(res.template).length;
       setSrcNodes(initSrcNodes(res.template));
       setSteps(schemaSteps(res.template).map((s) => initStepUI(s, src)));
-      setDirty(true);
       setActive(0);
       toast.success(`Applied suggestion from ${res.model}${res.redacted ? " (samples were PII-redacted)" : ""}`);
     },
@@ -568,6 +560,10 @@ function Designer({ template }: { template: Template }) {
     () => deriveTemplateJson(template, srcNodes, steps),
     [template, srcNodes, steps]
   );
+  // Compare the mapping that would be saved. Canvas layout events (node
+  // measurement and dragging) must not count, or Publish stays disabled.
+  const savedJson = useRef(JSON.stringify(templateJson));
+  const dirty = JSON.stringify(templateJson) !== savedJson.current;
   const validationErrors = useMemo(() => {
     const issues: string[] = [];
     if (srcNodes.filter((node) => node.id !== "src:__hint").length === 0) issues.push("Add at least one source field.");
@@ -779,14 +775,14 @@ function Designer({ template }: { template: Template }) {
             ) : null}
           </div>
 
-          <div className="h-[560px]">
+          <div className="h-[640px]">
             <p className="sr-only">Connect a source field to a destination field using the mapping canvas. The mapping list below provides a text summary.</p>
             <MappingCanvas
               resetKey={`${active}:${step.name}`}
               srcNodes={srcNodes}
               stepNodes={step.nodes}
               edges={step.edges}
-              onSrcNodesChange={(nodes) => { setDirty(true); setSrcNodes(nodes); }}
+              onSrcNodesChange={setSrcNodes}
               onStepNodesChange={(nodes) => updateStep(active, { nodes })}
               onEdgesChange={(edges) => updateStep(active, { edges })}
             />
@@ -934,7 +930,7 @@ function Designer({ template }: { template: Template }) {
           <details className="group rounded-lg border border-slate-200 bg-white shadow-sm">
             <summary className="flex cursor-pointer list-none items-center justify-between p-4 text-sm font-semibold text-slate-900">Advanced template JSON <ChevronDown className="h-4 w-4 transition group-open:rotate-180" /></summary>
             <div className="border-t border-slate-100 p-3">
-            <MonacoEditor
+            <MonacoEditor theme="vs-dark"
               height="180px"
               language="json"
               value={JSON.stringify(templateJson, null, 2)}
@@ -946,7 +942,7 @@ function Designer({ template }: { template: Template }) {
 
           <Card>
             <h3 className="mb-2 text-sm font-semibold text-slate-900">Dry-run rows</h3>
-            <MonacoEditor
+            <MonacoEditor theme="vs-dark"
               height="120px"
               language="json"
               value={dryRunRows}

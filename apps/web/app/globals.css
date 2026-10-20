@@ -3,7 +3,13 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
+  --page: #0f1522;
+  --surface: #151c2b;
+  --surface-2: #1a2234;
+  --line: #283449;
+  --ink: #eef2f8;
+  --ink-muted: #9aa6bd;
 }
 
 html,
@@ -11,11 +17,16 @@ body {
   height: 100%;
 }
 body {
-  @apply bg-slate-50 text-slate-900 antialiased;
+  background: var(--page);
+  color: var(--ink);
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, "Noto Serif", serif;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "kern", "liga", "onum" 0, "lnum";
 }
 
 ::selection {
-  @apply bg-brand-50 text-brand-700;
+  background: #2a4070;
+  color: #eef2f8;
 }
 
 button,
@@ -25,9 +36,24 @@ select,
 textarea {
   @apply focus-visible:outline-none;
 }
+:is(button, a, input, select, textarea, [role="button"]):focus-visible {
+  outline: 2px solid #9dbcfb;
+  outline-offset: 2px;
+}
+
+input,
+select,
+textarea {
+  color-scheme: dark;
+}
 
 table th {
   @apply font-medium;
+}
+
+/* Numerals in stat tiles and tables line up */
+.tnum {
+  font-variant-numeric: tabular-nums lining-nums;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -37,6 +63,7 @@ table th {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
   }
 }
 
@@ -44,10 +71,10 @@ table th {
 @keyframes pulse-soft {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgb(52 211 153 / 0.35);
+    box-shadow: 0 0 0 0 rgb(63 207 142 / 0.45);
   }
   50% {
-    box-shadow: 0 0 0 6px rgb(52 211 153 / 0);
+    box-shadow: 0 0 0 6px rgb(63 207 142 / 0);
   }
 }
 
@@ -80,4 +107,205 @@ table th {
 
 .react-flow__attribution {
   display: none !important;
+}
+
+.react-flow__controls {
+  box-shadow: none !important;
+}
+.react-flow__controls-button {
+  background: var(--surface-2) !important;
+  border-bottom: 1px solid var(--line) !important;
+  fill: var(--ink) !important;
+}
+.react-flow__minimap {
+  background: var(--surface) !important;
+}
+.react-flow__minimap-mask {
+  fill: rgb(15 21 34 / 0.6) !important;
+}
+
+/* Package dependency graph: stage nodes glow by state (text + icon carry it too) */
+.react-flow__node-stage {
+  padding: 0 !important;
+  border: none !important;
+  background: transparent !important;
+  width: auto !important;
+}
+
+.stage-node {
+  --glow: 127 139 163;
+  width: 236px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgb(var(--glow) / 0.75);
+  background: #151c2b;
+  box-shadow: 0 0 14px 1px rgb(var(--glow) / 0.35), inset 0 0 0 1px rgb(var(--glow) / 0.08);
+}
+
+.stage-node .stage-icon,
+.stage-node .stage-state-label {
+  color: rgb(var(--glow));
+}
+
+.stage-node .stage-bar {
+  background: rgb(var(--glow));
+}
+
+.stage-glow-pending,
+.stage-legend-pending {
+  --glow: 232 176 76;
+}
+.stage-glow-running,
+.stage-legend-running {
+  --glow: 91 141 239;
+}
+.stage-glow-waiting,
+.stage-legend-waiting {
+  --glow: 163 124 240;
+}
+.stage-glow-blocked,
+.stage-legend-blocked {
+  --glow: 240 140 70;
+}
+.stage-glow-completed,
+.stage-legend-completed {
+  --glow: 63 207 142;
+}
+.stage-glow-failed,
+.stage-legend-failed {
+  --glow: 242 109 109;
+}
+.stage-glow-cancelled,
+.stage-legend-cancelled {
+  --glow: 127 139 163;
+}
+
+.stage-glow-pending {
+  border-style: dashed;
+}
+
+.stage-glow-running {
+  animation: stage-pulse 1.8s ease-in-out infinite;
+}
+
+.stage-glow-failed {
+  box-shadow: 0 0 22px 3px rgb(var(--glow) / 0.5), inset 0 0 0 1px rgb(var(--glow) / 0.15);
+}
+
+.stage-glow-waiting {
+  animation: stage-breathe 3.2s ease-in-out infinite;
+}
+
+.stage-glow-blocked {
+  border-style: dashed;
+  border-width: 2px;
+  box-shadow: 0 0 18px 2px rgb(var(--glow) / 0.45);
+}
+
+@keyframes stage-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 8px 0 rgb(var(--glow) / 0.25);
+  }
+  50% {
+    box-shadow: 0 0 18px 3px rgb(var(--glow) / 0.5);
+  }
+}
+
+.stage-glow-cancelled {
+  opacity: 0.7;
+  box-shadow: none;
+}
+
+.stage-invalid {
+  outline: 2px dashed #f26d6d;
+  outline-offset: 3px;
+}
+
+@keyframes stage-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 10px 1px rgb(var(--glow) / 0.3);
+  }
+  50% {
+    box-shadow: 0 0 26px 6px rgb(var(--glow) / 0.65);
+  }
+}
+
+[class*="stage-legend-"] .stage-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 9999px;
+  background: rgb(var(--glow));
+  box-shadow: 0 0 8px 1px rgb(var(--glow) / 0.7);
+}
+[class*="stage-legend-"] .stage-icon {
+  color: rgb(var(--glow));
+}
+
+.stage-graph .react-flow__node-stage {
+  cursor: grab;
+}
+.stage-graph .react-flow__node-stage.dragging {
+  cursor: grabbing;
+}
+
+.stage-graph .react-flow__handle {
+  width: 9px;
+  height: 9px;
+  background: #5b8def;
+  border: 2px solid #151c2b;
+}
+
+/* Builder: large, obvious connection points */
+.stage-graph-editable .react-flow__handle {
+  width: 16px;
+  height: 16px;
+  border-width: 3px;
+  cursor: crosshair;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+.stage-graph-editable .react-flow__handle:hover,
+.stage-graph-editable .react-flow__handle.connectingto {
+  transform: scale(1.35);
+  box-shadow: 0 0 0 4px rgb(91 141 239 / 0.35);
+}
+.stage-graph-editable .react-flow__handle.source::after {
+  content: "";
+  position: absolute;
+  inset: -10px;
+}
+
+.stage-graph .react-flow__node-stage.selected .stage-node {
+  outline: 2px solid #9dbcfb;
+  outline-offset: 3px;
+}
+
+.stage-graph .react-flow__connection-path {
+  stroke: #9dbcfb;
+  stroke-width: 2.5;
+}
+
+/* Inline JSON viewer */
+.json-view {
+  font-family: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.json-view .k {
+  color: #9dbcfb;
+}
+.json-view .s {
+  color: #8ae7bd;
+}
+.json-view .n {
+  color: #f2cf8f;
+}
+.json-view .b {
+  color: #d3bff9;
+}
+.json-view .z {
+  color: #9aa6bd;
 }

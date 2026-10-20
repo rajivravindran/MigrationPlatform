@@ -1,5 +1,7 @@
 # MigrationPlatform — executable product roadmap
 
+> Product direction update — 17 October 2026: [Product vision and delivery plan](PRODUCT_VISION_AND_DELIVERY_PLAN.md) records the expanded, user-confirmed scope: all existing features, role-specific workspaces, campaign/environment/version-scoped dependencies, separate installations promoted through GitHub, and scalable million-row processing. Use its delivery sequence for current planning. Retain the engineering requirements and historical evidence below; later principal and architecture reviews reopen relevant integrity guarantees, so historical M0 closure is not current production approval.
+
 Date: 3 October 2026. Owner: Rajiv Ravindran. Implementation owners: unassigned.
 Planning baseline: local `2395f5d`; underlying reviewed application commit `18160097d3e95994bf8018838c9b43b719bcac49`.
 M0 closed locally on `965c01d` (2026-10-10). Evidence: [docs/evidence/R07_INTEGRITY.md](evidence/R07_INTEGRITY.md).

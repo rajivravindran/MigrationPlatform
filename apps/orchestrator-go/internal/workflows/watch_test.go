@@ -11,17 +11,20 @@ import (
 
 	"github.com/migration-platform/orchestrator/internal/activities"
 	"github.com/migration-platform/orchestrator/internal/connectors"
+	"github.com/migration-platform/orchestrator/internal/lifecycle"
 )
 
 type watchStub struct {
-	conn          activities.LoadConnectorOutput
-	objects       []connectors.ObjectInfo
-	jobs          []activities.StartWatchObjectJobInput
-	batches       []activities.StartBatchInput
-	cursor        map[string]string
-	staged        []activities.StageSftpObjectInput
-	stagingBucket string
-	stagingPrefix string
+	conn    activities.LoadConnectorOutput
+	objects []connectors.ObjectInfo
+	jobs    []activities.StartWatchObjectJobInput
+	batches []activities.StartBatchInput
+	cursor  map[string]string
+	// cursorScheduleID is the intent the last cursor advance was scoped to.
+	cursorScheduleID int64
+	staged           []activities.StageSftpObjectInput
+	stagingBucket    string
+	stagingPrefix    string
 }
 
 func (s *watchStub) LoadConnector(_ context.Context, _ activities.LoadConnectorInput) (activities.LoadConnectorOutput, error) {
@@ -56,12 +59,12 @@ func (s *watchStub) StageSftpObject(_ context.Context, in activities.StageSftpOb
 }
 func (s *watchStub) StartWatchObjectJob(_ context.Context, in activities.StartWatchObjectJobInput) (activities.StartWatchObjectJobOutput, error) {
 	s.jobs = append(s.jobs, in)
-	wid := activities.WatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag)
+	wid := activities.WatchExecutionWorkflowID(in.OrgID, in.ScheduleID, in.Bucket, in.Key, in.ETag)
 	return activities.StartWatchObjectJobOutput{JobID: int64(len(s.jobs)), WorkflowID: wid, Created: true}, nil
 }
 func (s *watchStub) StartBatch(_ context.Context, in activities.StartBatchInput) (activities.StartBatchOutput, error) {
 	s.batches = append(s.batches, in)
-	wid := activities.BatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag)
+	wid := activities.BatchExecutionWorkflowID(in.OrgID, in.ScheduleID, in.Bucket, in.Key, in.ETag)
 	return activities.StartBatchOutput{BatchID: int64(len(s.batches)), WorkflowID: wid, Created: true}, nil
 }
 func (s *watchStub) MarkJobRunning(_ context.Context, _ activities.MarkJobRunningInput) error {
@@ -73,6 +76,7 @@ func (s *watchStub) MarkBatchRunning(_ context.Context, _ activities.MarkBatchRu
 func (s *watchStub) RequireLicensed(_ context.Context) error { return nil }
 func (s *watchStub) AdvanceConnectorCursor(_ context.Context, in activities.AdvanceConnectorCursorInput) error {
 	s.cursor = in.Seen
+	s.cursorScheduleID = in.ScheduleID
 	return nil
 }
 func (s *watchStub) LoadTemplate(_ context.Context, _ activities.LoadTemplateInput) (activities.LoadTemplateOutput, error) {
@@ -93,7 +97,9 @@ func (s *watchStub) PersistStepOutcome(_ context.Context, _ activities.PersistSt
 func (s *watchStub) PublishProgress(_ context.Context, _ activities.PublishProgressInput) error {
 	return nil
 }
-func (s *watchStub) FinalizeJob(_ context.Context, _ activities.FinalizeJobInput) error { return nil }
+func (s *watchStub) FinalizeJob(_ context.Context, in activities.FinalizeJobInput) (*activities.FinalizeJobOutput, error) {
+	return stubVerdict(in), nil
+}
 func (s *watchStub) ExportJobResults(_ context.Context, _ activities.ExportJobResultsInput) error {
 	return nil
 }
@@ -131,8 +137,8 @@ func (s *watchStub) StartBatchStageJob(_ context.Context, in activities.StartBat
 func (s *watchStub) FinalizeBatchStage(_ context.Context, _ activities.FinalizeBatchStageInput) error {
 	return nil
 }
-func (s *watchStub) FinalizeBatch(_ context.Context, _ activities.FinalizeBatchInput) error {
-	return nil
+func (s *watchStub) FinalizeBatch(_ context.Context, in activities.FinalizeBatchInput) (*activities.FinalizeBatchOutput, error) {
+	return &activities.FinalizeBatchOutput{Status: "succeeded"}, nil
 }
 func (s *watchStub) QuarantineArchive(_ context.Context, _ activities.QuarantineArchiveInput) (activities.QuarantineArchiveOutput, error) {
 	return activities.QuarantineArchiveOutput{}, nil
@@ -185,6 +191,7 @@ func TestWatchPrefixWorkflowStartsNewObjects(t *testing.T) {
 	require.Equal(t, "incoming/pack.tar.gz", stub.batches[0].Key)
 	require.Equal(t, "etag-new", stub.cursor["incoming/new.csv"])
 	require.Equal(t, "etag-tar", stub.cursor["incoming/pack.tar.gz"])
+	require.EqualValues(t, 42, stub.cursorScheduleID, "discovery progress is recorded for this schedule")
 }
 
 func TestWatchPrefixWorkflowSftpStagesAndStarts(t *testing.T) {
@@ -310,7 +317,9 @@ func TestBatchWorkflowDAGParallelRootsThenDependent(t *testing.T) {
 	env := ts.NewTestWorkflowEnvironment()
 	env.SetTestTimeout(30 * time.Second)
 
-	// Ingest returns Done with no rows → child MigrationWorkflow succeeds.
+	// The stub Ingest returns Done with no rows; the stub FinalizeJob stands
+	// in for a job whose rows all succeeded, so each child is verified
+	// succeeded. See batch_verdict_test.go for the empty-job case.
 	stub := &batchStub{
 		stages: []activities.StagedFile{
 			{StageKey: "a", File: "a.csv", TemplateKey: "t", OnFailure: "stop", Bucket: "b", Key: "ka", Filename: "a.csv", Size: 1},
@@ -409,6 +418,18 @@ type batchStub struct {
 	failStage   string
 	startedJobs int
 	finalStatus string
+	// ingestErr, when set, fails the child job's Ingest activity for every
+	// stage: an execution error rather than a row outcome.
+	ingestErr error
+	// stageOutcomes records what the batch persisted per stage key.
+	stageOutcomes map[string]activities.FinalizeBatchStageInput
+	stageKeys     map[int64]string
+	// finalizeInputs records every FinalizeBatch call.
+	finalizeInputs []activities.FinalizeBatchInput
+	// stagePersistErr, when set, fails FinalizeBatchStage for that stage key.
+	stagePersistErr map[string]error
+	// unpackInput records the UnpackAndStageArchive request.
+	unpackInput activities.UnpackAndStageArchiveInput
 }
 
 func (s *batchStub) RequireLicensed(_ context.Context) error { return nil }
@@ -416,12 +437,17 @@ func (s *batchStub) RequireLicensed(_ context.Context) error { return nil }
 func (s *batchStub) MarkBatchRunning(_ context.Context, _ activities.MarkBatchRunningInput) error {
 	return nil
 }
-func (s *batchStub) UnpackAndStageArchive(_ context.Context, _ activities.UnpackAndStageArchiveInput) (activities.UnpackAndStageArchiveOutput, error) {
+func (s *batchStub) UnpackAndStageArchive(_ context.Context, in activities.UnpackAndStageArchiveInput) (activities.UnpackAndStageArchiveOutput, error) {
+	s.unpackInput = in
 	return activities.UnpackAndStageArchiveOutput{OnStageFailure: "stop", Stages: s.stages}, nil
 }
 func (s *batchStub) MaterializeBatchStages(_ context.Context, in activities.MaterializeBatchStagesInput) (activities.MaterializeBatchStagesOutput, error) {
 	out := activities.MaterializeBatchStagesOutput{}
+	if s.stageKeys == nil {
+		s.stageKeys = map[int64]string{}
+	}
 	for i, st := range in.Stages {
+		s.stageKeys[int64(i+1)] = st.StageKey
 		out.Stages = append(out.Stages, activities.ResolvedStage{
 			StageRowID: int64(i + 1), StageIndex: i, StageKey: st.StageKey,
 			TemplateKey: st.TemplateKey, RuleTemplateID: 1, RuleTemplateVersion: 1,
@@ -443,12 +469,43 @@ func (s *batchStub) StartBatchStageJob(_ context.Context, in activities.StartBat
 func (s *batchStub) MarkJobRunning(_ context.Context, _ activities.MarkJobRunningInput) error {
 	return nil
 }
-func (s *batchStub) FinalizeBatchStage(_ context.Context, _ activities.FinalizeBatchStageInput) error {
+func (s *batchStub) FinalizeBatchStage(_ context.Context, in activities.FinalizeBatchStageInput) error {
+	if err := s.stagePersistErr[s.stageKeys[in.StageRowID]]; err != nil {
+		return err
+	}
+	if s.stageOutcomes == nil {
+		s.stageOutcomes = map[string]activities.FinalizeBatchStageInput{}
+	}
+	if key, ok := s.stageKeys[in.StageRowID]; ok {
+		s.stageOutcomes[key] = in
+	}
 	return nil
 }
-func (s *batchStub) FinalizeBatch(_ context.Context, in activities.FinalizeBatchInput) error {
-	s.finalStatus = in.Status
-	return nil
+
+// FinalizeBatch mirrors lifecycle.FinalizeBatch: the verdict is derived from
+// the stage outcomes this stub persisted plus the execution outcome.
+func (s *batchStub) FinalizeBatch(_ context.Context, in activities.FinalizeBatchInput) (*activities.FinalizeBatchOutput, error) {
+	s.finalizeInputs = append(s.finalizeInputs, in)
+	if !in.DeriveFromStages && in.Status != "" { // legacy caller-supplied status
+		s.finalStatus = in.Status
+		return &activities.FinalizeBatchOutput{Status: in.Status}, nil
+	}
+	var t lifecycle.StageTotals
+	for _, key := range s.stageKeys {
+		t.Total++
+		switch out, ok := s.stageOutcomes[key]; {
+		case !ok:
+			t.Unfinished++
+		case out.Status == "succeeded":
+			t.Succeeded++
+		default:
+			t.Failed++
+		}
+	}
+	o := lifecycle.Outcome{Cancelled: in.Cancelled, Error: in.Error}
+	st := lifecycle.BatchTerminalStatus(t, o)
+	s.finalStatus = st
+	return &activities.FinalizeBatchOutput{Status: st, Reason: lifecycle.ExplainBatch(st, t, o), Stages: t}, nil
 }
 func (s *batchStub) QuarantineArchive(_ context.Context, _ activities.QuarantineArchiveInput) (activities.QuarantineArchiveOutput, error) {
 	return activities.QuarantineArchiveOutput{}, nil
@@ -457,6 +514,9 @@ func (s *batchStub) LoadTemplate(_ context.Context, _ activities.LoadTemplateInp
 	return activities.LoadTemplateOutput{}, nil
 }
 func (s *batchStub) Ingest(_ context.Context, _ activities.IngestInput) (activities.IngestOutput, error) {
+	if s.ingestErr != nil {
+		return activities.IngestOutput{}, s.ingestErr
+	}
 	return activities.IngestOutput{Done: true}, nil
 }
 func (s *batchStub) CallEndpoint(_ context.Context, _ activities.CallEndpointInput) (activities.CallEndpointOutput, error) {
@@ -471,7 +531,9 @@ func (s *batchStub) PersistStepOutcome(_ context.Context, _ activities.PersistSt
 func (s *batchStub) PublishProgress(_ context.Context, _ activities.PublishProgressInput) error {
 	return nil
 }
-func (s *batchStub) FinalizeJob(_ context.Context, _ activities.FinalizeJobInput) error { return nil }
+func (s *batchStub) FinalizeJob(_ context.Context, in activities.FinalizeJobInput) (*activities.FinalizeJobOutput, error) {
+	return stubVerdict(in), nil
+}
 func (s *batchStub) ExportJobResults(_ context.Context, _ activities.ExportJobResultsInput) error {
 	return nil
 }
@@ -479,7 +541,7 @@ func (s *batchStub) LoadRowState(_ context.Context, _ activities.LoadRowStateInp
 	return activities.LoadRowStateOutput{}, nil
 }
 
-func registerBatchStub(env *testsuite.TestWorkflowEnvironment, stub *batchStub) {
+func registerBatchStub(env *testsuite.TestWorkflowEnvironment, stub *batchStub) *jobFinish {
 	env.RegisterActivityWithOptions(stub.MarkBatchRunning, activities.RegisterOptions("MarkBatchRunning"))
 	env.RegisterActivityWithOptions(stub.UnpackAndStageArchive, activities.RegisterOptions("UnpackAndStageArchive"))
 	env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
@@ -495,6 +557,7 @@ func registerBatchStub(env *testsuite.TestWorkflowEnvironment, stub *batchStub) 
 	env.RegisterActivityWithOptions(stub.PersistOutcome, activities.RegisterOptions("PersistOutcome"))
 	env.RegisterActivityWithOptions(stub.PersistStepOutcome, activities.RegisterOptions("PersistStepOutcome"))
 	env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
-	registerJobFinish(env)
+	finish := registerJobFinish(env)
 	env.RegisterActivityWithOptions(stub.LoadRowState, activities.RegisterOptions("LoadRowState"))
+	return finish
 }

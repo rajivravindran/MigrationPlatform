@@ -157,3 +157,23 @@ manual setup needed.
 - Feature flags live in `apps/api/src/config.rs`; prefer env-configurable
   toggles over branches.
 - Generated code never edited by hand: `make generate`.
+
+
+## Integration tests without Docker
+
+Both the API route tests and the orchestrator's database tests can run against
+any Postgres you point them at (a fresh database is created per test from
+`apps/api/migrations`):
+
+```
+export TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres     # Rust
+cargo test -p migration-api --tests -- --ignored
+
+export MP_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres  # Go
+export MP_TEST_S3_ENDPOINT=http://127.0.0.1:9000                          # MinIO or `moto_server`
+cd apps/orchestrator-go && go test -tags integration ./internal/... -run 'TestPG|TestObjectReads'
+```
+
+Without `TEST_DATABASE_URL` the Rust harness starts Postgres through
+testcontainers as before. The Go integration tests skip when their variables
+are unset.

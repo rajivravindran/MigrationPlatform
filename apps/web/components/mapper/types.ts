@@ -82,8 +82,15 @@ export function isValidFieldConnection(sourceId: string, targetId: string): bool
   return isSourceKind(kindOfNode(sourceId)) && isTargetKind(kindOfNode(targetId));
 }
 
-export const ROW_H = 64;
+/**
+ * Vertical pitch between field cards. It must exceed the card's fixed height
+ * (FieldNode: 92px) or later cards cover earlier ones and hide their connect
+ * handles, which is what stopped a source field from being mapped to a
+ * second destination.
+ */
+export const ROW_H = 108;
 export const COL_PAD = 24;
+export const CARD_H = 92;
 
 export function layoutY(index: number) {
   return COL_PAD + index * ROW_H;

@@ -49,13 +49,43 @@ func InitObjectStore() error {
 	return nil
 }
 
-func openObjectStore(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+// ErrSourceChanged reports that the object's content no longer matches the
+// version the read was bound to (principal review F2/F3): either the
+// conditional GET was refused (412) or the stream's ETag differs.
+var ErrSourceChanged = errors.New("object changed since its version was registered")
+
+// openObjectStore opens bucket/key. When expectedETag is set the read is
+// bound to that version: the GET carries If-Match so the store refuses a
+// replaced object, and the opened stream's ETag is checked again so a
+// replacement between validation and read, or across SDK retries, cannot be
+// read under the old version's name.
+func openObjectStore(ctx context.Context, bucket, key, expectedETag string) (io.ReadCloser, error) {
 	if s3Client == nil {
 		return nil, errors.New("object store not configured (set MINIO_ENDPOINT on the orchestrator)")
 	}
-	obj, err := s3Client.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
+	opts := minio.GetObjectOptions{}
+	if expectedETag != "" {
+		if err := opts.SetMatchETag(expectedETag); err != nil {
+			return nil, err
+		}
+	}
+	obj, err := s3Client.GetObject(ctx, bucket, key, opts)
 	if err != nil {
 		return nil, err
+	}
+	// Stat issues the request now, so a refused precondition surfaces here
+	// instead of on the first Read deep inside a parser.
+	info, err := obj.Stat()
+	if err != nil {
+		_ = obj.Close()
+		if resp := minio.ToErrorResponse(err); resp.StatusCode == 412 || resp.Code == "PreconditionFailed" {
+			return nil, fmt.Errorf("%w: %s/%s expected etag %s", ErrSourceChanged, bucket, key, expectedETag)
+		}
+		return nil, err
+	}
+	if expectedETag != "" && strings.Trim(info.ETag, "\"") != expectedETag {
+		_ = obj.Close()
+		return nil, fmt.Errorf("%w: %s/%s expected etag %s, stream has %s", ErrSourceChanged, bucket, key, expectedETag, strings.Trim(info.ETag, "\""))
 	}
 	return obj, nil
 }
@@ -166,8 +196,9 @@ func StatObject(ctx context.Context, bucket, key string) (ObjectInfo, error) {
 }
 
 // DownloadObject writes bucket/key to destPath, enforcing maxBytes (0 = no cap).
-func DownloadObject(ctx context.Context, bucket, key, destPath string, maxBytes int64) (int64, error) {
-	rc, err := openObjectStore(ctx, bucket, key)
+// A non-empty expectedETag binds the download to that version (ErrSourceChanged otherwise).
+func DownloadObject(ctx context.Context, bucket, key, destPath string, maxBytes int64, expectedETag string) (int64, error) {
+	rc, err := openObjectStore(ctx, bucket, key, expectedETag)
 	if err != nil {
 		return 0, err
 	}
@@ -197,18 +228,23 @@ func DownloadObject(ctx context.Context, bucket, key, destPath string, maxBytes 
 	return n, nil
 }
 
-// PutObject uploads a local file to bucket/key.
-func PutObject(ctx context.Context, bucket, key, filePath, contentType string) error {
+// PutObject uploads a local file to bucket/key and returns the stored
+// object's ETag and size, so the caller can register the exact content
+// version it wrote (principal review F3).
+func PutObject(ctx context.Context, bucket, key, filePath, contentType string) (ObjectInfo, error) {
 	if s3Client == nil {
-		return errors.New("object store not configured (set MINIO_ENDPOINT on the orchestrator)")
+		return ObjectInfo{}, errors.New("object store not configured (set MINIO_ENDPOINT on the orchestrator)")
 	}
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	_, err := s3Client.FPutObject(ctx, bucket, key, filePath, minio.PutObjectOptions{
+	up, err := s3Client.FPutObject(ctx, bucket, key, filePath, minio.PutObjectOptions{
 		ContentType: contentType,
 	})
-	return err
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	return ObjectInfo{Key: key, ETag: strings.Trim(up.ETag, "\""), Size: up.Size, LastModified: up.LastModified}, nil
 }
 
 // CopyObject server-side copies an object within the same bucket.

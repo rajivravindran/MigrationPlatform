@@ -11,6 +11,7 @@ import (
 
 	"github.com/migration-platform/orchestrator/internal/activities"
 	"github.com/migration-platform/orchestrator/internal/connectors"
+	"github.com/migration-platform/orchestrator/internal/lifecycle"
 	"github.com/migration-platform/orchestrator/internal/template"
 )
 
@@ -32,7 +33,25 @@ func newDeliveryHarness(t *testing.T, tpl template.RuleTemplate, rows []connecto
 	h.env.RegisterActivityWithOptions(stub.Ingest, activities.RegisterOptions("Ingest"))
 	h.env.RegisterActivityWithOptions(stub.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
 	h.env.RegisterActivityWithOptions(stub.PublishProgress, activities.RegisterOptions("PublishProgress"))
-	registerJobFinish(h.env)
+	// FinalizeJob derives its verdict from the row outcomes this harness
+	// persisted, as lifecycle.Finalize does from job_rows.
+	registerJobFinish(h.env).verdict = func(in activities.FinalizeJobInput) *activities.FinalizeJobOutput {
+		var t lifecycle.Totals
+		for _, r := range h.rows {
+			t.Total++
+			switch r.Status {
+			case "succeeded":
+				t.Processed++
+			case "failed":
+				t.Failed++
+			case "unresolved":
+				t.Unresolved++
+			}
+		}
+		o := lifecycle.Outcome{Cancelled: in.Cancelled, Error: in.Error}
+		st := lifecycle.TerminalStatus(t, o)
+		return &activities.FinalizeJobOutput{Status: st, Reason: lifecycle.Explain(st, t, o, ""), Totals: t}
+	}
 	h.env.RegisterActivityWithOptions(func(_ context.Context, _ activities.LoadRowStateInput) (activities.LoadRowStateOutput, error) {
 		return h.rowState, nil
 	}, activities.RegisterOptions("LoadRowState"))
@@ -85,7 +104,8 @@ func TestUnresolvedStepStopsTheChain(t *testing.T) {
 	}
 	res, err := h.run(t)
 	require.NoError(t, err)
-	require.EqualValues(t, MigrationWorkflowResult{Unresolved: 1}, res)
+	require.EqualValues(t, MigrationWorkflowResult{Unresolved: 1, Status: "failed", Reason: "0 of 1 rows failed, 1 unresolved"}, res,
+		"the persisted verdict travels with the result: an unresolved row is not success")
 	require.Len(t, h.calls, 1, "dependent steps must not run after an unresolved step")
 	require.Equal(t, template.DeliveryManual, h.calls[0].DeliveryMode, "POST without a policy must default to manual")
 	require.Len(t, h.rows, 1)

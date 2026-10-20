@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
         "create-org" => create_org(&cfg, &args[1..]).await,
         "create-user" => create_user(&cfg, &args[1..]).await,
         "upsert-secret" => upsert_secret(&cfg, &args[1..]).await,
+        "merge-cursors" => merge_cursors(&cfg, &args[1..]).await,
         other => bail!("unknown subcommand {other}; run `admin help` for usage"),
     }
 }
@@ -52,6 +53,9 @@ fn print_help() {
     admin create-org     --name <name> [--slug <slug>]
     admin create-user    --org <id> --email <email> --role <role> --password <pw>
     admin upsert-secret  --org <id> --name <n>       --value <raw_string>
+    admin merge-cursors  [--connector <id>]          (fold per-schedule discovery
+                         cursors into the connector-wide cursor; run before rolling
+                         the orchestrator back to a build without ADR 0005)
     admin license-keygen --out-dir <dir>
     admin license-sign   --key <private.pem> --licensee <name> --expires <YYYY-MM-DD>
                          [--features a,b] [--max-seats <n>] [--kind trial|commercial]
@@ -379,5 +383,84 @@ async fn upsert_secret(cfg: &Config, args: &[String]) -> Result<()> {
     .fetch_one(&pool)
     .await?;
     println!("secret id={} name={}", row.0, name);
+    Ok(())
+}
+
+/// Rollback aid for ADR 0005. Builds before per-schedule cursors read only
+/// the connector-wide `cursor.seen`, so objects processed after the upgrade
+/// would be rediscovered and executed again by an older orchestrator. Folding
+/// every `cursor.bySchedule.<id>.seen` into `cursor.seen` first makes the
+/// older build skip them. The per-schedule maps are left in place.
+async fn merge_cursors(cfg: &Config, args: &[String]) -> Result<()> {
+    let mut connector: Option<i64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--connector" => {
+                connector = Some(args[i + 1].parse::<i64>()?);
+                i += 2
+            }
+            other => bail!("unknown flag {other}"),
+        }
+    }
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&cfg.database_url)
+        .await?;
+    let rows: Vec<(i64, serde_json::Value)> =
+        match connector {
+            Some(id) => {
+                sqlx::query_as("SELECT id, config_json FROM connectors WHERE id = $1")
+                    .bind(id)
+                    .fetch_all(&pool)
+                    .await?
+            }
+            None => sqlx::query_as(
+                "SELECT id, config_json FROM connectors WHERE config_json->'cursor' ? 'bySchedule'",
+            )
+            .fetch_all(&pool)
+            .await?,
+        };
+    let mut merged_connectors = 0;
+    for (id, mut cfg_json) in rows {
+        let Some(cursor) = cfg_json.get_mut("cursor").and_then(|c| c.as_object_mut()) else {
+            continue;
+        };
+        let Some(by_schedule) = cursor
+            .get("bySchedule")
+            .and_then(|b| b.as_object())
+            .cloned()
+        else {
+            continue;
+        };
+        let mut seen = cursor
+            .get("seen")
+            .and_then(|s| s.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut added = 0usize;
+        for (_schedule, own) in by_schedule {
+            if let Some(map) = own.get("seen").and_then(|s| s.as_object()) {
+                for (key, etag) in map {
+                    if seen.insert(key.clone(), etag.clone()).is_none() {
+                        added += 1;
+                    }
+                }
+            }
+        }
+        cursor.insert("seen".into(), serde_json::Value::Object(seen));
+        cursor.insert(
+            "mergedAt".into(),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        sqlx::query("UPDATE connectors SET config_json = $1, updated_at = now() WHERE id = $2")
+            .bind(&cfg_json)
+            .bind(id)
+            .execute(&pool)
+            .await?;
+        merged_connectors += 1;
+        println!("connector {id}: {added} per-schedule entries folded into cursor.seen");
+    }
+    println!("{merged_connectors} connector(s) updated");
     Ok(())
 }

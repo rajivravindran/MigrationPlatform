@@ -36,7 +36,9 @@ func (s *stubActivities) LoadRowState(_ any, _ activities.LoadRowStateInput) (ac
 	return s.rowState, nil
 }
 func (s *stubActivities) PublishProgress(_ any, _ activities.PublishProgressInput) error { return nil }
-func (s *stubActivities) FinalizeJob(_ any, _ activities.FinalizeJobInput) error         { return nil }
+func (s *stubActivities) FinalizeJob(_ any, in activities.FinalizeJobInput) (*activities.FinalizeJobOutput, error) {
+	return stubVerdict(in), nil
+}
 func (s *stubActivities) ExportJobResults(_ any, _ activities.ExportJobResultsInput) error {
 	return nil
 }
@@ -51,7 +53,7 @@ func registerStub(env *testsuite.TestWorkflowEnvironment, stub interface {
 	LoadRowState(any, activities.LoadRowStateInput) (activities.LoadRowStateOutput, error)
 	PublishProgress(any, activities.PublishProgressInput) error
 	RequireLicensed(any) error
-	FinalizeJob(any, activities.FinalizeJobInput) error
+	FinalizeJob(any, activities.FinalizeJobInput) (*activities.FinalizeJobOutput, error)
 	ExportJobResults(any, activities.ExportJobResultsInput) error
 }) {
 	env.RegisterActivityWithOptions(stub.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
@@ -543,6 +545,23 @@ func TestExtractConnectorFromSourceRef(t *testing.T) {
 	require.Equal(t, "migration", minioCfg.Config["s3_bucket"])
 	require.Equal(t, "uploads/1/ab/file.csv", minioCfg.Config["s3_key"])
 	require.Equal(t, true, minioCfg.Config["header"])
+}
+
+func TestTemplateFileOptionsShapeUploads(t *testing.T) {
+	xmlSrc := extractConnector(map[string]any{"type": "minio", "bucket": "b", "key": "uploads/1/ab/x", "filename": "accounts.xml"})
+	applyFileOptions(&xmlSrc, template.Source{Type: "xml", Options: map[string]any{"recordTag": "Account", "path": "/etc/passwd"}})
+	require.Equal(t, "Account", xmlSrc.Config["recordTag"])
+	require.NotContains(t, xmlSrc.Config, "path", "only parsing options are taken from the template")
+
+	csvSrc := extractConnector(map[string]any{"type": "minio", "bucket": "b", "key": "k", "filename": "a.csv"})
+	applyFileOptions(&csvSrc, template.Source{Type: "csv", Options: map[string]any{"delimiter": ";", "recordTag": "x"}})
+	require.Equal(t, ";", csvSrc.Config["delimiter"])
+	require.Equal(t, true, csvSrc.Config["header"])
+	require.NotContains(t, csvSrc.Config, "recordTag")
+
+	sf := extractConnector(map[string]any{"type": "connector", "connector_id": float64(3)})
+	applyFileOptions(&sf, template.Source{Options: map[string]any{"delimiter": ";"}})
+	require.NotContains(t, sf.Config, "delimiter", "connector sources are untouched")
 }
 
 func TestMigrationWorkflowHappyPath(t *testing.T) {

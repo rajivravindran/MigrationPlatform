@@ -37,6 +37,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/workflows/start", s.auth(s.startWorkflow))
 	mux.HandleFunc("POST /v1/workflows/signal", s.auth(s.signalWorkflow))
 	mux.HandleFunc("POST /v1/workflows/cancel", s.auth(s.cancelWorkflow))
+	mux.HandleFunc("POST /v1/workflows/query", s.auth(s.queryWorkflow))
 	mux.HandleFunc("POST /v1/schedules/create", s.auth(s.createSchedule))
 	mux.HandleFunc("POST /v1/schedules/update", s.auth(s.updateSchedule))
 	mux.HandleFunc("POST /v1/schedules/pause", s.auth(s.pauseSchedule))
@@ -157,6 +158,40 @@ func (s *Server) signalWorkflow(w http.ResponseWriter, r *http.Request) {
 
 type cancelRequest struct {
 	WorkflowID string `json:"workflowId"`
+}
+
+type queryRequest struct {
+	WorkflowID string `json:"workflowId"`
+	Query      string `json:"query"`
+}
+
+// queryWorkflow answers a workflow query (e.g. pauseState, review A3) as
+// {"result": <decoded value>}.
+func (s *Server) queryWorkflow(w http.ResponseWriter, r *http.Request) {
+	var req queryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		badRequest(w, err)
+		return
+	}
+	if req.Query == "" {
+		badRequest(w, errors.New("query is required"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	val, err := s.temporal.QueryWorkflow(ctx, req.WorkflowID, "", req.Query)
+	if err != nil {
+		workflowError(w, req.WorkflowID, err)
+		return
+	}
+	var result json.RawMessage
+	if val != nil && val.HasValue() {
+		if err := val.Get(&result); err != nil {
+			serverError(w, err)
+			return
+		}
+	}
+	writeJSON(w, map[string]any{"result": result})
 }
 
 func (s *Server) cancelWorkflow(w http.ResponseWriter, r *http.Request) {

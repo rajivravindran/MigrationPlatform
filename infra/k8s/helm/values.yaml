@@ -64,6 +64,15 @@ orchestrator:
     targetCPUUtilizationPercentage: 70
   env:
     ACTIVITY_CONCURRENCY: "128"
+    # Destination rate budget per host for the whole deployment, divided
+    # statically across DESTINATION_RATE_WORKERS processes. Keep
+    # DESTINATION_RATE_WORKERS equal to hpa.maxReplicas: the per-process
+    # limiter cannot see other replicas, so the aggregate stays within
+    # DESTINATION_RPS only while at most that many orchestrators run. With
+    # fewer replicas running the budget is under-used, never exceeded.
+    DESTINATION_RPS: "50"
+    DESTINATION_BURST: "100"
+    DESTINATION_RATE_WORKERS: "40"
   securityContext:
     runAsNonRoot: true
     runAsUser: 10001

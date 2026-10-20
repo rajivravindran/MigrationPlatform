@@ -26,6 +26,10 @@ type WatchPrefixWorkflowInput struct {
 	RuleTemplateVersion int32     `json:"ruleTemplateVersion"`
 	ConnectorID         int64     `json:"connectorId"`
 	ScheduledTime       time.Time `json:"scheduledTime,omitempty"`
+	// PlanID routes arrivals into a migration plan: archives become plan
+	// intakes and files matching a step's pattern become plan runs. Files no
+	// step matches keep the schedule's single-template behaviour.
+	PlanID int64 `json:"planId,omitempty"`
 }
 
 type WatchPrefixWorkflowResult struct {
@@ -109,23 +113,20 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 
 	result.Listed = len(listedObjs)
 
-	seen := map[string]string{}
-	if cursor, ok := conn.Config["cursor"].(map[string]any); ok {
-		if prev, ok := cursor["seen"].(map[string]any); ok {
-			for k, v := range prev {
-				if s, ok := v.(string); ok {
-					seen[k] = s
-				}
-			}
-		}
-	}
+	// Discovery progress is scoped to this schedule (the execution intent);
+	// the legacy connector-wide cursor still counts as seen. See
+	// activities.SeenObjects for the policy.
+	seen := activities.SeenObjects(conn.Config, in.ScheduleID)
 
 	type workItem struct {
 		remoteKey string // cursor key (remote path or object key)
 		bucket    string
 		key       string // object-store key used by child workflows
-		etag      string
+		etag      string // discovery version (object ETag, or SFTP fingerprint)
 		size      int64
+		// contentETag is the staged object's own ETag when etag is a
+		// fingerprint; empty when etag already is the content version.
+		contentETag string
 	}
 
 	var newObjs []workItem
@@ -162,6 +163,7 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 			item.key = staged.Key
 			item.etag = staged.ETag
 			item.size = staged.Size
+			item.contentETag = staged.ObjectETag
 		}
 		if batch.IsArchive(obj.Key) {
 			newArchives = append(newArchives, item)
@@ -172,6 +174,16 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 
 	advanced := map[string]string{}
 	for _, obj := range newArchives {
+		if in.PlanID != 0 {
+			if err := startPlanIntake(ctx, in, obj.bucket, obj.key, obj.etag, obj.size); err != nil {
+				log.Error("plan intake failed", "key", obj.remoteKey, "err", err)
+				result.Failed++
+				continue
+			}
+			result.Started++
+			advanced[obj.remoteKey] = obj.etag
+			continue
+		}
 		var started activities.StartBatchOutput
 		err := workflow.ExecuteActivity(ctx, "StartBatch", activities.StartBatchInput{
 			OrgID: in.OrgID, ScheduleID: in.ScheduleID, ConnectorID: in.ConnectorID,
@@ -222,12 +234,39 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 	}
 
 	for _, obj := range newObjs {
+		if in.PlanID != 0 {
+			var routed activities.RoutePlanFileOutput
+			if err := workflow.ExecuteActivity(ctx, "RoutePlanFile", activities.RoutePlanFileInput{
+				OrgID: in.OrgID, PlanID: in.PlanID, ScheduleID: in.ScheduleID,
+				Bucket: obj.bucket, Key: obj.key, Filename: path.Base(obj.remoteKey), ETag: obj.etag, Size: obj.size,
+				FallbackTemplateID: in.RuleTemplateID, FallbackTemplateVersion: in.RuleTemplateVersion,
+			}).Get(ctx, &routed); err != nil {
+				log.Error("RoutePlanFile failed", "key", obj.remoteKey, "err", err)
+				result.Failed++
+				continue
+			}
+			if routed.Matched {
+				if routed.WorkflowID != "" {
+					if err := startPlanRunChild(ctx, in.OrgID, activities.PlanRunRef{PlanRunID: routed.PlanRunID, WorkflowID: routed.WorkflowID}); err != nil {
+						log.Error("plan run start failed", "key", obj.remoteKey, "err", err)
+						result.Failed++
+						continue
+					}
+					result.Started++
+				} else {
+					result.Failed++
+				}
+				advanced[obj.remoteKey] = obj.etag
+				continue
+			}
+		}
 		var started activities.StartWatchObjectJobOutput
 		err := workflow.ExecuteActivity(ctx, "StartWatchObjectJob", activities.StartWatchObjectJobInput{
 			OrgID: in.OrgID, ScheduleID: in.ScheduleID,
 			RuleTemplateID: in.RuleTemplateID, RuleTemplateVersion: in.RuleTemplateVersion,
 			ConnectorID: in.ConnectorID, Bucket: obj.bucket,
 			Key: obj.key, ETag: obj.etag, Size: obj.size, ScheduledTime: scheduled,
+			ContentETag: obj.contentETag,
 		}).Get(ctx, &started)
 		if err != nil {
 			log.Error("StartWatchObjectJob failed", "key", obj.remoteKey, "err", err)
@@ -296,7 +335,7 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 
 	if len(advanced) > 0 {
 		if err := workflow.ExecuteActivity(ctx, "AdvanceConnectorCursor", activities.AdvanceConnectorCursorInput{
-			OrgID: in.OrgID, ConnectorID: in.ConnectorID, Seen: advanced,
+			OrgID: in.OrgID, ConnectorID: in.ConnectorID, ScheduleID: in.ScheduleID, Seen: advanced,
 		}).Get(ctx, nil); err != nil {
 			return result, fmt.Errorf("advance cursor: %w", err)
 		}
@@ -305,4 +344,34 @@ func WatchPrefixWorkflow(ctx workflow.Context, in WatchPrefixWorkflowInput) (*Wa
 	log.Info("WatchPrefixWorkflow done",
 		"listed", result.Listed, "started", result.Started, "skipped", result.Skipped, "failed", result.Failed)
 	return result, nil
+}
+
+// startPlanIntake records a watched archive for the schedule's plan and
+// starts a detached PlanArchiveWorkflow for it.
+func startPlanIntake(ctx workflow.Context, in WatchPrefixWorkflowInput, bucket, key, etag string, size int64) error {
+	var intake activities.CreatePlanIntakeOutput
+	if err := workflow.ExecuteActivity(ctx, "CreatePlanIntake", activities.CreatePlanIntakeInput{
+		OrgID: in.OrgID, PlanID: in.PlanID, ScheduleID: in.ScheduleID, Bucket: bucket, Key: key, ETag: etag, Size: size,
+	}).Get(ctx, &intake); err != nil {
+		return err
+	}
+	childCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+		WorkflowID:            intake.WorkflowID,
+		TaskQueue:             "migration",
+		ParentClosePolicy:     enums.PARENT_CLOSE_POLICY_ABANDON,
+		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+		RetryPolicy:           &temporal.RetryPolicy{MaximumAttempts: 1},
+	})
+	child := workflow.ExecuteChildWorkflow(childCtx, PlanArchiveWorkflow, PlanArchiveWorkflowInput{
+		OrgID: in.OrgID, IntakeID: intake.IntakeID, Bucket: bucket, Key: key, Filename: intake.Filename,
+	})
+	if err := child.GetChildWorkflowExecution().Get(ctx, nil); err != nil {
+		var already *temporal.ChildWorkflowExecutionAlreadyStartedError
+		if temporal.IsWorkflowExecutionAlreadyStartedError(err) || errors.As(err, &already) ||
+			strings.Contains(err.Error(), "already started") {
+			return nil
+		}
+		return err
+	}
+	return nil
 }

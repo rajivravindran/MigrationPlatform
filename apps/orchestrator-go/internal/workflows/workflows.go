@@ -13,15 +13,36 @@ import (
 
 	"github.com/migration-platform/orchestrator/internal/activities"
 	"github.com/migration-platform/orchestrator/internal/connectors"
+	"github.com/migration-platform/orchestrator/internal/control"
 	"github.com/migration-platform/orchestrator/internal/template"
 )
 
 const (
-	SignalPause  = "pause"
-	SignalResume = "resume"
+	SignalPause  = control.SignalPause
+	SignalResume = control.SignalResume
+	// QueryPauseState returns PauseState: whether the workflow has
+	// acknowledged a pause and which control command it last applied, so the
+	// API and the reconciler can converge jobs.status with workflow state
+	// instead of trusting a status written before the signal was confirmed
+	// (architecture review A3).
+	QueryPauseState = control.QueryPauseState
 
 	// TaskQueueTransforms hosts the Python preprocess/$py sandbox activities.
 	TaskQueueTransforms = "transforms"
+)
+
+// ControlCommand is the payload of pause/resume signals (control.Command).
+type ControlCommand = control.Command
+
+// PauseState answers QueryPauseState (control.PauseState).
+type PauseState = control.PauseState
+
+// rowLevelPauseVersion gates, via workflow.GetVersion, honouring a pause
+// between rows rather than only between ingest batches. Histories recorded
+// before it replay the batch-boundary behaviour.
+const (
+	rowLevelPauseChange  = "row-level-pause"
+	rowLevelPauseVersion = 1
 )
 
 // MigrationWorkflowInput is the single input shape for the top-level workflow.
@@ -53,12 +74,24 @@ type RetryRowRef struct {
 }
 
 // Result summarises the workflow outcome.
+//
+// Processed/Failed/Unresolved are this run's counters and are informational.
+// Status and Reason are the verdict FinalizeJob persisted on the job
+// (lifecycle.Verdict); they are the authority a parent workflow consults.
+// Status is empty only when this run did not record a verdict (legacy
+// history path, or a FinalizeJob worker predating verdicts); a parent must
+// then treat the outcome as not established rather than infer success.
 type MigrationWorkflowResult struct {
 	Processed int64 `json:"processed"`
 	Failed    int64 `json:"failed"`
 	// Unresolved rows stopped at an operation whose effect is unknown.
 	Unresolved int64 `json:"unresolved,omitempty"`
 	Cancelled  bool  `json:"cancelled"`
+	// Status is the persisted terminal job status: succeeded, failed or
+	// cancelled. See lifecycle.TerminalStatus.
+	Status string `json:"status,omitempty"`
+	// Reason says why Status was reached, in operator-facing words.
+	Reason string `json:"reason,omitempty"`
 }
 
 // MigrationWorkflow is the entrypoint workflow for a migration job. It loads
@@ -84,10 +117,16 @@ func MigrationWorkflow(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 	if errors.As(err, &continued) {
 		return nil, err
 	}
-	if err == nil {
-		log.Info("MigrationWorkflow done", "processed", result.Processed, "failed", result.Failed, "unresolved", result.Unresolved)
+	verdict, finishErr := finishJob(ctx, in.JobID, err)
+	if result == nil && (verdict != nil || finishErr == nil) {
+		result = &MigrationWorkflowResult{}
 	}
-	return result, finishJob(ctx, in.JobID, err)
+	applyVerdict(result, verdict)
+	if finishErr == nil {
+		log.Info("MigrationWorkflow done", "processed", result.Processed, "failed", result.Failed,
+			"unresolved", result.Unresolved, "status", result.Status, "reason", result.Reason)
+	}
+	return result, finishErr
 }
 
 // runMigration does the work of one run. It returns a ContinueAsNewError to
@@ -109,61 +148,93 @@ func runMigration(ctx workflow.Context, in MigrationWorkflowInput) (*MigrationWo
 	ctx = workflow.WithActivityOptions(ctx, defaultActivityOptions(tplOut.Template.Retry))
 
 	paused := false
+	pauseState := PauseState{}
 	pauseCh := workflow.GetSignalChannel(ctx, SignalPause)
 	resumeCh := workflow.GetSignalChannel(ctx, SignalResume)
+	if err := workflow.SetQueryHandler(ctx, QueryPauseState, func() (PauseState, error) {
+		return pauseState, nil
+	}); err != nil {
+		return nil, fmt.Errorf("register pause query: %w", err)
+	}
 
 	// Background goroutine listening for pause/resume.
 	workflow.Go(ctx, func(gCtx workflow.Context) {
 		for gCtx.Err() == nil {
 			sel := workflow.NewSelector(gCtx)
 			sel.AddReceive(pauseCh, func(c workflow.ReceiveChannel, _ bool) {
-				c.Receive(gCtx, nil)
+				var cmd ControlCommand
+				c.Receive(gCtx, &cmd)
 				paused = true
-				log.Info("workflow paused")
+				pauseState = PauseState{Paused: true, LastCommandID: cmd.CommandID}
+				log.Info("workflow paused", "commandId", cmd.CommandID)
 			})
 			sel.AddReceive(resumeCh, func(c workflow.ReceiveChannel, _ bool) {
-				c.Receive(gCtx, nil)
+				var cmd ControlCommand
+				c.Receive(gCtx, &cmd)
 				paused = false
-				log.Info("workflow resumed")
+				pauseState = PauseState{Paused: false, LastCommandID: cmd.CommandID}
+				log.Info("workflow resumed", "commandId", cmd.CommandID)
 			})
 			sel.Select(gCtx)
 		}
 	})
+	// waitWhilePaused blocks between units of work while paused and marks the
+	// pause acknowledged: from here no new row is dispatched until a resume.
+	waitWhilePaused := func() error {
+		for paused {
+			if !pauseState.Acknowledged {
+				pauseState.Acknowledged = true
+			}
+			if err := workflow.Sleep(ctx, 2*time.Second); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	cp, err := startingCheckpoint(in)
 	if err != nil {
 		return nil, err
 	}
 	result := &MigrationWorkflowResult{Processed: cp.Processed, Failed: cp.Failed, Unresolved: cp.Unresolved}
-	const batchSize = 500
+	// Batch size adapts to the template's history cost: a 10-step chain
+	// schedules ~21 activities per row, so a fixed 500-row batch could add
+	// tens of thousands of events before the first continuation check
+	// (principal review F4). The first batch is sized from the step count;
+	// later batches from the measured cost of the previous one.
+	batchSize := initialBatchSize(len(tplOut.Template.ExecutionSteps()))
 	batchIdx := 0
 	pendingPolls := 0
 	checkpointed := workflow.GetVersion(ctx, checkpointedIngestChange, workflow.DefaultVersion,
 		checkpointedIngestVersion) >= checkpointedIngestVersion
+	rowLevelPause := workflow.GetVersion(ctx, rowLevelPauseChange, workflow.DefaultVersion,
+		rowLevelPauseVersion) >= rowLevelPauseVersion
 	info := workflow.GetInfo(ctx)
 	source := extractConnector(in.SourceRef)
+	applyFileOptions(&source, tplOut.Template.Source)
 
 	for {
 		// Cooperative pause: spin with a short sleep while paused.
-		for paused {
-			if err := workflow.Sleep(ctx, 2*time.Second); err != nil {
-				return result, err
-			}
+		if err := waitWhilePaused(); err != nil {
+			return result, err
 		}
 		startEvents, startBytes := info.GetCurrentHistoryLength(), info.GetCurrentHistorySize()
+		rowsThisBatch := 0
 		continueAsNew := func() error {
 			if !checkpointed {
 				return nil
 			}
-			if !shouldContinueAsNew(historySnapshot{
-				Events: info.GetCurrentHistoryLength(), Bytes: info.GetCurrentHistorySize(),
-				Suggested:  info.GetContinueAsNewSuggested(),
-				LastEvents: info.GetCurrentHistoryLength() - startEvents,
-				LastBytes:  info.GetCurrentHistorySize() - startBytes,
-			}) {
-				return nil
+			events, bytes := info.GetCurrentHistoryLength(), info.GetCurrentHistorySize()
+			plan := planNextBatch(batchPlanInput{
+				Events: events, Bytes: bytes,
+				LastEvents: events - startEvents, LastBytes: bytes - startBytes,
+				LastRows: rowsThisBatch, Suggested: info.GetContinueAsNewSuggested(),
+			})
+			if plan.ContinueAsNew {
+				return continueMigrationAsNew(ctx, in, cp, tplOut.Version)
 			}
-			return continueMigrationAsNew(ctx, in, cp, tplOut.Version)
+			batchSize = plan.BatchSize
+			return nil
 		}
 
 		offsetRaw, err := json.Marshal(cp.Offset)
@@ -208,8 +279,14 @@ func runMigration(ctx workflow.Context, in MigrationWorkflowInput) (*MigrationWo
 		if err != nil {
 			return result, fmt.Errorf("preprocess: %w", err)
 		}
+		rowsThisBatch = len(rows)
 
 		for _, row := range rows {
+			if rowLevelPause {
+				if err := waitWhilePaused(); err != nil {
+					return result, err
+				}
+			}
 			if err := processOneRow(ctx, in.JobID, tplOut.Template, row, rowRun{}, result); err != nil {
 				return result, err
 			}
@@ -311,6 +388,10 @@ type rowRun struct {
 	resume            map[string]json.RawMessage
 	resend            bool
 	confirmNotApplied bool
+	// generation identifies the operator decision behind resend /
+	// confirmNotApplied: the retry workflow's first run id, stable across
+	// continue-as-new and activity redelivery (principal review F1).
+	generation string
 }
 
 // processOneRow executes the template's step chain for one row.
@@ -450,6 +531,9 @@ func executeStep(
 		Resend:            run.resend,
 		ConfirmNotApplied: run.confirmNotApplied,
 	}
+	if run.resend || run.confirmNotApplied {
+		in.DecisionGeneration = run.generation
+	}
 	if d := step.Destination.Delivery; d != nil {
 		in.RetentionHours = d.RetentionHours()
 		if d.Lookup != nil {
@@ -588,7 +672,9 @@ func runSingleRowRetry(ctx workflow.Context, in MigrationWorkflowInput) (*Migrat
 	_ = workflow.ExecuteActivity(ctx, "PublishProgress", activities.PublishProgressInput{
 		JobID: in.RetryRow.JobID, Processed: result.Processed, Failed: result.Failed + result.Unresolved,
 	}).Get(ctx, nil)
-	return result, finishJob(ctx, in.RetryRow.JobID, nil)
+	verdict, err := finishJob(ctx, in.RetryRow.JobID, nil)
+	applyVerdict(result, verdict)
+	return result, err
 }
 
 // RetryFailedRowsInput drives RetryFailedRowsWorkflow.
@@ -665,7 +751,9 @@ func RetryFailedRowsWorkflow(ctx workflow.Context, in RetryFailedRowsInput) (*Mi
 			return nil, workflow.NewContinueAsNewError(ctx, RetryFailedRowsWorkflow, next)
 		}
 	}
-	return result, finishJob(ctx, in.JobID, nil)
+	verdict, err := finishJob(ctx, in.JobID, nil)
+	applyVerdict(result, verdict)
+	return result, err
 }
 
 // retryPersistedRow re-runs one row from its persisted state (shared by the
@@ -694,7 +782,7 @@ func retryPersistedRow(
 		result.Failed++
 		return nil
 	}
-	run := rowRun{resend: fromStart, confirmNotApplied: confirmNotApplied}
+	run := rowRun{resend: fromStart, confirmNotApplied: confirmNotApplied, generation: decisionGeneration(ctx)}
 	if !fromStart {
 		run.resume = map[string]json.RawMessage{}
 		for _, s := range state.Steps {
@@ -705,6 +793,18 @@ func retryPersistedRow(
 	}
 	row := connectors.Row{Index: rowIndex, Data: state.Row}
 	return processOneRow(ctx, jobID, tpl, row, run, result)
+}
+
+// decisionGeneration names the operator decision a retry workflow carries:
+// its first run id, which continue-as-new preserves and every activity
+// redelivery shares. Histories recorded by SDKs without FirstRunID fall back
+// to the run id.
+func decisionGeneration(ctx workflow.Context) string {
+	info := workflow.GetInfo(ctx)
+	if info.FirstRunID != "" {
+		return info.FirstRunID
+	}
+	return info.WorkflowExecution.RunID
 }
 
 // ProcessShardWorkflow lets large jobs run several MigrationWorkflow shards in
@@ -817,6 +917,32 @@ func extractConnector(sourceRef map[string]any) ingestSource {
 		}
 	}
 	return src
+}
+
+// fileOptionKeys are the template source options that shape how an uploaded
+// file is parsed, per format. Anything else in options is ignored here so a
+// template cannot redirect where the file is read from.
+var fileOptionKeys = map[string][]string{
+	"csv": {"header", "delimiter"},
+	"xml": {"recordTag"},
+}
+
+// applyFileOptions lets a template's source options (e.g. the XML element
+// that holds one record) shape the parsing of an uploaded file.
+func applyFileOptions(src *ingestSource, tplSource template.Source) {
+	if _, isObject := src.Config["s3_key"]; !isObject {
+		return
+	}
+	for _, k := range fileOptionKeys[src.Kind] {
+		switch v := tplSource.Options[k].(type) {
+		case string:
+			if v != "" {
+				src.Config[k] = v
+			}
+		case bool:
+			src.Config[k] = v
+		}
+	}
 }
 
 // int64Field reads a JSON number that may have decoded as float64.

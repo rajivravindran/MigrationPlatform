@@ -55,6 +55,25 @@ func TestDecideAttempt(t *testing.T) {
 		{"unresolved, confirmed not applied sends", op(opUnresolved),
 			withIntent(intent(template.DeliveryManual), func(i *attemptIntent) { i.ConfirmNotApplied = true }), decideSend},
 		{"unrecognised state is unresolved", op("weird"), intent(template.DeliveryIdempotent), decideUnresolved},
+		// F1: operator decisions are scoped to a generation.
+		{"succeeded, resend by a fresh generation sends",
+			with(op(opSucceeded), func(s *opSnapshot) { s.DecisionGeneration = "g0" }),
+			withIntent(intent(template.DeliveryManual), func(i *attemptIntent) { i.Resend = true; i.Generation = "g1" }), decideSend},
+		{"succeeded, resend redelivered by the same generation replays",
+			with(op(opSucceeded), func(s *opSnapshot) { s.DecisionGeneration = "g1" }),
+			withIntent(intent(template.DeliveryManual), func(i *attemptIntent) { i.Resend = true; i.Generation = "g1" }), decideReplay},
+		{"unknown, confirmation spent by the same generation stays unresolved",
+			with(op(opUnknown), func(s *opSnapshot) { s.DecisionGeneration = "g1" }),
+			withIntent(intent(template.DeliveryManual), func(i *attemptIntent) { i.ConfirmNotApplied = true; i.Generation = "g1" }), decideUnresolved},
+		{"unresolved, confirmation spent by the same generation stays unresolved",
+			with(op(opUnresolved), func(s *opSnapshot) { s.DecisionGeneration = "g1" }),
+			withIntent(intent(template.DeliveryManual), func(i *attemptIntent) { i.ConfirmNotApplied = true; i.Generation = "g1" }), decideUnresolved},
+		{"unresolved, confirmation by a new generation sends",
+			with(op(opUnresolved), func(s *opSnapshot) { s.DecisionGeneration = "g1" }),
+			withIntent(intent(template.DeliveryManual), func(i *attemptIntent) { i.ConfirmNotApplied = true; i.Generation = "g2" }), decideSend},
+		{"legacy unscoped resend still sends",
+			with(op(opSucceeded), func(s *opSnapshot) { s.DecisionGeneration = "g1" }),
+			withIntent(intent(template.DeliveryManual), func(i *attemptIntent) { i.Resend = true }), decideSend},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

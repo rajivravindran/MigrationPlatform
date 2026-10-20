@@ -546,11 +546,23 @@ type FinalizeJobInput struct {
 	Error string `json:"error,omitempty"`
 }
 
+// FinalizeJobOutput is the persisted verdict (ADR 0004): the status actually
+// written to jobs.status, why, and the row totals it came from. Parent
+// workflows consume it instead of reconstructing success from counters.
+type FinalizeJobOutput struct {
+	Status string           `json:"status"`
+	Reason string           `json:"reason"`
+	Totals lifecycle.Totals `json:"totals"`
+}
+
 // FinalizeJob recomputes totals from job_rows and writes the terminal status
-// (see lifecycle.Finalize for the rules).
-func (a *Activities) FinalizeJob(ctx context.Context, in FinalizeJobInput) error {
-	_, err := lifecycle.Finalize(ctx, a.d.DB, in.JobID, lifecycle.Outcome{Cancelled: in.Cancelled, Error: in.Error})
-	return err
+// (see lifecycle.Finalize for the rules), returning the persisted verdict.
+func (a *Activities) FinalizeJob(ctx context.Context, in FinalizeJobInput) (*FinalizeJobOutput, error) {
+	v, err := lifecycle.Finalize(ctx, a.d.DB, in.JobID, lifecycle.Outcome{Cancelled: in.Cancelled, Error: in.Error})
+	if err != nil {
+		return nil, err
+	}
+	return &FinalizeJobOutput{Status: v.Status, Reason: v.Reason, Totals: v.Totals}, nil
 }
 
 func (a *Activities) syncJobTotals(ctx context.Context, jobID int64) error {

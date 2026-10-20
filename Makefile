@@ -5,7 +5,7 @@ PROJECT := migration-platform
 HUB_IMAGE_PREFIX ?= rajivravindran
 IMAGE_TAG ?= demo
 
-.PHONY: harness-up harness-setup harness harness-ci harness-unit help up hub-up hub-pull demo-pack down logs ps build rebuild seed smoke test test-rust test-go test-py test-web test-schema lint fmt clean keys
+.PHONY: harness-up harness-setup harness harness-ci harness-unit help up hub-up hub-pull hub-push demo-pack down logs ps build rebuild seed smoke test test-rust test-go test-py test-web test-schema lint fmt clean keys
 
 help:
 	@echo "Migration Platform — laptop developer targets"
@@ -14,6 +14,7 @@ help:
 	@echo "  make up          Start the full stack (compose, builds locally)"
 	@echo "  make hub-pull    Pull app images from Docker Hub"
 	@echo "  make hub-up      Start stack using Hub images (no local build)"
+	@echo "  make hub-push    Build x86-64 + arm64 images and push them to Docker Hub"
 	@echo "  make demo-pack   Zip infra/demo-pack for sharing (no git needed)"
 	@echo "  make down        Stop and remove the stack (keeps volumes)"
 	@echo "  make nuke        Stop and remove the stack INCLUDING volumes"
@@ -56,10 +57,31 @@ hub-up: keys hub-pull
 	@echo "\nMigration Platform is starting from Docker Hub ($(HUB_IMAGE_PREFIX)/*:$(IMAGE_TAG))..."
 	@echo "  Web:      http://localhost:3000"
 	@echo "  API:      http://localhost:8080"
-	@echo "  Temporal: http://localhost:8088"
+	@echo "  Temporal: http://localhost:8233"
 	@echo "  Grafana:  http://localhost:3001"
 	@echo "  MinIO:    http://localhost:9001 (minio / minio123)"
 	@echo "Next: make seed   # admin@example.com / admin123"
+
+# Publish multi-arch app images to Docker Hub. Needs `docker login` and a
+# buildx builder with QEMU (Docker Desktop has one; on Linux run
+# `docker run --privileged --rm tonistiigi/binfmt --install all` once, then
+# `docker buildx create --use`). Single-arch pushes from a laptop leave arm64
+# users running under emulation or failing outright; this target does not.
+HUB_PLATFORMS ?= linux/amd64,linux/arm64
+hub-push:
+	docker buildx build --platform $(HUB_PLATFORMS) --push \
+	  -f apps/api/Dockerfile --target final \
+	  -t $(HUB_IMAGE_PREFIX)/migration-api:$(IMAGE_TAG) .
+	docker buildx build --platform $(HUB_PLATFORMS) --push \
+	  -f apps/orchestrator-go/Dockerfile \
+	  -t $(HUB_IMAGE_PREFIX)/migration-orchestrator:$(IMAGE_TAG) .
+	docker buildx build --platform $(HUB_PLATFORMS) --push \
+	  -f apps/transform-worker/Dockerfile \
+	  -t $(HUB_IMAGE_PREFIX)/migration-transform-worker:$(IMAGE_TAG) .
+	docker buildx build --platform $(HUB_PLATFORMS) --push \
+	  -f apps/web/Dockerfile \
+	  -t $(HUB_IMAGE_PREFIX)/migration-web:$(IMAGE_TAG) .
+	@echo "Pushed $(HUB_IMAGE_PREFIX)/migration-*:$(IMAGE_TAG) for $(HUB_PLATFORMS)"
 
 # Shareable zip: compose + scripts only. Recipients need Docker, not git.
 # Tracked copy lives at infra/migration-demo-pack.zip (dist/ is gitignored).

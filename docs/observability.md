@@ -30,6 +30,7 @@ services; the API keeps this off its public `8080` listener):
 | Orchestrator (Go)| `rows_processed_total` / `rows_failed_total`            | Counter    |
 | Orchestrator     | `endpoint_call_seconds`                                 | Histogram  |
 | Orchestrator     | `jobs_reconciled_total{workflow_status,job_status}`     | Counter    |
+| Orchestrator     | `batches_reconciled_total{workflow_status,batch_status}` | Counter    |
 | Orchestrator     | `job_reconcile_errors_total`                            | Counter    |
 | Transform worker | `migration_transform_batch_latency_seconds`             | Histogram  |
 | Transform worker | `migration_transform_sandbox_kills_total{reason}`       | Counter    |

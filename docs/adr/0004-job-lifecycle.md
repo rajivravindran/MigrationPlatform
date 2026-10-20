@@ -70,6 +70,24 @@ only reads `job_rows` and uploads files, so retrying an export makes zero
 destination calls. Downloads use the exported files only while the latest
 export succeeded, and read `job_rows` otherwise.
 
+**Batches (amended 2026-10-19, architecture review A2).** A batch's terminal
+status follows the same shape. `lifecycle.FinalizeBatch` derives it from the
+persisted `batch_stages` rows plus the execution outcome
+(`lifecycle.BatchTerminalStatus`): `succeeded` when every stage succeeded,
+`partial` when some did, `failed` otherwise, and `failed` whenever the
+workflow ended on an execution error or cancellation or left stages
+unfinished (those stages are recorded `failed` with the reason first).
+`quarantined` is never overwritten. `BatchWorkflow` finalizes on every exit
+through `finishBatch` on a disconnected context, gated by
+`GetVersion("batch-finalize-on-exit")`; old histories replay the
+counter-based `FinalizeBatch{Status}` write. `MarkBatchRunning` only moves
+`pending`/`running` batches. The reconciler pages stale `pending`/`running`
+batches and applies the same repair table as for jobs, through
+`lifecycle.FinalizeBatch`; counts are in
+`batches_reconciled_total{workflow_status,batch_status}`. The API route for
+batch start still writes `running`/`failed` unconditionally; aligning it with
+the job route's conditional transitions is open.
+
 **Reconciler.** The reconciler runs in the orchestrator process every
 `RECONCILE_INTERVAL` (default 1m). Each pass holds a Postgres advisory lock,
 so replicas do not duplicate work. It pages through jobs that are
@@ -106,19 +124,56 @@ cancels the job directly, refreshes totals from rows, and records
 - Jobs left non-terminal by earlier builds are repaired on the first pass
   after deploying. This happened in local development: two `running` jobs
   with no workflow became `failed`.
-- Batch-parent interpretation is unchanged. A stage counts as failed when
-  its child result reports failed or unresolved rows, or when the child
-  errors.
+- Batch-parent interpretation (amended 2026-10-19, architecture review A1):
+  the stage consumes the verdict the child persisted. `lifecycle.Finalize`
+  returns a `Verdict{Status, Reason, Totals}`; `FinalizeJob` returns it as
+  `FinalizeJobOutput`; `MigrationWorkflow` surfaces it as
+  `MigrationWorkflowResult.Status/Reason`. `stageVerdict` in
+  `workflows/batch.go` marks a stage succeeded only for a persisted
+  `succeeded`. A child that errored is recorded as `execution error: …`; a
+  child that completed with a failed or cancelled verdict is recorded as
+  `job <status>: <reason>`; a child that completed without a verdict (legacy
+  history, or a `FinalizeJob` worker predating verdicts) is recorded as
+  `job completed without a persisted verdict … success not established`.
+  The batch never reconstructs success from row counters, so an empty job
+  (`no source rows were read`) cannot unblock dependent stages.
 
 ## Verification
 
-- Go: `lifecycle` tests for terminal status and repair decisions;
-  workflow tests for ingest failure, cancellation on a disconnected
-  context, finalize failure, export failure and export-only workflows. All
-  existing replay tests pass.
+- Go: `lifecycle` tests for terminal status, reasons (`Explain`) and repair
+  decisions; workflow tests for ingest failure, cancellation on a
+  disconnected context, finalize failure, export failure and export-only
+  workflows; `batch_verdict_test.go` for empty, cancelled, errored and
+  verdict-less children versus a verified success (A1). All existing replay
+  tests pass; the verdict is an additive activity result and result field,
+  so no new `GetVersion` marker was needed.
 - API (`tests/job_lifecycle.rs`): a fast outcome is not overwritten; an
   ambiguous start stays `pending`; pause/resume/cancel return 409 outside
   their states; cancel settles a vanished workflow; export retry starts
   only `ExportResultsWorkflow`.
 - Harness: `ingest-failure`, `terminated-workflow` (reconciler) and
   `export-recovery` (zero destination calls on export retry).
+
+
+## Amendment 2026-10-19 — control commands (architecture review A3) and batch admission (A2)
+
+**Pause/resume are commands with identity.** `POST /jobs/{id}/pause|resume`
+records `control_requested`, `control_command_id` and `control_requested_at`
+*before* signalling; the signal carries the command id; the route then reads
+the workflow's `pauseState` query (bridge `POST /v1/workflows/query`) and
+writes `jobs.status` only from what the workflow reports, clearing the
+request. A retry of the same command keeps its id. If any step after the
+record fails, the request stays and the reconciler converges the job: it
+queries the workflow, re-sends a signal that never arrived, drops a request
+against an ended workflow, and persists the status the workflow reports.
+`FinalizeJob` clears any pending request.
+
+**Pause acknowledgment** means no further row is dispatched: the workflow
+checks between rows (`GetVersion("row-level-pause")`) and between batches;
+`PauseState.Acknowledged` is true once that check has blocked. An activity
+already in flight completes and is accounted for.
+
+**Batch admission** (`routes/batches.rs`) follows the job rules: a refused
+connection marks the batch `failed` only while `pending`; an ambiguous start
+leaves it `pending` for the reconciler; a successful start moves it to
+`running` only from `pending`.

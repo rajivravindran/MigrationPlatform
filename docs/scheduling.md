@@ -69,8 +69,11 @@ avoids reprocessing. The orchestrator stores a **cursor** per
 (schedule, connector):
 
 - Salesforce: last `SystemModstamp` (or template-specified field).
-- Watched prefix: map of `{ key: etag }` under `connectors.config_json.cursor.seen`,
-  advanced by `WatchPrefixWorkflow` after successfully starting each object job.
+- Watched prefix / SFTP: map of `{ key: etag }` per schedule under
+  `connectors.config_json.cursor.bySchedule.<scheduleId>.seen`, advanced by
+  `WatchPrefixWorkflow` after successfully starting each object job. The older
+  connector-wide `cursor.seen` is still honoured as seen for every schedule
+  (see ADR 0005).
 - Custom HTTP: last pagination cursor value.
 
 Watched-prefix schedules fire **`WatchPrefixWorkflow`** (not `MigrationWorkflow`
@@ -80,7 +83,17 @@ child `BatchWorkflow` per archive (`.tar.gz` / `.tgz` / `.zip` with in-archive
 `manifest.json`).
 
 The cursor is stored in `connectors.config_json.cursor` and updated via the
-`AdvanceConnectorCursor` activity. Clear `cursor` on the connector to reprocess.
+`AdvanceConnectorCursor` activity. Clear `cursor.bySchedule.<scheduleId>` to
+reprocess for one schedule, or the whole `cursor` to reprocess for all; the
+jobs already created keep their identity, so a cleared cursor restarts only
+objects whose execution was never recorded for that schedule.
+
+Each discovered object becomes one job per schedule: the child workflow id
+hashes organization, schedule, bucket, key and ETag, so two schedules that
+route the same file to different templates or destinations both run, while a
+redelivered or caught-up fire of the same schedule reuses the existing job.
+A template version change within a schedule does not reprocess objects that
+schedule has already seen.
 
 ## Controls
 

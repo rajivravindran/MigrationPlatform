@@ -83,6 +83,14 @@ func TestIsArchive(t *testing.T) {
 	require.True(t, batch.IsArchive("x.tgz"))
 	require.True(t, batch.IsArchive("x.ZIP"))
 	require.False(t, batch.IsArchive("x.csv"))
+	require.False(t, batch.IsArchive("uploads/1/ab/ab12cd"), "uploaded sources have content-hash keys without an extension")
+}
+
+func TestArchiveExt(t *testing.T) {
+	require.Equal(t, ".tar.gz", batch.ArchiveExt("incoming/Pack.TAR.GZ"))
+	require.Equal(t, ".tgz", batch.ArchiveExt("x.tgz"))
+	require.Equal(t, ".zip", batch.ArchiveExt("../../evil.zip"))
+	require.Equal(t, "", batch.ArchiveExt("x.csv"))
 }
 
 func TestParseManifestDependsOnValid(t *testing.T) {

@@ -131,6 +131,82 @@ func shouldContinueAsNew(h historySnapshot) bool {
 	return h.Events+h.LastEvents > historyEventBudget || h.Bytes+h.LastBytes > historyByteBudget
 }
 
+// Batch sizing (principal review F4). History cost per row grows with the
+// number of chained steps (two activities per step plus one per row), so the
+// rows ingested per batch are derived from that cost instead of being fixed.
+const (
+	maxBatchSize = 500
+	// minBatchSize is the smallest batch worth ingesting; below it the run
+	// continues as new instead so the next batch starts on a fresh history.
+	minBatchSize = 10
+	// eventsPerActivity is the history events one awaited activity costs
+	// (scheduled, started, completed, plus a share of workflow-task events).
+	eventsPerActivity = 5
+)
+
+// initialBatchSize sizes the first batch of a run from the template's step
+// count so even the maximum supported chain stays inside the budget before
+// its cost has been measured (a single-step template keeps the historical
+// 500-row batch).
+func initialBatchSize(steps int) int {
+	if steps < 1 {
+		steps = 1
+	}
+	perRow := (2*steps + 1) * eventsPerActivity
+	size := historyEventBudget * 3 / 4 / perRow
+	if size > maxBatchSize {
+		size = maxBatchSize
+	}
+	if size < minBatchSize {
+		size = minBatchSize
+	}
+	return size
+}
+
+type batchPlanInput struct {
+	Events, Bytes         int
+	LastEvents, LastBytes int
+	LastRows              int
+	Suggested             bool
+}
+
+type batchPlan struct {
+	ContinueAsNew bool
+	BatchSize     int
+}
+
+// planNextBatch decides, after a batch, whether the run continues as new or
+// ingests another batch, and how many rows that batch may hold: the rows
+// that fit in the remaining event and byte budget at the per-row cost just
+// measured. A projected batch smaller than minBatchSize hands off instead.
+func planNextBatch(in batchPlanInput) batchPlan {
+	if in.Suggested {
+		return batchPlan{ContinueAsNew: true}
+	}
+	if in.LastRows <= 0 || in.LastEvents <= 0 {
+		// Nothing measured (an empty or pending batch): keep the server
+		// suggestion and the fixed-cost check as the only guards.
+		return batchPlan{ContinueAsNew: shouldContinueAsNew(historySnapshot{
+			Events: in.Events, Bytes: in.Bytes, LastEvents: in.LastEvents, LastBytes: in.LastBytes,
+		}), BatchSize: maxBatchSize}
+	}
+	perRowEvents := (in.LastEvents + in.LastRows - 1) / in.LastRows
+	perRowBytes := (in.LastBytes + in.LastRows - 1) / in.LastRows
+	size := (historyEventBudget - in.Events) / perRowEvents
+	if perRowBytes > 0 {
+		if byBytes := (historyByteBudget - in.Bytes) / perRowBytes; byBytes < size {
+			size = byBytes
+		}
+	}
+	if size < minBatchSize {
+		return batchPlan{ContinueAsNew: true}
+	}
+	if size > maxBatchSize {
+		size = maxBatchSize
+	}
+	return batchPlan{BatchSize: size}
+}
+
 // pendingBackoff is the wait before polling a source that reported Pending
 // for the n-th consecutive time (n >= 1).
 func pendingBackoff(n int) time.Duration {

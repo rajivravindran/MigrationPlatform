@@ -17,7 +17,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/migration-platform/orchestrator/internal/batch"
 	"github.com/migration-platform/orchestrator/internal/connectors"
+	"github.com/migration-platform/orchestrator/internal/lifecycle"
 	"github.com/migration-platform/orchestrator/internal/metrics"
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/temporal"
 )
 
 // ---------------- StartBatch ----------------
@@ -39,23 +42,50 @@ type StartBatchOutput struct {
 	Created    bool   `json:"created"`
 }
 
-// BatchWorkflowID builds a stable Temporal workflow id for an archive package.
+// BatchWorkflowID is the legacy workflow id for an archive package, naming the
+// source version only. See WatchWorkflowID for why it is kept.
 func BatchWorkflowID(orgID int64, bucket, key, etag string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%s", orgID, bucket, key, etag)))
 	return fmt.Sprintf("batch-%d-%s", orgID, hex.EncodeToString(sum[:16]))
 }
 
-// StartBatch inserts a batches row for a watched archive. Idempotent on workflow id.
+// BatchExecutionWorkflowID names the execution intent for a watched archive:
+// the source version plus the schedule that discovered it (review A4).
+// Without a schedule the legacy source-only id is used.
+func BatchExecutionWorkflowID(orgID, scheduleID int64, bucket, key, etag string) string {
+	if scheduleID <= 0 {
+		return BatchWorkflowID(orgID, bucket, key, etag)
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|s%d|%s|%s|%s", orgID, scheduleID, bucket, key, etag)))
+	return fmt.Sprintf("batch-%d-%s", orgID, hex.EncodeToString(sum[:16]))
+}
+
+// StartBatch inserts a batches row for a watched archive. Idempotent on
+// workflow id; a batch this schedule already created under the legacy
+// source-only id is reused rather than duplicated.
 func (a *Activities) StartBatch(ctx context.Context, in StartBatchInput) (StartBatchOutput, error) {
 	if err := a.sources.checkOrgLocation(in.OrgID, in.Bucket, in.Key); err != nil {
 		return StartBatchOutput{}, err
 	}
-	workflowID := BatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag)
+	workflowID := BatchExecutionWorkflowID(in.OrgID, in.ScheduleID, in.Bucket, in.Key, in.ETag)
 	tx, err := a.d.DB.Begin(ctx)
 	if err != nil {
 		return StartBatchOutput{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	if legacyID := BatchWorkflowID(in.OrgID, in.Bucket, in.Key, in.ETag); legacyID != workflowID {
+		var legacyBatchID int64
+		err := tx.QueryRow(ctx, `
+			SELECT id FROM batches WHERE temporal_workflow_id = $1 AND org_id = $2 AND schedule_id = $3`,
+			legacyID, in.OrgID, in.ScheduleID).Scan(&legacyBatchID)
+		switch {
+		case err == nil:
+			return StartBatchOutput{BatchID: legacyBatchID, WorkflowID: legacyID, Created: false}, nil
+		case !errors.Is(err, pgx.ErrNoRows):
+			return StartBatchOutput{}, fmt.Errorf("look up legacy batch: %w", err)
+		}
+	}
 
 	sourceID, err := registerSource(ctx, tx, newSource{
 		OrgID: in.OrgID, Bucket: in.Bucket, Key: in.Key, Filename: path.Base(in.Key),
@@ -123,11 +153,15 @@ type MarkBatchRunningInput struct {
 	RunID   string `json:"runId"`
 }
 
+// MarkBatchRunning records that the workflow owns the batch. It is
+// conditional: a batch that already reached a terminal state (a fast run
+// finalized before a redelivered start was recorded, or a quarantine) is
+// never put back to running (ADR 0004 transition rules, review A2).
 func (a *Activities) MarkBatchRunning(ctx context.Context, in MarkBatchRunningInput) error {
 	_, err := a.d.DB.Exec(ctx, `
 		UPDATE batches SET status = 'running'::batch_status, temporal_run_id = $1,
 			started_at = COALESCE(started_at, now()), updated_at = now()
-		WHERE id = $2`, in.RunID, in.BatchID)
+		WHERE id = $2 AND status IN ('pending'::batch_status, 'running'::batch_status)`, in.RunID, in.BatchID)
 	return err
 }
 
@@ -138,6 +172,9 @@ type UnpackAndStageArchiveInput struct {
 	BatchID int64  `json:"batchId"`
 	Bucket  string `json:"bucket"`
 	Key     string `json:"key"`
+	// Filename is the original archive name when Key has no extension
+	// (uploaded sources); it selects the format only, never a path.
+	Filename string `json:"filename,omitempty"`
 }
 
 type StagedFile struct {
@@ -150,6 +187,8 @@ type StagedFile struct {
 	Key         string   `json:"key"`
 	Filename    string   `json:"filename"`
 	Size        int64    `json:"size"`
+	// ETag is the staged object's content version, recorded at upload (F3).
+	ETag string `json:"etag,omitempty"`
 }
 
 type UnpackAndStageArchiveOutput struct {
@@ -179,45 +218,136 @@ func unpackLimitsFromEnv() batch.UnpackLimits {
 	return lim
 }
 
-// UnpackAndStageArchive downloads, safely unpacks, validates manifest.json, and
-// re-uploads each stage file under batches/{batchId}/stages/...
-func (a *Activities) UnpackAndStageArchive(ctx context.Context, in UnpackAndStageArchiveInput) (UnpackAndStageArchiveOutput, error) {
-	if _, err := a.sources.store.SourceByObject(ctx, in.OrgID, in.Bucket, in.Key); err != nil {
+// openedArchive is a registered archive that was downloaded at its recorded
+// version, safely unpacked and whose manifest.json validated. The caller
+// removes tmpRoot.
+type openedArchive struct {
+	tmpRoot  string
+	files    map[string]string
+	raw      []byte
+	manifest *batch.Manifest
+}
+
+// openArchive is the shared front half of every archive intake (batches and
+// plan archives): authorize, bind to the registered version, unpack, parse.
+// filename carries the format when key has no extension (uploads).
+func (a *Activities) openArchive(ctx context.Context, orgID int64, bucket, key, filename, label string) (*openedArchive, error) {
+	src, err := a.sources.store.SourceByObject(ctx, orgID, bucket, key)
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return UnpackAndStageArchiveOutput{}, notAuthorized("archive %s/%s is not registered for org %d", in.Bucket, in.Key, in.OrgID)
+			return nil, notAuthorized("archive %s/%s is not registered for org %d", bucket, key, orgID)
 		}
-		return UnpackAndStageArchiveOutput{}, fmt.Errorf("load archive source: %w", err)
+		return nil, fmt.Errorf("load archive source: %w", err)
+	}
+	// The download is bound to the registered archive version (F3). An
+	// archive registered before versions were recorded cannot be verified
+	// against its registration; it is bound to the version seen now and that
+	// version is recorded, so later attempts and stages cannot drift.
+	archiveETag := src.ETag
+	if archiveETag == "" {
+		info, err := a.sources.stat(ctx, bucket, key)
+		if err != nil {
+			return nil, fmt.Errorf("stat archive: %w", err)
+		}
+		archiveETag = info.ETag
+		activity.GetLogger(ctx).Warn("archive was registered without a version; binding to the current object version",
+			"archive", label, "key", key, "etag", archiveETag)
+		if _, err := registerSource(ctx, a.d.DB, newSource{
+			OrgID: orgID, Bucket: bucket, Key: key, Filename: path.Base(key),
+			ETag: archiveETag, Size: info.Size, Provenance: "watched",
+		}); err != nil {
+			return nil, err
+		}
 	}
 	lim := unpackLimitsFromEnv()
-	tmpRoot, err := os.MkdirTemp("", fmt.Sprintf("batch-%d-*", in.BatchID))
+	tmpRoot, err := os.MkdirTemp("", label+"-*")
 	if err != nil {
-		return UnpackAndStageArchiveOutput{}, err
+		return nil, err
 	}
-	defer os.RemoveAll(tmpRoot)
-
-	archivePath := filepath.Join(tmpRoot, path.Base(in.Key))
-	if _, err := connectors.DownloadObject(ctx, in.Bucket, in.Key, archivePath, lim.MaxCompressedBytes); err != nil {
-		return UnpackAndStageArchiveOutput{}, fmt.Errorf("download archive: %w", err)
+	fail := func(err error) (*openedArchive, error) {
+		os.RemoveAll(tmpRoot)
+		return nil, err
 	}
 
-	extractDir := filepath.Join(tmpRoot, "extract")
-	unpacked, err := batch.UnpackArchive(archivePath, extractDir, lim)
+	name := filename
+	if name == "" {
+		name = key
+	}
+	ext := batch.ArchiveExt(name)
+	if ext == "" {
+		return fail(temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("not an archive package: %s", name), "NotAnArchive", nil))
+	}
+	archivePath := filepath.Join(tmpRoot, "archive"+ext)
+	if _, err := connectors.DownloadObject(ctx, bucket, key, archivePath, lim.MaxCompressedBytes, archiveETag); err != nil {
+		if errors.Is(err, connectors.ErrSourceChanged) {
+			return fail(temporal.NewNonRetryableApplicationError(
+				fmt.Sprintf("archive %s/%s changed since registration: %v", bucket, key, err), ErrTypeSourceChanged, err))
+		}
+		return fail(fmt.Errorf("download archive: %w", err))
+	}
+
+	unpacked, err := batch.UnpackArchive(archivePath, filepath.Join(tmpRoot, "extract"), lim)
 	if err != nil {
-		return UnpackAndStageArchiveOutput{}, fmt.Errorf("unpack: %w", err)
+		return fail(fmt.Errorf("unpack: %w", err))
 	}
-
 	manifestPath, ok := unpacked.Files["manifest.json"]
 	if !ok {
-		return UnpackAndStageArchiveOutput{}, fmt.Errorf("manifest.json missing at archive root")
+		return fail(fmt.Errorf("manifest.json missing at archive root"))
 	}
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return UnpackAndStageArchiveOutput{}, err
+		return fail(err)
 	}
 	manifest, err := batch.ParseManifest(raw)
 	if err != nil {
+		return fail(err)
+	}
+	return &openedArchive{tmpRoot: tmpRoot, files: unpacked.Files, raw: raw, manifest: manifest}, nil
+}
+
+// stageFile uploads one manifest stage's file under destPrefix/<stage id>/.
+func (o *openedArchive) stageFile(ctx context.Context, bucket, destPrefix string, st batch.ManifestStage) (StagedFile, error) {
+	abs, ok := o.files[st.File]
+	if !ok {
+		// Also try clean slash form.
+		abs, ok = o.files[path.Clean(st.File)]
+	}
+	if !ok {
+		return StagedFile{}, fmt.Errorf("stage %q file %q not found in archive", st.ID, st.File)
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return StagedFile{}, err
+	}
+	destKey := path.Join(destPrefix, st.ID, path.Base(st.File))
+	stored, err := connectors.PutObject(ctx, bucket, destKey, abs, "application/octet-stream")
+	if err != nil {
+		return StagedFile{}, fmt.Errorf("upload stage %s: %w", st.ID, err)
+	}
+	return StagedFile{
+		StageKey:    st.ID,
+		File:        st.File,
+		TemplateKey: st.TemplateKey,
+		OnFailure:   o.manifest.EffectiveOnFailure(st),
+		DependsOn:   append([]string(nil), st.DependsOn...),
+		Bucket:      bucket,
+		Key:         destKey,
+		Filename:    path.Base(st.File),
+		Size:        fi.Size(),
+		ETag:        stored.ETag,
+	}, nil
+}
+
+// UnpackAndStageArchive downloads, safely unpacks, validates manifest.json, and
+// re-uploads each stage file under batches/{batchId}/stages/...
+func (a *Activities) UnpackAndStageArchive(ctx context.Context, in UnpackAndStageArchiveInput) (UnpackAndStageArchiveOutput, error) {
+	arc, err := a.openArchive(ctx, in.OrgID, in.Bucket, in.Key, in.Filename, fmt.Sprintf("batch-%d", in.BatchID))
+	if err != nil {
 		return UnpackAndStageArchiveOutput{}, err
 	}
+	defer os.RemoveAll(arc.tmpRoot)
+	raw, manifest := arc.raw, arc.manifest
 
 	out := UnpackAndStageArchiveOutput{
 		ManifestJSON:   raw,
@@ -226,34 +356,13 @@ func (a *Activities) UnpackAndStageArchive(ctx context.Context, in UnpackAndStag
 		Stages:         make([]StagedFile, 0, len(manifest.Stages)),
 	}
 
+	prefix := path.Join("batches", fmt.Sprintf("%d", in.BatchID), "stages")
 	for _, st := range manifest.Stages {
-		abs, ok := unpacked.Files[st.File]
-		if !ok {
-			// Also try clean slash form.
-			abs, ok = unpacked.Files[path.Clean(st.File)]
-		}
-		if !ok {
-			return UnpackAndStageArchiveOutput{}, fmt.Errorf("stage %q file %q not found in archive", st.ID, st.File)
-		}
-		fi, err := os.Stat(abs)
+		staged, err := arc.stageFile(ctx, in.Bucket, prefix, st)
 		if err != nil {
 			return UnpackAndStageArchiveOutput{}, err
 		}
-		destKey := path.Join("batches", fmt.Sprintf("%d", in.BatchID), "stages", st.ID, path.Base(st.File))
-		if err := connectors.PutObject(ctx, in.Bucket, destKey, abs, "application/octet-stream"); err != nil {
-			return UnpackAndStageArchiveOutput{}, fmt.Errorf("upload stage %s: %w", st.ID, err)
-		}
-		out.Stages = append(out.Stages, StagedFile{
-			StageKey:    st.ID,
-			File:        st.File,
-			TemplateKey: st.TemplateKey,
-			OnFailure:   manifest.EffectiveOnFailure(st),
-			DependsOn:   append([]string(nil), st.DependsOn...),
-			Bucket:      in.Bucket,
-			Key:         destKey,
-			Filename:    path.Base(st.File),
-			Size:        fi.Size(),
-		})
+		out.Stages = append(out.Stages, staged)
 	}
 
 	if _, err := a.d.DB.Exec(ctx, `
@@ -344,6 +453,7 @@ type ResolvedStage struct {
 	Key                 string   `json:"key"`
 	Filename            string   `json:"filename"`
 	Size                int64    `json:"size"`
+	ETag                string   `json:"etag,omitempty"`
 }
 
 type MaterializeBatchStagesOutput struct {
@@ -351,6 +461,15 @@ type MaterializeBatchStagesOutput struct {
 }
 
 // MaterializeBatchStages resolves templateKey → published template and inserts batch_stages rows.
+// MaterializeBatchStages binds every manifest stage to a published template
+// version and persists the binding. The binding is resolved once per batch:
+// on redelivery (a lost activity acknowledgment, a worker crash after commit)
+// an existing stage row keeps the template version it was first bound to,
+// even if a newer version was published in between, so the plan a batch runs
+// cannot change between attempts (R08 plan binding; architecture review,
+// "future plan binding"). Stage key, file and template key are fixed by the
+// archive's manifest; a row that disagrees with the manifest is a conflict,
+// not something to overwrite.
 func (a *Activities) MaterializeBatchStages(ctx context.Context, in MaterializeBatchStagesInput) (MaterializeBatchStagesOutput, error) {
 	out := MaterializeBatchStagesOutput{Stages: make([]ResolvedStage, 0, len(in.Stages))}
 	hasDependencies := false
@@ -362,17 +481,6 @@ func (a *Activities) MaterializeBatchStages(ctx context.Context, in MaterializeB
 
 	for i, st := range in.Stages {
 		hasDependencies = hasDependencies || len(st.DependsOn) > 0
-		var tplID int64
-		var tplVer int32
-		err := tx.QueryRow(ctx, `
-			SELECT id, version FROM rule_templates
-			WHERE org_id = $1 AND template_key = $2 AND published = true
-			ORDER BY version DESC LIMIT 1`,
-			in.OrgID, st.TemplateKey,
-		).Scan(&tplID, &tplVer)
-		if err != nil {
-			return out, fmt.Errorf("resolve templateKey %q: %w", st.TemplateKey, err)
-		}
 		onFail := st.OnFailure
 		if onFail == "" {
 			onFail = in.OnStageFailure
@@ -384,32 +492,52 @@ func (a *Activities) MaterializeBatchStages(ctx context.Context, in MaterializeB
 		if deps == nil {
 			deps = []string{}
 		}
+
+		// Latest published version, used only when this stage has no binding yet.
+		var latestID int64
+		var latestVer int32
+		err := tx.QueryRow(ctx, `
+			SELECT id, version FROM rule_templates
+			WHERE org_id = $1 AND template_key = $2 AND published = true
+			ORDER BY version DESC LIMIT 1`,
+			in.OrgID, st.TemplateKey,
+		).Scan(&latestID, &latestVer)
+		if err != nil {
+			return out, fmt.Errorf("resolve templateKey %q: %w", st.TemplateKey, err)
+		}
+
 		var stageRowID int64
+		var boundID int64
+		var boundVer int32
+		var boundStageKey, boundTemplateKey, boundFile string
 		err = tx.QueryRow(ctx, `
 			INSERT INTO batch_stages (
 				batch_id, stage_index, stage_key, file_path, template_key,
 				rule_template_id, rule_template_version, status, on_stage_failure, depends_on
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending'::batch_status, $8, $9)
 			ON CONFLICT (batch_id, stage_index) DO UPDATE SET
-				stage_key = EXCLUDED.stage_key,
-				file_path = EXCLUDED.file_path,
-				template_key = EXCLUDED.template_key,
-				rule_template_id = EXCLUDED.rule_template_id,
-				rule_template_version = EXCLUDED.rule_template_version,
+				rule_template_id = COALESCE(batch_stages.rule_template_id, EXCLUDED.rule_template_id),
+				rule_template_version = COALESCE(batch_stages.rule_template_version, EXCLUDED.rule_template_version),
 				on_stage_failure = EXCLUDED.on_stage_failure,
 				depends_on = EXCLUDED.depends_on,
 				updated_at = now()
-			RETURNING id`,
-			in.BatchID, i, st.StageKey, st.File, st.TemplateKey, tplID, tplVer, onFail, deps,
-		).Scan(&stageRowID)
+			RETURNING id, rule_template_id, rule_template_version, stage_key, template_key, file_path`,
+			in.BatchID, i, st.StageKey, st.File, st.TemplateKey, latestID, latestVer, onFail, deps,
+		).Scan(&stageRowID, &boundID, &boundVer, &boundStageKey, &boundTemplateKey, &boundFile)
 		if err != nil {
 			return out, fmt.Errorf("insert batch_stage: %w", err)
 		}
+		if boundStageKey != st.StageKey || boundTemplateKey != st.TemplateKey || boundFile != st.File {
+			return out, temporal.NewNonRetryableApplicationError(fmt.Sprintf(
+				"batch %d stage %d is already bound to %s/%s (%s) but the manifest names %s/%s (%s)",
+				in.BatchID, i, boundStageKey, boundTemplateKey, boundFile, st.StageKey, st.TemplateKey, st.File),
+				"StageBindingConflict", nil)
+		}
 		out.Stages = append(out.Stages, ResolvedStage{
 			StageRowID: stageRowID, StageIndex: i, StageKey: st.StageKey,
-			TemplateKey: st.TemplateKey, RuleTemplateID: tplID, RuleTemplateVersion: tplVer,
+			TemplateKey: st.TemplateKey, RuleTemplateID: boundID, RuleTemplateVersion: boundVer,
 			OnFailure: onFail, DependsOn: append([]string(nil), st.DependsOn...),
-			Bucket: st.Bucket, Key: st.Key, Filename: st.Filename, Size: st.Size,
+			Bucket: st.Bucket, Key: st.Key, Filename: st.Filename, Size: st.Size, ETag: st.ETag,
 		})
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -435,6 +563,9 @@ type StartBatchStageJobInput struct {
 	Filename            string `json:"filename"`
 	Size                int64  `json:"size"`
 	StageKey            string `json:"stageKey"`
+	// ETag is the staged object's content version; empty for stages staged
+	// before versions were recorded, which then rely on size alone.
+	ETag string `json:"etag,omitempty"`
 }
 
 type StartBatchStageJobOutput struct {
@@ -468,7 +599,7 @@ func (a *Activities) StartBatchStageJob(ctx context.Context, in StartBatchStageJ
 	}
 	sourceID, err := registerSource(ctx, tx, newSource{
 		OrgID: in.OrgID, Bucket: in.Bucket, Key: in.Key, Filename: in.Filename,
-		Size: in.Size, Provenance: "batch_stage",
+		ETag: in.ETag, Size: in.Size, Provenance: "batch_stage",
 	})
 	if err != nil {
 		return StartBatchStageJobOutput{}, err
@@ -480,6 +611,7 @@ func (a *Activities) StartBatchStageJob(ctx context.Context, in StartBatchStageJ
 		"key":       in.Key,
 		"filename":  in.Filename,
 		"size":      in.Size,
+		"etag":      in.ETag,
 		"batchId":   in.BatchID,
 		"stageKey":  in.StageKey,
 	})
@@ -546,12 +678,41 @@ func (a *Activities) FinalizeBatchStage(ctx context.Context, in FinalizeBatchSta
 // ---------------- FinalizeBatch ----------------
 
 type FinalizeBatchInput struct {
-	BatchID int64  `json:"batchId"`
-	Status  string `json:"status"` // succeeded | failed | partial
-	Error   string `json:"error,omitempty"`
+	BatchID int64 `json:"batchId"`
+	// Status is the counter-derived status the workflow computed. Workers
+	// built before DeriveFromStages existed write it as-is (their original
+	// behaviour), so a mixed-version rollout never records "failed" for a
+	// batch the old worker would have called succeeded.
+	Status string `json:"status,omitempty"`
+	// DeriveFromStages asks this worker to ignore Status and derive the
+	// verdict from the persisted stage outcomes (lifecycle.FinalizeBatch).
+	// BatchWorkflow sets it on every finalize-on-exit call.
+	DeriveFromStages bool `json:"deriveFromStages,omitempty"`
+	// Error records an execution failure outside a stage; the batch is failed.
+	Error string `json:"error,omitempty"`
+	// Cancelled records that the batch workflow was cancelled.
+	Cancelled bool `json:"cancelled,omitempty"`
 }
 
-func (a *Activities) FinalizeBatch(ctx context.Context, in FinalizeBatchInput) error {
+// FinalizeBatchOutput is the persisted batch verdict.
+type FinalizeBatchOutput struct {
+	Status string                `json:"status"`
+	Reason string                `json:"reason"`
+	Stages lifecycle.StageTotals `json:"stages"`
+}
+
+// FinalizeBatch writes the batch's terminal status. With DeriveFromStages
+// (or an empty Status) the verdict is derived from batch_stages, one rule
+// shared with the reconciler; otherwise the caller-supplied Status is written
+// as legacy histories recorded it.
+func (a *Activities) FinalizeBatch(ctx context.Context, in FinalizeBatchInput) (*FinalizeBatchOutput, error) {
+	if in.DeriveFromStages || in.Status == "" {
+		v, err := lifecycle.FinalizeBatch(ctx, a.d.DB, in.BatchID, lifecycle.Outcome{Cancelled: in.Cancelled, Error: truncateErr(in.Error, 2000)})
+		if err != nil {
+			return nil, err
+		}
+		return &FinalizeBatchOutput{Status: v.Status, Reason: v.Reason, Stages: v.Stages}, nil
+	}
 	status := strings.ToLower(in.Status)
 	switch status {
 	case "succeeded", "failed", "partial", "quarantined":
@@ -561,8 +722,11 @@ func (a *Activities) FinalizeBatch(ctx context.Context, in FinalizeBatchInput) e
 	_, err := a.d.DB.Exec(ctx, `
 		UPDATE batches SET status = $1::batch_status, error_message = NULLIF($2, ''),
 			finished_at = now(), updated_at = now()
-		WHERE id = $3`,
+		WHERE id = $3 AND status <> 'quarantined'::batch_status`,
 		status, truncateErr(in.Error, 2000), in.BatchID,
 	)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return &FinalizeBatchOutput{Status: status, Reason: in.Error}, nil
 }

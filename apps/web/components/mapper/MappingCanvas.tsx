@@ -129,14 +129,19 @@ export function MappingCanvas({
             source,
             target,
             animated: true,
-            style: { strokeWidth: 2, stroke: "#2a4fbf" },
-            markerEnd: { type: MarkerType.ArrowClosed, color: "#2a4fbf", width: 18, height: 18 }
+            style: { strokeWidth: 2, stroke: "#6d9bf5" },
+            markerEnd: { type: MarkerType.ArrowClosed, color: "#6d9bf5", width: 18, height: 18 }
           } as Edge,
           next
         )
       );
-      toast.success(`Mapped ${bareName(source)} → ${bareName(target)}`);
-      setPendingSource(null);
+      toast.success(`Mapped ${bareName(source)} → ${bareName(target)}`, {
+        description: "The source stays selected: click another destination to map it again."
+      });
+      // Keep the source selected so one field can feed several destinations
+      // without re-selecting it each time (one-to-many). Esc, clicking the
+      // source again or clicking the pane clears it.
+      setPendingSource((prev) => (prev === source ? prev : null));
     },
     [edges, onEdgesChange]
   );
@@ -186,10 +191,10 @@ export function MappingCanvas({
       edges.map((e) => ({
         ...e,
         animated: true,
-        style: { strokeWidth: 2, stroke: "#2a4fbf", ...(e.style ?? {}) },
+        style: { strokeWidth: 2, stroke: "#6d9bf5", ...(e.style ?? {}) },
         markerEnd: e.markerEnd ?? {
           type: MarkerType.ArrowClosed,
-          color: "#2a4fbf",
+          color: "#6d9bf5",
           width: 18,
           height: 18
         }
@@ -241,6 +246,7 @@ export function MappingCanvas({
     []
   );
 
+  const pendingCount = pendingSource ? edges.filter((e) => e.source === pendingSource).length : 0;
   const pendingLabel = pendingSource
     ? pendingSource.startsWith("resp:")
       ? pendingSource.slice(5)
@@ -260,14 +266,16 @@ export function MappingCanvas({
       >
         {pendingSource ? (
           <p>
-            Connecting from <strong className="font-semibold">{pendingLabel}</strong> — click a
-            destination field on the right, or press Esc to cancel.
+            Connecting from <strong className="font-semibold">{pendingLabel}</strong>
+            {pendingCount > 0 ? ` (feeds ${pendingCount} field${pendingCount === 1 ? "" : "s"})` : ""} — click
+            each destination it should feed, then press Esc or click it again to finish.
           </p>
         ) : (
           <p>
             <strong className="font-semibold">Click</strong> a source field, then{" "}
-            <strong className="font-semibold">click</strong> a destination to map. You can also drag
-            from the handle dots.
+            <strong className="font-semibold">click</strong> one or more destinations. A source can feed
+            many fields; a destination takes one source (query parameters take several). Dragging from
+            the handle dots works too.
           </p>
         )}
         {pendingSource ? (
@@ -281,12 +289,11 @@ export function MappingCanvas({
         ) : null}
       </div>
 
+      <div className="flex justify-between border-b border-slate-100 px-10 py-1.5 text-[12px] text-slate-500">
+        <span>Source fields and earlier responses</span>
+        <span>Destination fields</span>
+      </div>
       <div className="relative min-h-0 flex-1" data-testid="mapping-canvas">
-        {/* Column labels */}
-        <div className="pointer-events-none absolute left-0 right-0 top-3 z-10 flex justify-between px-10 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-          <span>Source / prior response</span>
-          <span>Destination fields</span>
-        </div>
 
         <ReactFlow
           nodes={canvasNodes}
@@ -300,30 +307,32 @@ export function MappingCanvas({
           fitViewOptions={{ padding: 0.2 }}
           proOptions={{ hideAttribution: true }}
           deleteKeyCode={["Backspace", "Delete"]}
-          connectionLineStyle={{ stroke: "#2a4fbf", strokeWidth: 2 }}
+          connectionLineStyle={{ stroke: "#6d9bf5", strokeWidth: 2 }}
           defaultEdgeOptions={{
             animated: true,
-            style: { strokeWidth: 2, stroke: "#2a4fbf" },
-            markerEnd: { type: MarkerType.ArrowClosed, color: "#2a4fbf", width: 18, height: 18 }
+            style: { strokeWidth: 2, stroke: "#6d9bf5" },
+            markerEnd: { type: MarkerType.ArrowClosed, color: "#6d9bf5", width: 18, height: 18 }
           }}
           onPaneClick={() => setPendingSource(null)}
-          className="bg-[radial-gradient(#e2e8f0_1px,transparent_1px)] [background-size:16px_16px]"
+          className="bg-[radial-gradient(#283449_1px,transparent_1px)] [background-size:16px_16px]"
         >
-          <Background gap={16} size={1} color="#e2e8f0" />
+          <Background gap={16} size={1} color="#283449" />
           <Controls showInteractive={false} />
-          <MiniMap
-            pannable
-            zoomable
-            nodeColor={(n) => {
-              const k = kindOfNode(n.id);
-              if (k === "src") return "#0ea5e9";
-              if (k === "resp") return "#10b981";
-              if (k === "path") return "#f59e0b";
-              if (k === "query") return "#3b82f6";
-              if (k === "hdr") return "#8b5cf6";
-              return "#6366f1";
-            }}
-          />
+          {canvasNodes.length > 12 ? (
+            <MiniMap
+              pannable
+              zoomable
+              nodeColor={(n) => {
+                const k = kindOfNode(n.id);
+                if (k === "src") return "#4fb3f0";
+                if (k === "resp") return "#3fcf8e";
+                if (k === "path") return "#e8b04c";
+                if (k === "query") return "#6d9bf5";
+                if (k === "hdr") return "#b08cf4";
+                return "#8b93f4";
+              }}
+            />
+          ) : null}
         </ReactFlow>
       </div>
     </div>

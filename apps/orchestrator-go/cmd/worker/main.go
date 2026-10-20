@@ -77,13 +77,20 @@ func main() {
 	}
 	defer c.Close()
 
+	shareRPS, shareBurst := cfg.WorkerRateShare()
+	if cfg.DestinationRPS > 0 {
+		logger.Info("destination rate budget per host",
+			"deploymentRPS", cfg.DestinationRPS, "deploymentBurst", cfg.DestinationBurst,
+			"rateWorkers", cfg.DestinationRateWorkers, "thisWorkerRPS", shareRPS, "thisWorkerBurst", shareBurst,
+			"note", "per-process limiter; aggregate holds only while at most rateWorkers orchestrator processes run")
+	}
 	deps := activities.Deps{
 		DB:               pg,
 		Redis:            rds,
 		HTTP:             security.NewEgressHTTPClient(30*time.Second, cfg.AllowPrivateDestinations),
 		LicenseHTTP:      &http.Client{Timeout: 10 * time.Second},
 		SecretsMasterKey: cfg.SecretsMasterKey,
-		RateLimiter:      security.NewHostLimiter(cfg.DestinationRPS, cfg.DestinationBurst),
+		RateLimiter:      security.NewHostLimiter(shareRPS, shareBurst),
 		MaxResponseBytes: cfg.MaxResponseBytes,
 		LicenseCheckURL:  cfg.APIInternalURL + "/internal/license/authorize",
 		BridgeToken:      cfg.BridgeToken,
@@ -105,6 +112,8 @@ func main() {
 	w.RegisterWorkflow(workflows.WatchPrefixWorkflow)
 	w.RegisterWorkflow(workflows.BatchWorkflow)
 	w.RegisterWorkflow(workflows.ExportResultsWorkflow)
+	w.RegisterWorkflow(workflows.PlanRunWorkflow)
+	w.RegisterWorkflow(workflows.PlanArchiveWorkflow)
 
 	w.RegisterActivityWithOptions(acts.LoadTemplate, activities.RegisterOptions("LoadTemplate"))
 	w.RegisterActivityWithOptions(acts.RequireLicensed, activities.RegisterOptions("RequireLicensed"))
@@ -135,6 +144,19 @@ func main() {
 	w.RegisterActivityWithOptions(acts.ExportJobResults, activities.RegisterOptions("ExportJobResults"))
 	w.RegisterActivityWithOptions(acts.RecordExportStarted, activities.RegisterOptions("RecordExportStarted"))
 	w.RegisterActivityWithOptions(acts.RecordExportFailure, activities.RegisterOptions("RecordExportFailure"))
+	for name, fn := range map[string]any{
+		"CheckPlanRunGate":     acts.CheckPlanRunGate,
+		"StartPlanRunJob":      acts.StartPlanRunJob,
+		"FinalizePlanRun":      acts.FinalizePlanRun,
+		"CancelPlanRun":        acts.CancelPlanRun,
+		"StagePlanArchive":     acts.StagePlanArchive,
+		"CreatePlanIntakeRuns": acts.CreatePlanIntakeRuns,
+		"FailPlanIntake":       acts.FailPlanIntake,
+		"CreatePlanIntake":     acts.CreatePlanIntake,
+		"RoutePlanFile":        acts.RoutePlanFile,
+	} {
+		w.RegisterActivityWithOptions(fn, activities.RegisterOptions(name))
+	}
 
 	// Internal Temporal bridge for the Rust API (start/signal/cancel/schedules).
 	bridgeSrv := &http.Server{

@@ -246,3 +246,49 @@ func (r *restartingSource) Ingest(_ context.Context, in activities.IngestInput) 
 	}
 	return activities.IngestOutput{Rows: rows, NewOffset: connectors.Offset{Items: int64(in.BatchSize)}}, nil
 }
+
+// Principal review F4: batches are sized from history cost, not fixed at 500.
+func TestInitialBatchSizeShrinksWithChainLength(t *testing.T) {
+	if got := initialBatchSize(1); got != maxBatchSize {
+		t.Fatalf("single-step template: %d, want %d", got, maxBatchSize)
+	}
+	ten := initialBatchSize(10)
+	if ten >= initialBatchSize(1) || ten < minBatchSize {
+		t.Fatalf("ten-step template: %d", ten)
+	}
+	// Worst case must stay inside the budget before measurement.
+	if ten*(2*10+1)*eventsPerActivity > historyEventBudget {
+		t.Fatalf("first batch of a 10-step chain projects %d events", ten*(2*10+1)*eventsPerActivity)
+	}
+}
+
+func TestPlanNextBatchFitsTheRemainingBudget(t *testing.T) {
+	// 100 rows cost 2,100 events; 4,000 used: 6,000 left / 21 = 285 rows.
+	p := planNextBatch(batchPlanInput{Events: 4000, LastEvents: 2100, LastRows: 100})
+	if p.ContinueAsNew || p.BatchSize != 285 {
+		t.Fatalf("plan = %+v", p)
+	}
+	// Cheap rows cap at the maximum batch size.
+	p = planNextBatch(batchPlanInput{Events: 100, LastEvents: 100, LastRows: 100})
+	if p.ContinueAsNew || p.BatchSize != maxBatchSize {
+		t.Fatalf("plan = %+v", p)
+	}
+	// Too little room for a useful batch: hand off.
+	p = planNextBatch(batchPlanInput{Events: 9900, LastEvents: 2100, LastRows: 100})
+	if !p.ContinueAsNew {
+		t.Fatalf("plan = %+v", p)
+	}
+	// Bytes can be the binding constraint.
+	p = planNextBatch(batchPlanInput{Events: 100, LastEvents: 100, LastRows: 100, Bytes: historyByteBudget - 1000, LastBytes: 100_000})
+	if !p.ContinueAsNew {
+		t.Fatalf("plan = %+v", p)
+	}
+	// The server's suggestion always wins.
+	if p := planNextBatch(batchPlanInput{Suggested: true, LastRows: 1, LastEvents: 1}); !p.ContinueAsNew {
+		t.Fatalf("plan = %+v", p)
+	}
+	// Nothing measured keeps the old fixed check.
+	if p := planNextBatch(batchPlanInput{Events: 100}); p.ContinueAsNew || p.BatchSize != maxBatchSize {
+		t.Fatalf("plan = %+v", p)
+	}
+}

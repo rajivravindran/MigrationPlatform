@@ -39,6 +39,7 @@ export default function NewSchedulePage() {
   const [overlap, setOverlap] = useState<(typeof OVERLAPS)[number]>("skip");
   const [catchup, setCatchup] = useState(3600);
   const [submitted, setSubmitted] = useState(false);
+  const [planId, setPlanId] = useState<number | null>(null);
 
   const templates = useQuery({
     queryKey: ["templates"],
@@ -48,6 +49,11 @@ export default function NewSchedulePage() {
     queryKey: ["connectors"],
     queryFn: () => apiFetch<{ items: Connector[] }>("/connectors")
   });
+  const plans = useQuery({
+    queryKey: ["plans"],
+    queryFn: () => apiFetch<{ items: { id: number; name: string; version: number; status: string }[] }>("/plans")
+  });
+  const publishedPlans = (plans.data?.items ?? []).filter((p) => p.status === "published");
 
   const nextFive = useMemo(() => previewCron(cron, timezone), [cron, timezone]);
 
@@ -68,7 +74,8 @@ export default function NewSchedulePage() {
           timezone,
           overlap_policy: overlap,
           catchup_window_seconds: catchup,
-          enabled: true
+          enabled: true,
+          plan_id: planId
         })
       });
     },
@@ -125,6 +132,17 @@ export default function NewSchedulePage() {
             </Select>
           </FormField>
           </div>
+          <FormField
+            label="Route files into a plan"
+            hint="Optional. Files whose names match a plan step’s pattern run as that step and wait for its prerequisites; .tar.gz / .zip archives are routed by their manifest. Other files use the template above."
+          >
+            <Select value={planId ?? ""} onChange={(e) => setPlanId(e.target.value ? Number(e.target.value) : null)}>
+              <option value="">No plan — every file uses the template above</option>
+              {publishedPlans.map((p) => (
+                <option key={p.id} value={p.id}>{p.name} (v{p.version})</option>
+              ))}
+            </Select>
+          </FormField>
           {published.length === 0 ? <p className="text-sm text-amber-800">Create and publish a <Link className="font-medium underline" href="/templates/new">template</Link> before scheduling it.</p> : null}
         </div>
       </Card>

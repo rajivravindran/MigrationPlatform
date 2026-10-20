@@ -14,6 +14,12 @@ use crate::security::audit::record_audit;
 use crate::sources;
 use crate::state::AppState;
 
+/// True when the bridge refused the connection, so no workflow can exist.
+fn start_never_reached_bridge(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_connect)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/batches", get(list_batches).post(create_batch))
@@ -190,20 +196,34 @@ async fn create_batch(
                 "sourceId": source.id,
                 "bucket": source.bucket,
                 "key": source.object_key,
+                "filename": archive_name,
                 "etag": source.etag.clone().unwrap_or_default(),
                 "size": source.size_bytes.unwrap_or(0),
             }),
         )
         .await;
 
+    // Same lifecycle contract as jobs (ADR 0004, architecture review A2):
+    // only a refused connection proves nothing started, so only that marks
+    // the batch failed; an ambiguous start leaves it pending for the
+    // reconciler, and a successful start never overwrites a batch that a
+    // fast workflow already finalized.
     let run_id = match start {
         Ok(run_id) => run_id,
+        Err(e) if !start_never_reached_bridge(&e) => {
+            tracing::warn!(batch_id = row.id, workflow_id, error = %e, "batch workflow start outcome unknown");
+            return Err(ApiError::External(format!(
+                "temporal: {e}; batch {} will be reconciled",
+                row.id
+            )));
+        }
         Err(e) => {
             sqlx::query(
                 "UPDATE batches SET status = 'failed'::batch_status, finished_at = now(),
-                 error_message = $1, updated_at = now() WHERE id = $2",
+                 error_message = $1, updated_at = now()
+                 WHERE id = $2 AND status = 'pending'::batch_status",
             )
-            .bind(format!("temporal: {e}"))
+            .bind(format!("workflow start failed: {e}"))
             .bind(row.id)
             .execute(&state.db)
             .await?;
@@ -212,7 +232,9 @@ async fn create_batch(
     };
 
     row = sqlx::query_as(&format!(
-        "UPDATE batches SET status = 'running'::batch_status, temporal_run_id = $1, updated_at = now()
+        "UPDATE batches SET
+           status = CASE WHEN status = 'pending'::batch_status THEN 'running'::batch_status ELSE status END,
+           temporal_run_id = $1, started_at = COALESCE(started_at, now()), updated_at = now()
          WHERE id = $2
          RETURNING {BATCH_COLS}"
     ))

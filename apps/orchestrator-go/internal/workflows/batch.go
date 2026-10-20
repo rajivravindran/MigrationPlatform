@@ -12,70 +12,121 @@ import (
 
 	"github.com/migration-platform/orchestrator/internal/activities"
 	"github.com/migration-platform/orchestrator/internal/batch"
+	"github.com/migration-platform/orchestrator/internal/lifecycle"
 )
 
 // BatchWorkflowInput is started for each watched (or manually submitted) archive package.
 type BatchWorkflowInput struct {
-	OrgID         int64     `json:"orgId"`
-	BatchID       int64     `json:"batchId"`
-	ScheduleID    int64     `json:"scheduleId,omitempty"`
-	ConnectorID   int64     `json:"connectorId,omitempty"`
-	Bucket        string    `json:"bucket"`
-	Key           string    `json:"key"`
+	OrgID       int64  `json:"orgId"`
+	BatchID     int64  `json:"batchId"`
+	ScheduleID  int64  `json:"scheduleId,omitempty"`
+	ConnectorID int64  `json:"connectorId,omitempty"`
+	Bucket      string `json:"bucket"`
+	Key         string `json:"key"`
+	// Filename is the archive's original name. Uploaded sources are stored
+	// under content-hash keys without an extension, so the format comes from
+	// here when set; watched and scheduled archives fall back to Key.
+	Filename      string    `json:"filename,omitempty"`
 	ETag          string    `json:"etag,omitempty"`
 	Size          int64     `json:"size,omitempty"`
 	ScheduledTime time.Time `json:"scheduledTime,omitempty"`
 }
 
+// archiveName is the name that carries the archive format.
+func (in BatchWorkflowInput) archiveName() string {
+	if in.Filename != "" {
+		return in.Filename
+	}
+	return in.Key
+}
+
+// BatchWorkflowResult summarises a batch run. Status/Reason are the verdict
+// FinalizeBatch persisted (lifecycle.BatchVerdict); StagesOK/StagesFailed
+// are this run's counters and are informational.
 type BatchWorkflowResult struct {
 	Status       string `json:"status"`
+	Reason       string `json:"reason,omitempty"`
 	StagesTotal  int    `json:"stagesTotal"`
 	StagesOK     int    `json:"stagesOk"`
 	StagesFailed int    `json:"stagesFailed"`
 	Quarantined  bool   `json:"quarantined,omitempty"`
 }
 
+// batchFinalizeOnExitVersion gates, via workflow.GetVersion, finalizing the
+// batch on every exit from its persisted stage outcomes (lifecycle.FinalizeBatch)
+// on a disconnected context. Histories recorded before it replay the old
+// path, which computed the final status from in-workflow counters and left
+// the batch running when a stage-persistence error ended the workflow.
+const (
+	batchFinalizeOnExitChange  = "batch-finalize-on-exit"
+	batchFinalizeOnExitVersion = 1
+)
+
 // BatchWorkflow unpacks an archive with manifest.json, then runs child
 // MigrationWorkflows per stage. Without dependsOn: ordered sequential (P2).
 // With any dependsOn: topological DAG; ready stages run in parallel (P4a).
 // onStageFailure stop|continue controls whether further stages start after a failure.
+//
+// Every exit except a quarantine (which persists its own status) goes
+// through finishBatch, so the persisted batch status converges to the
+// persisted stage outcomes however the workflow ended (review A2).
 func BatchWorkflow(ctx workflow.Context, in BatchWorkflowInput) (*BatchWorkflowResult, error) {
 	log := workflow.GetLogger(ctx)
 	log.Info("BatchWorkflow start", "batchId", in.BatchID, "key", in.Key)
 
 	ao := defaultActivityOptions(nil)
 	ctx = workflow.WithActivityOptions(ctx, ao)
-	if err := requireLicensed(ctx); err != nil {
-		return nil, err
-	}
+	finalizeOnExit := workflow.GetVersion(ctx, batchFinalizeOnExitChange, workflow.DefaultVersion,
+		batchFinalizeOnExitVersion) >= batchFinalizeOnExitVersion
 
 	result := &BatchWorkflowResult{Status: "failed"}
+	runErr := runBatch(ctx, in, result)
+	if result.Quarantined {
+		return result, runErr
+	}
+	if !finalizeOnExit {
+		if runErr != nil {
+			return result, runErr
+		}
+		return result, legacyFinalizeBatch(ctx, in, result)
+	}
+	return result, finishBatch(ctx, in.BatchID, result, runErr)
+}
 
-	if !batch.IsArchive(in.Key) {
-		return result, fmt.Errorf("not an archive package: %s", in.Key)
+// runBatch does the work of one batch run: license gate, admission, unpack,
+// stage materialization and stage execution. It returns the error that
+// stopped the batch; BatchWorkflow records the outcome either way.
+func runBatch(ctx workflow.Context, in BatchWorkflowInput, result *BatchWorkflowResult) error {
+	log := workflow.GetLogger(ctx)
+	if err := requireLicensed(ctx); err != nil {
+		return err
+	}
+
+	if !batch.IsArchive(in.archiveName()) {
+		return fmt.Errorf("not an archive package: %s", in.archiveName())
 	}
 
 	if err := workflow.ExecuteActivity(ctx, "MarkBatchRunning", activities.MarkBatchRunningInput{
 		BatchID: in.BatchID,
 		RunID:   workflow.GetInfo(ctx).WorkflowExecution.RunID,
 	}).Get(ctx, nil); err != nil {
-		return result, fmt.Errorf("mark batch running: %w", err)
+		return fmt.Errorf("mark batch running: %w", err)
 	}
 
 	var unpacked activities.UnpackAndStageArchiveOutput
 	err := workflow.ExecuteActivity(ctx, "UnpackAndStageArchive", activities.UnpackAndStageArchiveInput{
-		OrgID: in.OrgID, BatchID: in.BatchID, Bucket: in.Bucket, Key: in.Key,
+		OrgID: in.OrgID, BatchID: in.BatchID, Bucket: in.Bucket, Key: in.Key, Filename: in.Filename,
 	}).Get(ctx, &unpacked)
 	if err != nil {
 		log.Error("unpack failed; quarantining", "err", err)
 		if qErr := workflow.ExecuteActivity(ctx, "QuarantineArchive", activities.QuarantineArchiveInput{
 			OrgID: in.OrgID, BatchID: in.BatchID, Bucket: in.Bucket, Key: in.Key, Reason: err.Error(),
 		}).Get(ctx, nil); qErr != nil {
-			return result, fmt.Errorf("unpack failed (%v); quarantine persistence failed: %w", err, qErr)
+			return fmt.Errorf("unpack failed (%v); quarantine persistence failed: %w", err, qErr)
 		}
 		result.Status = "quarantined"
 		result.Quarantined = true
-		return result, nil
+		return nil
 	}
 
 	var resolved activities.MaterializeBatchStagesOutput
@@ -88,42 +139,92 @@ func BatchWorkflow(ctx workflow.Context, in BatchWorkflowInput) (*BatchWorkflowR
 		if qErr := workflow.ExecuteActivity(ctx, "QuarantineArchive", activities.QuarantineArchiveInput{
 			OrgID: in.OrgID, BatchID: in.BatchID, Bucket: in.Bucket, Key: in.Key, Reason: err.Error(),
 		}).Get(ctx, nil); qErr != nil {
-			return result, fmt.Errorf("materialize failed (%v); quarantine persistence failed: %w", err, qErr)
+			return fmt.Errorf("materialize failed (%v); quarantine persistence failed: %w", err, qErr)
 		}
 		result.Status = "quarantined"
 		result.Quarantined = true
-		return result, nil
+		return nil
 	}
 
 	result.StagesTotal = len(resolved.Stages)
 	nodes := stageNodes(resolved.Stages)
 	if batch.UsesDependsOnNodes(nodes) {
 		log.Info("BatchWorkflow DAG mode (dependsOn)")
-		if err := runStagesDAG(ctx, in, resolved.Stages, result); err != nil {
-			return result, err
-		}
-	} else {
-		log.Info("BatchWorkflow sequential mode")
-		if err := runStagesSequential(ctx, in, resolved.Stages, result); err != nil {
-			return result, err
-		}
+		return runStagesDAG(ctx, in, resolved.Stages, result)
 	}
+	log.Info("BatchWorkflow sequential mode")
+	return runStagesSequential(ctx, in, resolved.Stages, result)
+}
 
-	final := "succeeded"
-	if result.StagesFailed > 0 && result.StagesOK > 0 {
-		final = "partial"
-	} else if result.StagesFailed > 0 {
-		final = "failed"
-	}
+// legacyFinalizeBatch is the pre-"batch-finalize-on-exit" finalization,
+// replayed for old histories: the status is computed from this run's
+// counters and written unconditionally.
+func legacyFinalizeBatch(ctx workflow.Context, in BatchWorkflowInput, result *BatchWorkflowResult) error {
+	final := counterStatus(result)
 	result.Status = final
 	if err := workflow.ExecuteActivity(ctx, "FinalizeBatch", activities.FinalizeBatchInput{
 		BatchID: in.BatchID, Status: final,
 	}).Get(ctx, nil); err != nil {
-		return result, fmt.Errorf("finalize batch: %w", err)
+		return fmt.Errorf("finalize batch: %w", err)
 	}
+	workflow.GetLogger(ctx).Info("BatchWorkflow done", "status", final, "ok", result.StagesOK, "failed", result.StagesFailed)
+	return nil
+}
 
-	log.Info("BatchWorkflow done", "status", final, "ok", result.StagesOK, "failed", result.StagesFailed)
-	return result, nil
+// counterStatus is the pre-verdict batch status computed from this run's
+// stage counters: succeeded, partial or failed.
+func counterStatus(result *BatchWorkflowResult) string {
+	switch {
+	case result.StagesFailed > 0 && result.StagesOK > 0:
+		return "partial"
+	case result.StagesFailed > 0:
+		return "failed"
+	default:
+		return "succeeded"
+	}
+}
+
+// finishBatch records the batch outcome once execution has ended, however it
+// ended. The status is derived by the lifecycle module from the persisted
+// stage outcomes plus the execution outcome (cancelled or an error outside
+// a stage), never from this run's counters, so the batch, its stages and
+// the UI agree after a crash or a persistence error. It runs on a
+// disconnected context so a cancelled workflow still records its outcome.
+// A FinalizeBatch failure is returned: the workflow fails and the
+// reconciler repairs the batch. runErr is returned unchanged when finalizing
+// succeeds.
+func finishBatch(ctx workflow.Context, batchID int64, result *BatchWorkflowResult, runErr error) error {
+	dctx, cancel := workflow.NewDisconnectedContext(ctx)
+	defer cancel()
+	// Status carries the counter-derived value for workers that predate
+	// DeriveFromStages; a current worker ignores it and derives the verdict.
+	in := activities.FinalizeBatchInput{BatchID: batchID, Status: counterStatus(result), DeriveFromStages: true}
+	if runErr != nil {
+		in.Status = "failed"
+	}
+	switch {
+	case runErr == nil:
+	case temporal.IsCanceledError(runErr) || errors.Is(ctx.Err(), workflow.ErrCanceled):
+		in.Cancelled = true
+	default:
+		in.Error = failureMessage(runErr)
+	}
+	fctx := workflow.WithActivityOptions(dctx, finishActivityOptions())
+	var verdict *activities.FinalizeBatchOutput
+	if err := workflow.ExecuteActivity(fctx, "FinalizeBatch", in).Get(fctx, &verdict); err != nil {
+		workflow.GetLogger(ctx).Error("FinalizeBatch failed; the reconciler will repair the batch", "batchId", batchID, "err", err)
+		if runErr != nil {
+			return fmt.Errorf("%w (and finalize batch failed: %v)", runErr, err)
+		}
+		return fmt.Errorf("finalize batch: %w", err)
+	}
+	if verdict != nil && verdict.Status != "" {
+		result.Status = verdict.Status
+		result.Reason = verdict.Reason
+	}
+	workflow.GetLogger(ctx).Info("BatchWorkflow done", "status", result.Status, "reason", result.Reason,
+		"ok", result.StagesOK, "failed", result.StagesFailed, "err", runErr)
+	return runErr
 }
 
 func stageNodes(stages []activities.ResolvedStage) []batch.StageNode {
@@ -230,7 +331,7 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 				ScheduleID: in.ScheduleID, RuleTemplateID: st.RuleTemplateID,
 				RuleTemplateVersion: st.RuleTemplateVersion,
 				Bucket:              st.Bucket, Key: st.Key, Filename: st.Filename, Size: st.Size,
-				StageKey: st.StageKey,
+				StageKey: st.StageKey, ETag: st.ETag,
 			}).Get(ctx, &started)
 			if err != nil {
 				if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
@@ -270,6 +371,7 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 					"key":       st.Key,
 					"filename":  st.Filename,
 					"size":      st.Size,
+					"etag":      st.ETag,
 				},
 			})
 
@@ -310,30 +412,19 @@ func runStagesDAG(ctx workflow.Context, in BatchWorkflowInput, stages []activiti
 			}
 			var childResult MigrationWorkflowResult
 			childErr := item.child.Get(ctx, &childResult)
-			stageStatus := "succeeded"
-			stageErr := ""
-			if childErr != nil {
-				stageStatus = "failed"
-				stageErr = childErr.Error()
-				result.StagesFailed++
-				status[item.st.StageKey] = batch.StageFailed
-				if item.st.OnFailure != "continue" {
-					stopEarly = true
-				}
-			} else if childResult.Failed > 0 || childResult.Unresolved > 0 || childResult.Cancelled {
-				stageStatus = "failed"
-				stageErr = fmt.Sprintf("job finished with failed=%d unresolved=%d cancelled=%v", childResult.Failed, childResult.Unresolved, childResult.Cancelled)
-				result.StagesFailed++
-				status[item.st.StageKey] = batch.StageFailed
-				if item.st.OnFailure != "continue" {
-					stopEarly = true
-				}
-			} else {
+			verdict := stageVerdict(childResult, childErr)
+			if verdict.ok {
 				result.StagesOK++
 				status[item.st.StageKey] = batch.StageSucceeded
+			} else {
+				result.StagesFailed++
+				status[item.st.StageKey] = batch.StageFailed
+				if item.st.OnFailure != "continue" {
+					stopEarly = true
+				}
 			}
 			if err := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
-				StageRowID: item.st.StageRowID, JobID: item.jobID, Status: stageStatus, Error: stageErr,
+				StageRowID: item.st.StageRowID, JobID: item.jobID, Status: verdict.status, Error: verdict.reason,
 			}); err != nil {
 				return err
 			}
@@ -373,7 +464,7 @@ func runOneStage(ctx workflow.Context, in BatchWorkflowInput, st activities.Reso
 		ScheduleID: in.ScheduleID, RuleTemplateID: st.RuleTemplateID,
 		RuleTemplateVersion: st.RuleTemplateVersion,
 		Bucket:              st.Bucket, Key: st.Key, Filename: st.Filename, Size: st.Size,
-		StageKey: st.StageKey,
+		StageKey: st.StageKey, ETag: st.ETag,
 	}).Get(ctx, &started)
 	if err != nil {
 		if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
@@ -436,37 +527,63 @@ func runOneStage(ctx workflow.Context, in BatchWorkflowInput, st activities.Reso
 
 	var childResult MigrationWorkflowResult
 	childErr := child.Get(ctx, &childResult)
-	stageStatus := "succeeded"
-	stageErr := ""
-	if childErr != nil {
-		stageStatus = "failed"
-		stageErr = childErr.Error()
+	verdict := stageVerdict(childResult, childErr)
+	if verdict.ok {
+		result.StagesOK++
+	} else {
 		result.StagesFailed++
-		if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
-			StageRowID: st.StageRowID, JobID: started.JobID, Status: stageStatus, Error: stageErr,
-		}); persistErr != nil {
-			return false, false, persistErr
-		}
-		return false, st.OnFailure != "continue", nil
 	}
-	if childResult.Failed > 0 || childResult.Unresolved > 0 || childResult.Cancelled {
-		stageStatus = "failed"
-		stageErr = fmt.Sprintf("job finished with failed=%d unresolved=%d cancelled=%v", childResult.Failed, childResult.Unresolved, childResult.Cancelled)
-		result.StagesFailed++
-		if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
-			StageRowID: st.StageRowID, JobID: started.JobID, Status: stageStatus, Error: stageErr,
-		}); persistErr != nil {
-			return false, false, persistErr
-		}
-		return false, st.OnFailure != "continue", nil
-	}
-	result.StagesOK++
 	if persistErr := finalizeBatchStage(ctx, activities.FinalizeBatchStageInput{
-		StageRowID: st.StageRowID, JobID: started.JobID, Status: stageStatus, Error: stageErr,
+		StageRowID: st.StageRowID, JobID: started.JobID, Status: verdict.status, Error: verdict.reason,
 	}); persistErr != nil {
 		return false, false, persistErr
 	}
-	return true, false, nil
+	if verdict.ok {
+		return true, false, nil
+	}
+	return false, st.OnFailure != "continue", nil
+}
+
+// stageOutcome is what the batch records for a stage once its child job has
+// ended.
+type stageOutcome struct {
+	ok     bool
+	status string // persisted batch_stages status: succeeded | failed
+	reason string // operator-facing explanation; empty on success
+}
+
+// stageVerdict decides a stage's outcome from its child MigrationWorkflow.
+// The authority is the verdict the child persisted on its job
+// (MigrationWorkflowResult.Status/Reason, written by FinalizeJob through
+// lifecycle.Finalize). The batch never reconstructs success from row
+// counters: an empty job, a cancelled job and a job whose execution error
+// was recorded are all failed by the lifecycle module and must be failed
+// here too, so dependent stages cannot run on them (ADR 0004, review A1).
+//
+// Two distinct failure kinds are kept apart in the reason: an execution
+// error (childErr: the workflow failed, timed out or could not record its
+// outcome) versus a completed execution whose business outcome is not
+// success. A child that completed without reporting a verdict (legacy
+// history, or a worker predating verdicts) has not established success and
+// is failed with a reason saying so; the reconciler, not this parent, is
+// the place that may repair such a job.
+func stageVerdict(res MigrationWorkflowResult, childErr error) stageOutcome {
+	switch {
+	case childErr != nil:
+		return stageOutcome{status: "failed", reason: "execution error: " + childErr.Error()}
+	case res.Status == "":
+		return stageOutcome{status: "failed", reason: fmt.Sprintf(
+			"job completed without a persisted verdict (processed=%d failed=%d unresolved=%d cancelled=%v); success not established",
+			res.Processed, res.Failed, res.Unresolved, res.Cancelled)}
+	case res.Status == lifecycle.StatusSucceeded:
+		return stageOutcome{ok: true, status: "succeeded"}
+	default:
+		reason := res.Reason
+		if reason == "" {
+			reason = fmt.Sprintf("job finished with failed=%d unresolved=%d cancelled=%v", res.Failed, res.Unresolved, res.Cancelled)
+		}
+		return stageOutcome{status: "failed", reason: fmt.Sprintf("job %s: %s", res.Status, reason)}
+	}
 }
 
 func finalizeBatchStage(ctx workflow.Context, in activities.FinalizeBatchStageInput) error {

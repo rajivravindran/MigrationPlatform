@@ -41,6 +41,8 @@ pub struct CreateSchedule {
     pub overlap_policy: Option<String>,
     pub catchup_window_seconds: Option<i32>,
     pub enabled: Option<bool>,
+    /// Route arriving files into this published plan by step file patterns.
+    pub plan_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -53,7 +55,7 @@ async fn list_schedules(
     AuthUser(claims): AuthUser,
 ) -> ApiResult<Json<ListResponse>> {
     let items: Vec<ScheduleRow> = sqlx::query_as(
-        "SELECT id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, created_by, created_at, updated_at
+        "SELECT id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, plan_id, created_by, created_at, updated_at
          FROM schedules WHERE org_id = $1 ORDER BY name",
     )
     .bind(claims.org)
@@ -83,16 +85,34 @@ async fn create_schedule(
     }
     let catchup = req.catchup_window_seconds.unwrap_or(3600).max(0);
     let enabled = req.enabled.unwrap_or(true);
-    crate::sources::require_connector(&state.db, claims.org, req.connector_id).await?;
-    let template_owned: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM rule_templates WHERE id = $1 AND org_id = $2)",
+    // One admission rule for every entry point (review A5): the connector
+    // must be one the schedule executor can read, and the template must be
+    // published at the version the schedule will pin.
+    crate::admission::admit_schedule_connector(&state.db, claims.org, req.connector_id).await?;
+    let binding = crate::admission::admit_template(
+        &state.db,
+        claims.org,
+        req.rule_template_id,
+        Some(req.rule_template_version),
     )
-    .bind(req.rule_template_id)
-    .bind(claims.org)
-    .fetch_one(&state.db)
     .await?;
-    if !template_owned {
-        return Err(ApiError::BadRequest("template not found".into()));
+
+    if let Some(plan_id) = req.plan_id {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM plans WHERE id = $1 AND org_id = $2")
+                .bind(plan_id)
+                .bind(claims.org)
+                .fetch_optional(&state.db)
+                .await?;
+        match status.as_deref() {
+            Some("published") => {}
+            Some(_) => {
+                return Err(ApiError::BadRequest(format!(
+                    "plan {plan_id} is a draft; publish it before routing files to it"
+                )))
+            }
+            None => return Err(ApiError::BadRequest(format!("plan {plan_id} not found"))),
+        }
     }
 
     let schedule_id_str = format!("sch-{}-{}", claims.org, uuid::Uuid::new_v4().simple());
@@ -100,14 +120,14 @@ async fn create_schedule(
 
     // Insert Postgres row first so the Temporal payload can carry the DB schedule id.
     let row: ScheduleRow = sqlx::query_as(
-        "INSERT INTO schedules (org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy, catchup_window_seconds, enabled, temporal_schedule_id, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::schedule_overlap, $9, $10, $11, $12)
-         RETURNING id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, created_by, created_at, updated_at",
+        "INSERT INTO schedules (org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy, catchup_window_seconds, enabled, temporal_schedule_id, created_by, plan_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::schedule_overlap, $9, $10, $11, $12, $13)
+         RETURNING id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, plan_id, created_by, created_at, updated_at",
     )
     .bind(claims.org)
     .bind(&req.name)
-    .bind(req.rule_template_id)
-    .bind(req.rule_template_version)
+    .bind(binding.id)
+    .bind(binding.version)
     .bind(req.connector_id)
     .bind(&normalised_spec)
     .bind(&timezone)
@@ -116,6 +136,7 @@ async fn create_schedule(
     .bind(enabled)
     .bind(&schedule_id_str)
     .bind(created_by)
+    .bind(req.plan_id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| match &e {
@@ -133,9 +154,10 @@ async fn create_schedule(
             &json!({
                 "orgId": claims.org,
                 "scheduleId": row.id,
-                "ruleTemplateId": req.rule_template_id,
-                "ruleTemplateVersion": req.rule_template_version,
+                "ruleTemplateId": binding.id,
+                "ruleTemplateVersion": binding.version,
                 "connectorId": req.connector_id,
+                "planId": req.plan_id,
             }),
             &overlap,
             catchup,
@@ -175,7 +197,7 @@ async fn get_schedule(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<ScheduleRow>> {
     let row: Option<ScheduleRow> = sqlx::query_as(
-        "SELECT id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, created_by, created_at, updated_at
+        "SELECT id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, plan_id, created_by, created_at, updated_at
          FROM schedules WHERE id = $1 AND org_id = $2",
     )
     .bind(id)
@@ -205,7 +227,7 @@ async fn update_schedule(
         crate::security::license::require_licensed()?;
     }
     let mut existing: ScheduleRow = sqlx::query_as(
-        "SELECT id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, created_by, created_at, updated_at
+        "SELECT id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, plan_id, created_by, created_at, updated_at
          FROM schedules WHERE id = $1 AND org_id = $2",
     )
     .bind(id)
@@ -264,7 +286,7 @@ async fn update_schedule(
     let row: ScheduleRow = sqlx::query_as(
         "UPDATE schedules SET spec_json = $1, timezone = $2, overlap_policy = $3::schedule_overlap, catchup_window_seconds = $4, enabled = $5, updated_at = now()
          WHERE id = $6 AND org_id = $7
-         RETURNING id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, created_by, created_at, updated_at",
+         RETURNING id, org_id, name, rule_template_id, rule_template_version, connector_id, spec_json, timezone, overlap_policy::text AS overlap_policy, catchup_window_seconds, enabled, next_run_at, last_run_at, temporal_schedule_id, plan_id, created_by, created_at, updated_at",
     )
     .bind(&existing.spec_json)
     .bind(&existing.timezone)

@@ -117,6 +117,7 @@ pub struct ScheduleRow {
     pub next_run_at: Option<DateTime<Utc>>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub temporal_schedule_id: Option<String>,
+    pub plan_id: Option<i64>,
     pub created_by: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
